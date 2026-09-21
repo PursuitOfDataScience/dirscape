@@ -786,6 +786,49 @@ classes, and somebody looking at their own storage on the machine they are
 typing on knows which machine it is. Still in `--json`, `why`, `new` and every
 snapshot record.
 
+### Tenth pass: provenance behind `-v`, and one frame width
+
+Owner, reading `quota home on meadow3_cap, matched by name`, `uncounted 2.4G,
+1.5k files` and `found an environment variable`: "do you think these things
+users can understand what they are? it makes no fucking sense."
+
+All three were correct and none of them answered a question a researcher
+arrived with. `home on meadow3_cap` is a fileset name and a device name,
+`matched by name` is an attribution method, `uncounted` is a GPFS internal
+(`blockInDoubt`), and `found` explains dirscape's own discovery rather than
+the storage. **They are what a support ticket needs, so they are one flag
+away**, behind `-v` / `--verbose`, and every one of them stays in `--json`
+unconditionally. The default `why` is now eight lines of things a reader can
+act on: used, limit, free, files, access, backups.
+
+- **The symlink line survived, reworded, because it is a fact about the
+  STORAGE.** A home directory whose dotfiles point into `/project` holds
+  almost nothing while `du ~` reports gigabytes, and the space is charged to
+  the project quota. It read `symlinks 10 into /project/hpc/jdoe42/.cache,
+  /project/hpc/jdoe42/.cache/R-library, ..., billed there (dirscape tree)`:
+  two full paths, an ellipsis, a passive verb and a command. It now reads
+  `note  10 folders here are really stored in /project/hpc/jdoe42, and count
+  against its space`, and the inventory is under `-v`.
+- **A bug on the way: `os.path.commonprefix` is a CHARACTER operation.** Ten
+  symlinks into `.cache`, `.conda` and friends share the characters
+  `/project/hpc/jdoe42/.`, so the note named a directory with a trailing dot
+  that does not exist. `_common_dir` splits on the separator first.
+- **The `-v` labels are no longer than the others.** `measured by` and `not
+  yet counted` are 11 and 15 characters against a 9 column label field, so
+  their values sat one and six columns right of every value above them. They
+  are `source`, `in doubt` and `found by`.
+
+**Every frame in the interactive session is the window wide.** Owner: "when
+going to different dirs, the ui will shrink the horizontal spacing, which is
+annoying. that shouldn't change." It was a real bug: the table fills the
+window, and the detail panel shrink-wrapped to whatever the opened row
+happened to say, so the box jumped narrower on the way in, wider on the way
+out, and to a different width for each row. The two views are one screen
+replacing another in place, so a width that moves reads as the layout
+breaking. Asserted across every row at three window sizes, because a
+single-row test cannot see a width that varies BETWEEN rows, which is what
+the reader saw.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

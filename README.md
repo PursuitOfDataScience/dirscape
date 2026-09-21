@@ -50,14 +50,14 @@ ds                            # no flags, no config, no setup
 
 | Command | Answers |
 | :- | :- |
-| `dirscape new` | What changed since the last run |
-| `dirscape stranded` | Space you hold in filesets you can no longer reach |
-| `dirscape elsewhere` | Allocations with no path on this node |
-| `dirscape why <path>` | One path as a field list: quota source, access, policy |
-| `dirscape --all` | Every root, including aliases and filesystem roots |
-| `dirscape matrix` | Yes / no / **could not determine**, per capability |
-| `dirscape tree` | Which filesets share a device, and symlinks that cross a quota |
-| `dirscape --json` | The same facts, with a reason code on every unknown |
+| `ds new` | What changed since the last run |
+| `ds stranded` | Space you hold in filesets you can no longer reach |
+| `ds elsewhere` | Allocations with no path on this node |
+| `ds why <path>` | One path as a field list; add `-v` for where each figure came from |
+| `ds --all` | Every root, including aliases and filesystem roots |
+| `ds matrix` | Yes / no / **could not determine**, per capability |
+| `ds tree` | Which filesets share a device, and symlinks that cross a quota |
+| `ds --json` | The same facts, with a reason code on every unknown |
 
 ## ⚠️ What will bite you
 

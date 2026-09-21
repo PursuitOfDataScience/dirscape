@@ -1311,6 +1311,62 @@ def test_an_uncapped_quota_says_none_and_never_a_missing_number():
     assert "no limit" not in " ".join(lines), "the two-word form prompted the question"
 
 
+def test_every_interactive_frame_is_the_same_width():
+    """The frame must not resize as the reader moves or drills in.
+
+    Owner: "when going to different dirs, the ui will shrink the horizontal
+    spacing, which is annoying. that shouldn't change." It was shrink-wrapping
+    the detail panel to whatever the opened row happened to say while the
+    table filled the window, so the box jumped narrower on the way in, wider
+    on the way out, and to a different width for each row. The two views are
+    one screen replacing another in place, so a width that moves reads as the
+    layout breaking.
+
+    Asserted across every row and three windows, because a single row cannot
+    show a width that varies BETWEEN rows, which is what the reader saw.
+    """
+    from dirscape.render import resolve_style
+    from dirscape.render.style import width as measure
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    run = cli.Run()
+    run.roots = []
+    for offset, (path, role) in enumerate(
+        (
+            ("/home/me", "home"),
+            # A long path and a short one, so the content width really does
+            # differ between rows.
+            ("/project/a-long-project-directory-name/me", "project"),
+            ("/tmp", "local"),
+        )
+    ):
+        root = _measured(
+            _root(path, "fs" + role),
+            used=876_543_210 * (offset + 1),
+            limit=32_212_254_720 * (offset + 1),
+        )
+        root.role = role
+        root.writable = confirmed()
+        run.roots.append(root)
+
+    for window in (80, 100, 118):
+        seen = {}
+        seen["table"] = {
+            measure(line)
+            for line in cli._table_frame(run.roots, 0, run=run, style=style, width=window)
+        }
+        for index, root in enumerate(run.roots):
+            seen["row %d" % index] = {
+                measure(line) for line in cli._detail(run, root, style, cols=window, window=40)
+            }
+        for name, widths in seen.items():
+            assert widths == {window}, "%s is %s wide in a %d column window" % (
+                name,
+                sorted(widths),
+                window,
+            )
+
+
 def test_the_detail_view_is_fields_and_not_paragraphs():
     """The owner's verdict on the old one: "this chunk of verbose text makes
     no fucking sense. it says the figures above. what figures?"
@@ -1337,12 +1393,20 @@ def test_the_detail_view_is_fields_and_not_paragraphs():
     lines = text.splitlines()
 
     assert len(lines) <= 14, "a detail view is a field list, not a page: %d lines" % (len(lines),)
-    body = [ln for ln in lines[1:] if ln.strip()]
+    # The last line is the `--json` pointer, which is a command and not a
+    # field, so it is measured for LENGTH above and excluded here.
+    body = [ln for ln in lines[1:-1] if ln.strip()]
     for line in body:
         assert len(line.split()) <= 9, "%r is a sentence, not a field" % (line,)
     assert "the figures above" not in text, "prose must not point at other lines"
     assert "counted by the filesystem itself" not in text, "the mechanism paragraph is gone"
-    assert "  quota     " in text, "the quota source survives as a field"
+    # The quota's source survives, one flag away: it names a fileset and a
+    # device, which is provenance rather than a fact about the reader's
+    # storage. It is also in `--json` unconditionally.
+    verbose, _ = cli._why(
+        run, "/project/lab", resolve_style(color="never", stream=None), verbose=True
+    )
+    assert "  source    " in verbose, "the quota source survives as a -v field"
 
 
 def test_why_does_not_print_one_line_per_symlink():
@@ -1373,8 +1437,14 @@ def test_why_does_not_print_one_line_per_symlink():
     # the "billed there" consequence are the two things this test is about, and
     # both survived the rewrite; the sentence around them did not.
     flat = " ".join(text.split())
-    assert "symlinks 6 into" in flat, flat
-    assert "billed there" in flat, "the consequence is the point, not the count"
+    # Reworded again when the owner asked whether a reader could understand
+    # these lines. The count and the consequence are still the two things this
+    # test is about; the two full paths and the `(dirscape tree)` pointer that
+    # used to sit between them are behind `-v`.
+    assert "note 6 folders here are really stored in" in flat, flat
+    assert "count against its space" in flat, "the consequence is the point, not the count"
+    verbose, _ = cli._why(run, "/home/me", resolve_style(color="never", stream=None), verbose=True)
+    assert "symlinks" in verbose, "-v still lists which paths they are"
     assert len(text.splitlines()) < 20, "why is a screen, not a transcript"
 
 
@@ -2013,7 +2083,13 @@ def test_no_discovery_source_token_reaches_the_prose():
     for token in discover.SOURCE_LABELS:
         assert token not in text, "%r is a wire token and reached the screen" % (token,)
     flat = " ".join(text.split())
-    assert "found " in flat, "the sources are a field now, not a sentence"
+    # `found by` is provenance, so it moved behind `-v` with the rest of it:
+    # "do you think these things users can understand what they are?"
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None), verbose=True)
+    flat = " ".join(text.split())
+    for token in discover.SOURCE_LABELS:
+        assert token not in text, "%r is a wire token and reached the screen" % (token,)
+    assert "found by " in flat, "the sources are a field now, not a sentence"
     # The SHORT form, because the `found` field takes noun phrases. The long
     # clause form still exists and `--json` and the long views use it; what
     # this test guards either way is that the wire token never appears and its
@@ -2056,6 +2132,7 @@ def test_the_detail_view_repeats_nothing_discovery_already_said():
     assert "holds the fileset" not in text
     # A note that is NOT a source restatement survives, because dropping it
     # would cost a fact rather than a repetition.
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None), verbose=True)
     assert "also reachable at" in " ".join(text.split())
 
 
@@ -2083,7 +2160,10 @@ def test_an_unmeasured_figure_is_not_explained_as_a_measured_one():
             field,
             text,
         )
-    assert "quota none measured" in flat
+    verbose, _ = cli._why(
+        run, "/project/lab", resolve_style(color="never", stream=None), verbose=True
+    )
+    assert "source none measured" in " ".join(verbose.split())
     assert "counted by the filesystem itself" not in flat
 
 

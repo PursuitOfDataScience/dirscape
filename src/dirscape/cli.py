@@ -215,6 +215,13 @@ def _add_global_args(parser, suppress=False):
         default=_absent(suppress),
         help=h("add the stranded, elsewhere and hidden-row counts under the table"),
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=_absent(suppress),
+        help=h("in `why`, add where each figure came from and how the path was found"),
+    )
 
 
 def build_parser():
@@ -1524,8 +1531,29 @@ def _why_allocation(root, style, size=None):
     return "\n".join(out)
 
 
-def _why(run, path, style, size=None):
-    # type: (Run, str, object, Optional[int]) -> Tuple[str, int]
+def _common_dir(paths):
+    # type: (Sequence[str]) -> str
+    """The deepest directory every path is inside, by COMPONENT not by string.
+
+    `os.path.commonprefix` is a character operation and it showed: ten
+    symlinks into `/project/hpc/jdoe42/.cache`, `.../.conda` and friends share
+    the characters `/project/hpc/jdoe42/.`, so the view named a directory with
+    a trailing dot that does not exist. Splitting on the separator first is
+    the whole fix.
+    """
+    if not paths:
+        return ""
+    parts = [p.strip("/").split("/") for p in paths]
+    shared = []  # type: List[str]
+    for pieces in zip(*parts):
+        if len(set(pieces)) != 1:
+            break
+        shared.append(pieces[0])
+    return "/" + "/".join(shared) if shared else sorted(paths)[0]
+
+
+def _why(run, path, style, size=None, verbose=False):
+    # type: (Run, str, object, Optional[int], bool) -> Tuple[str, int]
     """One path, explained in a screen you can read.
 
     The first version printed everything it knew: raw byte counts, every
@@ -1636,34 +1664,68 @@ def _why(run, path, style, size=None):
     #    sentence in a labelled row, because the label is a word a researcher
     #    would use and it is doing work.
     out.extend(_field(style, room, "access", _access_phrase(match)))
-    # 3. Where the figures came from, which is what makes a disagreeing `du`
-    #    make sense instead of looking like a bug in one of the two tools. A
-    #    FIELD and not a paragraph: see `_quota_source`.
-    out.extend(_field(style, room, "quota", _quota_source(match)))
-    uncounted = _uncounted(match)
-    if uncounted:
-        out.extend(_field(style, room, "uncounted", uncounted))
     out.extend(_field(style, room, "backups", _keeping_phrase(match, run.site)))
-    # 4. Why this directory is on the reader's screen at all.
-    found = _because_phrase(match)
-    if found:
-        out.extend(_field(style, room, "found", found))
-    # 5. The repetitive part, collapsed. Eleven symlinks out of a home
-    #    directory are one fact about that directory, not eleven facts.
+
+    # 3. The one piece of provenance that is a fact about the STORAGE rather
+    #    than about dirscape, so it stays in the default view.
+    #
+    #    A home directory whose dotfiles are symlinks into `/project` holds
+    #    almost nothing while `du ~` reports gigabytes, and the space is
+    #    charged to the project quota. That surprises people badly enough to
+    #    be worth a line. The line itself was unreadable:
+    #
+    #      symlinks  10 into /project/hpc/jdoe42/.cache,
+    #                /project/hpc/jdoe42/.cache/R-library, ..., billed there
+    #                (dirscape tree)
+    #
+    #    Two full paths, an ellipsis, a passive verb and a command, for what
+    #    is one sentence: ten folders here are stored somewhere else. It names
+    #    the DIRECTORY the space lands in, once, and leaves the inventory to
+    #    `dirscape tree`.
     crossings = [n for n in match.notes if "resolves to" in n]
     if crossings:
         targets = sorted({n.split("resolves to")[1].split(",")[0].strip() for n in crossings})
+        home = _common_dir(targets)
         out.extend(
             _field(
                 style,
                 room,
-                "symlinks",
-                "%d into %s, billed there (dirscape tree)"
-                % (len(crossings), ", ".join(targets[:2]) + (", ..." if len(targets) > 2 else "")),
+                "note",
+                "%d folder%s here are really stored in %s, and count against its space"
+                % (len(crossings), "" if len(crossings) == 1 else "s", home),
             )
         )
     if match.labels:
         out.extend(_field(style, room, "changed", ", ".join(match.labels)))
+
+    # 4. Everything that is about HOW DIRSCAPE KNOWS, behind `--verbose`.
+    #
+    #    Owner, reading `quota home on meadow3_cap, matched by name`,
+    #    `uncounted 2.4G, 1.5k files` and `found an environment variable`:
+    #    "do you think these things users can understand what they are? it
+    #    makes no fucking sense."
+    #
+    #    They are all correct and none of them answers a question a researcher
+    #    arrived with. `home on meadow3_cap` is a fileset name and a device
+    #    name, `matched by name` is an attribution method, `uncounted` is a
+    #    GPFS internal (`blockInDoubt`), and `found` explains dirscape's own
+    #    discovery. They are what a support ticket needs, so they are one flag
+    #    away and every one of them is in `--json` unconditionally.
+    if verbose:
+        out.append("")
+        # Labels no longer than the others. `_field` pads to nine columns, so
+        # `measured by` and `not yet counted` pushed their own values one and
+        # six columns right of every value above them, which is the alignment
+        # complaint this view has already been through once.
+        out.extend(_field(style, room, "source", _quota_source(match)))
+        uncounted = _uncounted(match)
+        if uncounted:
+            out.extend(_field(style, room, "in doubt", "%s, so du can disagree" % (uncounted,)))
+        found = _because_phrase(match)
+        if found:
+            out.extend(_field(style, room, "found by", found))
+        if crossings:
+            out.extend(_field(style, room, "symlinks", ", ".join(sorted(set(targets))[:4])))
 
     # 4. The axes with something to say. Nothing prints for a probe that was
     #    never run, or for a confirmed `present`.
@@ -1673,12 +1735,15 @@ def _why(run, path, style, size=None):
         for glyph, sentence in findings:
             out.extend(_bullet(style, room, glyph, sentence))
 
-    # 7. Anything the backends said that is not already a field above. Two at
-    #    most, and every one dropped is behind the `--json` pointer.
+    # 5. Anything the backends said that is not already a field above. Two at
+    #    most, and every one dropped is behind the `--json` pointer. These are
+    #    the tool's own words about an unusual site (`mounted noquota, so no
+    #    project scope exists here`), which is the same register as the block
+    #    above it, so they went the same way.
     others = [
         n for n in match.notes if "resolves to" not in n and not restates_source(n, match.sources)
     ]
-    if others:
+    if verbose and others:
         out.append("")
         for note in others[:2]:
             out.extend(_prose(style, room, note))
@@ -1692,7 +1757,9 @@ def _why(run, path, style, size=None):
     #    detail off the screen and one line saying where it went.
     out.append("")
     hatch = style.dim("dirscape why %s --json" % (match.path or shown,))
-    if match.writable.confirmed and match.writable.source == "os.access":
+    if not verbose:
+        hatch += style.dim("   -v for where these figures came from")
+    elif match.writable.confirmed and match.writable.source == "os.access":
         hatch += style.dim("   --probe-write to test writing for real")
     out.append("  " + hatch)
 
@@ -1771,7 +1838,7 @@ def _render(run, opts, command, style, width):
         )
 
     if command == "why":
-        return _why(run, opts.path, style)
+        return _why(run, opts.path, style, verbose=bool(_merge_flag(opts, "verbose", False)))
 
     if command == "ncdu":
         target = os.path.abspath(os.path.expanduser(opts.path))
@@ -2207,7 +2274,17 @@ def _detail(run, root, style, cols=None, window=None):
     # `_fit` again over the framed block, as the backstop: if `panel` ever
     # returns a row wider than the window it was given, a broken looking box
     # is a far smaller failure than a repaint that wipes the scrollback.
-    return _fit(panel(lines, style=style, size=cols).splitlines(), cols)
+    # `shrink=False`: the frame is the WINDOW wide, not the detail's content.
+    #
+    # The owner caught this as a bug and it is one: "when going to different
+    # dirs, the ui will shrink the horizontal spacing, which is annoying. that
+    # shouldn't change." The table fills the window, and this panel wrapped
+    # tight to whatever the opened row happened to say, so the box jumped
+    # narrower on the way in and wider on the way out, and a different width
+    # again for each row. A frame that resizes as the cursor moves reads as
+    # the layout breaking, and the two views are one screen replacing another
+    # in place rather than two separate printouts.
+    return _fit(panel(lines, style=style, size=cols, shrink=False).splitlines(), cols)
 
 
 def _table_frame(
@@ -2273,7 +2350,11 @@ def _table_frame(
         if target and target in plain(line):
             lines = interactive.highlight(lines, position)
             break
-    return panel(lines, style=style, size=window).splitlines()
+    # `shrink=False` for the same reason `_detail` uses it: every frame in the
+    # interactive session is the window wide, so none of them changes size as
+    # the reader moves or drills in. The table's content already fills the
+    # window, so this only matters on the degraded paths where it does not.
+    return panel(lines, style=style, size=window, shrink=False).splitlines()
 
 
 def _browse(run, opts, style, width):

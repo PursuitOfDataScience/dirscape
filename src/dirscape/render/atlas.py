@@ -117,6 +117,88 @@ def _row(root, style, site, show_bar):
     return cells, both
 
 
+def _align_figures(blocks, index):
+    # type: (Sequence[List[str]], int) -> None
+    """Right-align the used and limit figures inside an already-built cell.
+
+    `USED / QUOTA` is composed per row as one string, so the numbers land
+    wherever their own width puts them and a reader cannot compare down the
+    column:
+
+        836M / 30G  ...
+        11T / no limit
+        928K / no limit
+        22G / 100G  ...
+
+    Aligning on the separator makes the same four rows read as a column of
+    magnitudes, which is the entire reason to put numbers in a table:
+
+         836M / 30G       ...
+          11T / no limit
+         928K / no limit
+          22G / 100G      ...
+
+    Done here rather than by splitting the cell into two real columns, because
+    the figure, its limit and its bar are one statement and `_ATOMIC` already
+    treats them as one unit for fitting. Widths are measured with `width`, not
+    `len`, since the cells carry colour and block characters.
+    """
+    parts = []  # type: List[Optional[Tuple[str, str, str]]]
+    for block in blocks:
+        for row in block:
+            cell = row[index]
+            head, sep, tail = cell.partition(" / ")
+            parts.append((head, sep, tail) if sep else None)
+
+    lead = max([measure(p[0]) for p in parts if p] or [0])
+    # The limit is padded to the widest limit TOKEN, not the widest tail: the
+    # tail includes the bar and the percentage, and padding to that would push
+    # short rows into a gulf of whitespace.
+    limits = []  # type: List[int]
+    for p in parts:
+        if p:
+            limits.append(measure(p[2].split("  ")[0]))
+    room = max(limits or [0])
+
+    cursor = 0
+    for block in blocks:
+        for row in block:
+            p = parts[cursor]
+            cursor += 1
+            if not p:
+                continue
+            head, _, tail = p
+            token, gap, rest = tail.partition("  ")
+            padded = token + " " * max(0, room - measure(token))
+            row[index] = "%s%s / %s%s%s" % (
+                " " * max(0, lead - measure(head)),
+                head,
+                padded,
+                gap,
+                rest,
+            )
+
+
+def _constant_columns(rows):
+    # type: (Sequence[Sequence[str]]) -> set
+    """Column indexes whose value never varies, excluding the ones that must stay.
+
+    PATH is never dropped, and USED is never dropped even if every row happens
+    to read the same, because both are the answer rather than the context.
+    """
+    if len(rows) < 2:
+        return set()
+    keep = {_PATH, _USED}
+    out = set()
+    for index in range(len(COLUMNS)):
+        if index in keep:
+            continue
+        seen = {row[index] for row in rows if index < len(row)}
+        if len(seen) == 1:
+            out.add(index)
+    return out
+
+
 def _column_width(headers, rows, columns, indent=""):
     # type: (Sequence[str], Sequence[Sequence[str]], Sequence[int], str) -> int
     if not columns:
@@ -147,32 +229,25 @@ def _plan(rows_bar, rows_flat, window):
 
 def _header(roots, meta, style):
     # type: (Sequence[Root], fields.RunMeta, Style) -> str
-    name = meta.tool
-    if meta.version:
-        name = "%s %s" % (name, fields.safe(meta.version, limit=32))
+    # One line, and only facts that change what a reader does next. The tool's
+    # own name and version were dropped: a user who wants them types
+    # `--version`, and printing them on every run costs a line of the window
+    # for something nobody reads twice.
     node = fields.safe(meta.node_class, limit=32)
     if not node or node == "unknown":
         # `discover.mounts.node_class` answers the literal string "unknown".
         # That is the tool's own vocabulary for an unanswered question, and on
         # screen the answer to an unanswered question is the mark.
         node = fields.UNKNOWN
+    host = fields.safe(meta.host, limit=64) or fields.UNKNOWN
     items = [
-        style.accent(name),
-        "host %s" % (fields.safe(meta.host, limit=64) or fields.UNKNOWN,),
-        "%s node" % (node,),
+        style.accent(host.split(".")[0]),
+        node,
         fields.device_count(roots, meta),
-        "took %s" % (fields.human_duration(meta.elapsed_s),),
+        fields.human_duration(meta.elapsed_s),
     ]
-    if meta.baseline_at is None:
-        items.append("baseline %s" % (fields.UNKNOWN,))
-    else:
-        items.append(
-            "baseline %s (%s)"
-            % (
-                fields.date_text(meta.baseline_at),
-                fields.age_phrase(meta.baseline_at, meta.now),
-            )
-        )
+    if meta.baseline_at is not None:
+        items.append("baseline %s" % (fields.age_phrase(meta.baseline_at, meta.now),))
     return legend(items, style, size=style.size, indent="")
 
 
@@ -286,51 +361,59 @@ def _notes(roots, caveats, style):
     return lines
 
 
-def _footer(roots, style, dropped, window):
-    # type: (Sequence[Root], Style, Sequence[str], int) -> List[str]
+def _footer(roots, style, dropped, window, hidden=0, legend_on=False):
+    # type: (Sequence[Root], Style, Sequence[str], int, int, bool) -> List[str]
+    """At most two lines, and often none.
+
+    The previous version printed six: a dropped-column notice, an unmeasured
+    count, the `rdu` handoff and a two-line glyph legend, every single run.
+    That is four lines of chrome under a table, and a legend reprinted on every
+    invocation is read once and skipped forever after. The glyphs are now
+    explained by `--legend`, and the rest is folded into one line.
+    """
     g = style.g
-    lines = []  # type: List[str]
-    if dropped:
-        lines.append(
-            style.dim(
-                "  %s %d more column%s (widen, or --json): %s"
-                % (
-                    g.ellipsis,
-                    len(dropped),
-                    "" if len(dropped) == 1 else "s",
-                    ", ".join(dropped),
-                )
-            )
-        )
+    bits = []  # type: List[str]
+
+    if hidden:
+        bits.append("%d hidden (%s)" % (hidden, style.accent("--all")))
     stuck = [r for r in roots if fields.unmeasured(r)]
     if stuck:
-        target = stuck[0].path if len(stuck) == 1 else "<path>"
-        lines.append(
-            "  %s could not be measured: %s"
-            % (
-                style.warn("%d root%s" % (len(stuck), "" if len(stuck) == 1 else "s")),
-                style.accent("dirscape why %s" % (target,)),
-            )
+        bits.append("%d unmeasured (%s)" % (len(stuck), style.accent("dirscape why <path>")))
+    if dropped:
+        bits.append(
+            "%d column%s hidden (%s)"
+            % (len(dropped), "" if len(dropped) == 1 else "s", style.accent("--json"))
         )
-    # The handoff, and it is deliberate: this tool never walks a tree, so
-    # bytes-by-directory is a sibling tool's job and saying so is better than
-    # having a user wait for a walk that is not coming.
-    lines.append("  what is filling a root? %s" % (style.accent("rdu <path>"),))
-    # Wrapped, because a legend that overflows the window is the one line
-    # guaranteed to wrap badly and it explains the columns above it.
-    for text in (
-        "reach: r list, w write, x traverse, - refused, %s not determined, "
-        "%s traverse only" % (fields.UNKNOWN, g.warn),
-        "marks: ~ figure attributed rather than published, %s space allocated and "
-        "not yet accounted for" % (g.doubt,),
-    ):
-        for line in wrap(text, indent="  ", size=window, style=style).splitlines():
-            lines.append(style.dim(line))
+
+    lines = []  # type: List[str]
+    if bits:
+        lines.append(style.dim("  " + (" %s " % (g.sep,)).join(bits)))
+
+    if legend_on:
+        for text in (
+            "reach: r list, w write, x traverse, - refused, %s not determined, "
+            "%s traverse only" % (fields.UNKNOWN, g.warn),
+            "marks: ~ figure attributed rather than published, %s space allocated "
+            "and not yet accounted for" % (g.doubt,),
+        ):
+            for line in wrap(text, indent="  ", size=window, style=style).splitlines():
+                lines.append(style.dim(line))
     return lines
 
 
-def render(roots, meta=None, changes=(), site=None, style=None, size=None):
-    # type: (Sequence[Root], object, Sequence[object], object, Optional[Style], Optional[int]) -> str
+def render(
+    roots,
+    meta=None,
+    changes=(),
+    site=None,
+    style=None,
+    size=None,
+    hidden=0,
+    legend_on=False,
+    all_roots=None,
+    group=False,
+):
+    # type: (...) -> str
     """The atlas, as one string.
 
     ``changes`` comes from the state layer and is rendered, never computed.
@@ -345,6 +428,11 @@ def render(roots, meta=None, changes=(), site=None, style=None, size=None):
     style = style or Style()
     window = size if size else style.size
     info = fields.RunMeta.of(meta)
+    # The summary lines count every root, not the filtered subset. Counting the
+    # subset made the `elsewhere` line vanish and stripped the byte figure off
+    # the `stranded` line, because the rows those lines describe are exactly
+    # the ones the default view holds back.
+    census = list(all_roots) if all_roots is not None else list(roots)
     out = [_header(roots, info, style)]
 
     if not roots:
@@ -361,9 +449,39 @@ def render(roots, meta=None, changes=(), site=None, style=None, size=None):
         if caveat:
             caveats.append((root.path, caveat))
 
+    # A column with one distinct value across every row is a caption, not a
+    # column. On a filtered default view WHERE reads `here` on all of them,
+    # which spends nine characters of the window saying nothing. Dropped here
+    # rather than in `_plan`, because `_plan` is about fitting and this is
+    # about content.
+    constant = _constant_columns(rows_bar)
+
+    if group:
+        _align_figures((rows_bar, rows_flat), _USED)
+        # The role is printed once per run of rows that share it. Nine rows
+        # reading `project`, `project`, `project` is the table stuttering: the
+        # word carries information the first time and is visual noise after
+        # that. Blanking the repeat turns the column into a quiet grouping
+        # without moving a single cell, which keeps every number in the same
+        # place a reader last saw it.
+        for block in (rows_bar, rows_flat):
+            previous = None
+            for row in block:
+                current = row[_ROLE]
+                row[_ROLE] = "" if current == previous else current
+                previous = current
+        # Inode figures are detail, not headline. The default view answers
+        # "where can I put data and how full is it"; a file count belongs in
+        # `--all`, `--json` and `why`, where a reader has already asked for
+        # more than a glance.
+        constant = set(constant) | {_FILES}
+
     columns, show_bar, stacked = _plan(rows_bar, rows_flat, window)
     rows = rows_bar if show_bar else rows_flat
+    columns = [i for i in columns if i not in constant] or columns
     dropped = [COLUMNS[i] for i in range(len(COLUMNS)) if i not in columns]
+    # A dropped-because-constant column is not news: the reader lost nothing.
+    dropped = [name for name in dropped if COLUMNS.index(name) not in constant]
 
     if stacked:
         out.append("")
@@ -374,7 +492,7 @@ def render(roots, meta=None, changes=(), site=None, style=None, size=None):
             facts = [row[i] for i in (_WHERE, _REACH, _USED) if row[i]]
             out.append("    " + "  ".join(facts))
         out.append("")
-        out.extend(_footer(roots, style, dropped, window))
+        out.extend(_footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on))
         return "\n".join(out)
 
     body, extra = table(
@@ -391,31 +509,90 @@ def render(roots, meta=None, changes=(), site=None, style=None, size=None):
     out.append(body)
     dropped.extend(extra)
 
-    stranded, deltas = _delta_lines(roots, changes, style)
+    stranded, deltas = _delta_lines(census, changes, style)
+
+    # Panels are SUMMARISED by default and expanded by a subcommand. The
+    # previous version printed one line per stranded fileset, one per change
+    # and one per note, and on a real account that was nineteen lines under
+    # the table restating what the table had already implied. A reader scans
+    # a summary; nobody reads nineteen.
+    alerts = []  # type: List[Tuple[str, str]]
     if stranded:
-        out.append("")
-        out.append(
-            "%s %s"
-            % (
-                style.bad(style.g.bullet),
-                style.head("stranded: space you hold here and cannot reach"),
+        held = fields.total_stranded(census)
+        alerts.append(
+            (
+                "%s %s"
+                % (
+                    style.bad(style.g.warn),
+                    style.head(
+                        "%d fileset%s hold%s %s you cannot reach"
+                        % (
+                            len(stranded),
+                            "" if len(stranded) == 1 else "s",
+                            "s" if len(stranded) == 1 else "",
+                            held or "space",
+                        )
+                    ),
+                ),
+                "dirscape stranded",
             )
         )
-        out.extend(stranded)
+    elsewhere = [r for r in census if r.elsewhere]
+    if elsewhere:
+        alerts.append(
+            (
+                "%s %s"
+                % (
+                    style.warn(style.g.warn),
+                    style.head(
+                        "%d allocation%s with no path here"
+                        % (len(elsewhere), "" if len(elsewhere) == 1 else "s")
+                    ),
+                ),
+                "dirscape elsewhere",
+            )
+        )
     if deltas:
+        alerts.append(
+            (
+                "%s %s"
+                % (
+                    style.info(style.g.warn),
+                    style.head(
+                        "%d change%s since the baseline"
+                        % (len(deltas), "" if len(deltas) == 1 else "s")
+                    ),
+                ),
+                "dirscape new",
+            )
+        )
+    if alerts:
         out.append("")
-        heading = "changes"
-        if info.baseline_at is not None:
-            heading = "changes since %s" % (fields.date_text(info.baseline_at),)
-        out.append("%s %s" % (style.accent(style.g.bullet), style.head(heading)))
-        out.extend(deltas)
+        # Padded so the commands form a column. Three lines whose pointers
+        # start at three different offsets read as three unrelated sentences;
+        # aligned, they read as a menu.
+        room = max(measure(text) for text, _ in alerts)
+        for text, command in alerts:
+            pad = " " * max(1, room - measure(text) + 3)
+            out.append("  %s%s%s" % (text, pad, style.accent(command)))
 
     notes = _notes(roots, caveats, style)
     if notes:
+        # A count and a pointer. The notes themselves are per-root detail and
+        # `why` is where per-root detail belongs.
         out.append("")
-        out.append("%s %s" % (style.accent(style.g.bullet), style.head("notes")))
-        out.extend(notes)
+        out.append(
+            style.dim(
+                "  %d note%s (%s)"
+                % (
+                    len(notes),
+                    "" if len(notes) == 1 else "s",
+                    style.accent("dirscape why <path>"),
+                )
+            )
+        )
 
-    out.append("")
-    out.extend(_footer(roots, style, dropped, window))
+    tail = _footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on)
+    if tail:
+        out.extend(tail)
     return "\n".join(out)

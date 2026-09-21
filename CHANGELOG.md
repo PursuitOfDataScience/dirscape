@@ -75,6 +75,42 @@ devices and reported 28 on a node with 9; allocation rows with no path printed
 `?` in every column and were indistinguishable, and now show their location
 marked as a location; and the quota backends were being asked twice per run.
 
+### The default view, redesigned
+
+The first working version printed **80 lines** on a real account: 63 table rows
+of which **50 were `?` in every data column**, a glyph legend reprinted on every
+run, and a notes block that repeated the same sentence twice per line. That is
+not a view, it is a dump. The default is now **20 lines** and answers the
+question in the first nine.
+
+- **A row must say something to earn its place.** Kept when write access was
+  confirmed, a quota figure was measured, or something changed. The nine
+  `/gpfs/<cluster>/<tier>` aliases, `/`, `/.nodelog/log` and `/programs` are
+  counted and reachable with `--all`, never discarded.
+- **Rows that are already summarised are no longer also tabled.** Stranded
+  filesets and pathless allocations each get one summary line with their own
+  subcommand, where before eleven rows of other people's directories sat above
+  the four places the user could actually write.
+- **Twenty dataset collections fold into their parent.** They share one fileset,
+  so the parent holds the only figure and each child was a `?`.
+- **A repeated role is printed once.** Nine rows reading `project` is the table
+  stuttering.
+- **A column with one value on every row is dropped.** `WHERE` read `here`
+  everywhere and spent nine characters saying nothing.
+- **Figures align on the separator**, so the column reads as a set of magnitudes
+  a reader can compare rather than four numbers at four offsets.
+- **Inode counts, the glyph legend and per-root notes left the default.** They
+  are detail, and `--all`, `--legend`, `--json` and `why` are where detail
+  belongs.
+- **Ordered by role**, your own space first and machinery last, rather than by
+  mount-table order, which interleaves `/gpfs/collie3/cap` with your home
+  directory.
+
+New: `dirscape stranded`, `dirscape elsewhere` and `--legend`. `elsewhere` is
+purpose-built rather than a table, because with no path there is nothing to
+stat and every column the table would draw is the unknown mark; it lists the
+account, the location and the size the allocation database published.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

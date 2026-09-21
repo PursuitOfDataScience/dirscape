@@ -684,6 +684,30 @@ def role_cell(root):
 _POLICY_NO = frozenset(["no", "never", "off", "false", "0", "none"])
 
 
+def total_stranded(roots):
+    # type: (Sequence[Root]) -> str
+    """The bytes held in unreachable filesets, as one figure, or "".
+
+    Summed so the atlas can say "5 filesets hold 18G you cannot reach" in one
+    line instead of five. Returns "" rather than "0B" when nothing could be
+    measured, because a zero would read as "nothing is stranded" when the
+    truth is that the amount is unknown.
+    """
+    total = 0
+    measured = False
+    for root in roots:
+        if not getattr(root, "stranded", False):
+            continue
+        snap = getattr(root, "quota", None)
+        if snap is None:
+            continue
+        for row in snap.rows:
+            if row.kind == "blocks" and row.used is not None:
+                total += int(row.used)
+                measured = True
+    return human_bytes(total) if measured else ""
+
+
 def merged_policy(root, site=None):
     # type: (Root, object) -> Dict[str, object]
     """Site policy for this path, overlaid with the root's own.

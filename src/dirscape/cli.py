@@ -183,6 +183,12 @@ def _add_global_args(parser, suppress=False):
         default=_absent(suppress),
         help=h("report how long each stage took"),
     )
+    parser.add_argument(
+        "--legend",
+        action="store_true",
+        default=_absent(suppress),
+        help=h("explain the reach letters and the bar marks"),
+    )
 
 
 def build_parser():
@@ -231,6 +237,8 @@ def build_parser():
     sub("matrix", "roots by capability, as confirmed / refused / could not determine")
     sub("tree", "device, then fileset, then paths, with quota-crossing symlinks marked")
     sub("map", "a treemap of where your bytes live, across every root at once")
+    sub("stranded", "space you hold in filesets you cannot reach")
+    sub("elsewhere", "allocations with no path on this node")
     sub("snapshot", "record a baseline without printing a table")
 
     export = sub("ncdu", "export one root as ncdu-compatible JSON")
@@ -726,21 +734,118 @@ def _record_state(run, opts):
         run.warnings.append("could not save the snapshot lineage: %s" % (exc,))
 
 
-def _visible(run, show_all):
-    # type: (Run, bool) -> List[object]
-    """Primary roots, unless `--all`.
+#: The order a reader's eye should travel: your own space first, shared data
+#: after it, machinery last. Not alphabetical and not mount-table order, both
+#: of which interleave `/gpfs/collie3/cap` with your home directory.
+_ROLE_ORDER = (
+    "home",
+    "project",
+    "scratch",
+    "dataset",
+    "software",
+    "archive",
+    "local",
+    "other",
+)
 
-    Secondary roots are the ones a user asking "where can my data go" does not
-    want: filesystem roots whose fileset is the GPFS `root` fileset, the
-    `/gpfs/<cluster>/<tier>` aliases of filesystems already shown at their
-    fileset junctions, and pseudo mounts. They are real, so they are kept and
-    flagged rather than dropped.
+
+def _says_something(root):
+    # type: (object) -> bool
+    """Whether a row carries information a reader can act on.
+
+    This is the filter that turned a 63-row default into a handful. Of those
+    63 rows on one real account, **50 were `?` in every data column**: nine
+    `/gpfs/<cluster>/<tier>` aliases, `/`, `/.nodelog/log`, `/programs`, and
+    twenty `/project2/reference/*` collections whose quota belongs to their
+    parent fileset. A row that says nothing is not evidence of anything, and
+    fifty of them bury the six rows that matter.
+
+    A row is kept when it answers one of the questions the tool exists for:
+
+    * can I put data here?            (write access was confirmed)
+    * how full is it?                 (a quota figure was measured)
+    * did something change?           (a delta label, or stranded)
+    * do I have space with no path?   (allocated elsewhere)
+
+    Everything else is counted and reachable with `--all`, never discarded.
+    """
+    # Stranded and elsewhere rows are DELIBERATELY not kept here. Each gets a
+    # one-line summary under the table with its own subcommand, and listing
+    # them in the table as well put eleven rows of other people's directories
+    # and pathless allocations above the four places this user can actually
+    # write. A row that is already summarised does not earn a second showing.
+    if getattr(root, "stranded", False) or getattr(root, "elsewhere", False):
+        return False
+    if getattr(root, "labels", None):
+        return True
+    writable = getattr(root, "writable", None)
+    if writable is not None and writable.confirmed:
+        return True
+    for snap in (getattr(root, "quota", None), getattr(root, "inode_quota", None)):
+        if snap is not None and snap.available and snap.rows:
+            return True
+    return False
+
+
+def _collapse_families(roots):
+    # type: (List[object]) -> Tuple[List[object], int]
+    """Fold a run of child roots into the parent that already carries them.
+
+    `/project2/reference` has twenty collection directories under it, all in
+    one fileset, so the parent holds the only quota figure and each child is a
+    `?`. Twenty rows for one fact is the single worst case in the default view.
+
+    The parent keeps a count so the information is not lost, and `--all` still
+    lists them.
+    """
+    paths = {r.path for r in roots if getattr(r, "path", "")}
+    kept = []  # type: List[object]
+    folded = {}  # type: Dict[str, int]
+
+    for root in roots:
+        path = getattr(root, "path", "")
+        parent = os.path.dirname(path.rstrip("/")) if path else ""
+        # Folded only when the PARENT is itself a discovered root and this
+        # child has nothing of its own to say. A child with its own quota or
+        # its own delta is never hidden behind a count.
+        if parent and parent in paths and parent != path and not _says_something(root):
+            folded[parent] = folded.get(parent, 0) + 1
+            continue
+        kept.append(root)
+
+    for root in kept:
+        count = folded.get(getattr(root, "path", ""))
+        if count:
+            root.policy = dict(root.policy or {})
+            root.policy["contains"] = count
+    return kept, sum(folded.values())
+
+
+def _visible(run, show_all):
+    # type: (Run, bool) -> Tuple[List[object], int]
+    """The rows to render, and how many were held back.
+
+    Secondary roots (filesystem roots, `/gpfs/*` aliases of filesystems
+    already shown at their fileset junctions, pseudo mounts) are real, so they
+    are counted and kept reachable rather than dropped.
     """
     if show_all:
-        return list(run.roots)
+        return list(run.roots), 0
+
     primary = [r for r in run.roots if getattr(r, "rank", RANK_PRIMARY) == RANK_PRIMARY]
-    # Never render an empty table when the only thing wrong was the filter.
-    return primary or list(run.roots)
+    kept, folded = _collapse_families(primary)
+    speaking = [r for r in kept if _says_something(r)]
+
+    if not speaking:
+        # Never render an empty table when the only thing wrong was the
+        # filter: a user with no measurable storage still needs to see what
+        # was found.
+        return kept, folded
+
+    order = {name: i for i, name in enumerate(_ROLE_ORDER)}
+    speaking.sort(key=lambda r: (order.get(getattr(r, "role", "") or "other", 99), r.path))
+    hidden = len(run.roots) - len(speaking)
+    return speaking, hidden
 
 
 # --------------------------------------------------------------------------
@@ -839,11 +944,55 @@ def _why(run, path, style):
     return "\n".join(lines), EXIT_OK
 
 
+def _elsewhere(run):
+    # type: (Run) -> str
+    """Allocations the database names and this node has no path for.
+
+    Purpose-built rather than run through the atlas, because every column the
+    atlas would draw is the unknown mark: with no path there is nothing to
+    stat, so no reach, no quota and no fileset. What IS known is the account
+    and the size the allocation database published, and a short list of those
+    is a view where a table of six question marks was not.
+    """
+    rows = [r for r in run.roots if r.elsewhere]
+    if not rows:
+        return "Every allocation has a path on this node."
+
+    entries = []  # type: List[Tuple[str, str, str]]
+    for root in rows:
+        policy = root.policy or {}
+        location = str(policy.get("allocation_location") or "?")
+        gb = policy.get("allocation_gb")
+        size = "?"
+        if isinstance(gb, (int, float)) and gb > 0:
+            # The database publishes GB in decimal, so it is converted in
+            # decimal. Treating it as binary would overstate a 256000 GB
+            # allocation by about 10%.
+            size = render_fields.human_bytes(int(gb * 1000 * 1000 * 1000))
+        entries.append((root.role or "?", location, size))
+
+    room = max(len(e[0]) for e in entries)
+    span = max(len(e[1]) for e in entries)
+    out = [
+        "  %d allocation%s with no path on this node"
+        % (len(entries), "" if len(entries) == 1 else "s"),
+        "",
+    ]
+    for role, location, size in entries:
+        out.append("  %s  %s  %s" % (role.ljust(room), location.ljust(span), size.rjust(6)))
+    out.append("")
+    out.append("  Named by the allocation database. Nothing here could be measured,")
+    out.append("  because no path for it exists on this node, which is a fact about")
+    out.append("  where you are standing and not about the storage.")
+    return "\n".join(out)
+
+
 def _render(run, opts, command, style, width):
     # type: (Run, argparse.Namespace, str, object, Optional[int]) -> Tuple[str, int]
     show_all = bool(_merge_flag(opts, "all", False))
-    roots = _visible(run, show_all)
+    roots, hidden = _visible(run, show_all)
     changes = list(run.changes or [])
+    legend_on = bool(_merge_flag(opts, "legend", False))
 
     if _merge_flag(opts, "json", False):
         caveats = list(run.warnings)
@@ -861,6 +1010,34 @@ def _render(run, opts, command, style, width):
             "dirscape has no root at %s, so there is nothing to export.\n"
             "Run `dirscape` to see the roots it found." % (target,),
             EXIT_PATH,
+        )
+
+    if command == "elsewhere":
+        return _elsewhere(run), EXIT_OK
+
+    if command == "stranded":
+        wanted = [r for r in run.roots if r.stranded]
+        if not wanted:
+            return (
+                "Nothing stranded: every fileset you hold space in is reachable.",
+                EXIT_OK,
+            )
+        return (
+            render_atlas(
+                wanted,
+                meta=run.meta,
+                site=run.site,
+                style=style,
+                size=width,
+                legend_on=legend_on,
+                # No changes and an empty census on purpose: a detail view must
+                # not reprint the summary line that sent the reader to it.
+                # Three alert lines under the very list they point at is the
+                # table telling you to go look at itself.
+                all_roots=[],
+                group=True,
+            ),
+            EXIT_OK,
         )
 
     if command == "matrix":
@@ -908,12 +1085,26 @@ def _render(run, opts, command, style, width):
                 site=run.site,
                 style=style,
                 size=width,
+                legend_on=legend_on,
             ),
             EXIT_OK,
         )
 
     return (
-        render_atlas(roots, meta=run.meta, changes=changes, site=run.site, style=style, size=width),
+        render_atlas(
+            roots,
+            meta=run.meta,
+            changes=changes,
+            site=run.site,
+            style=style,
+            size=width,
+            hidden=hidden,
+            legend_on=legend_on,
+            # The unfiltered list, so the summary lines can count the rows the
+            # default view deliberately holds back.
+            all_roots=run.roots,
+            group=not show_all,
+        ),
         EXIT_OK,
     )
 

@@ -1060,3 +1060,79 @@ def test_the_treemap_and_the_table_agree_about_what_was_measured():
     # headroom, so sizing a tile by it would let a shared /tmp dwarf the
     # user's own project directory.
     assert "nothing of yours to size" in reason
+
+
+def test_json_respects_a_command_that_filters_roots():
+    """`dirscape stranded --json` emitted every root, so a script asking for
+    stranded storage had to re-implement the filter.
+    """
+    import json as jsonlib
+
+    run = cli.Run()
+    held = _measured(_root("/project/dahlias", "project-dahlias", reach=Reach.CLOSED))
+    held.stranded = True
+    away = Root("", role="archive")
+    away.allocated = confirmed()
+    away.mounted = refuted(VerdictCategory.NOT_MOUNTED_HERE)
+    away.policy = {"allocation_location": "cfs4/acct"}
+    ordinary = _measured(_root("/home/me", "home"))
+    ordinary.role = "home"
+    run.roots = [held, away, ordinary]
+
+    for command, expected in (("stranded", 1), ("elsewhere", 1)):
+        opts = cli.build_parser().parse_args([command, "--json"])
+        text, code = cli._render(run, opts, command, style=None, width=None)
+        assert code == cli.EXIT_OK
+        payload = jsonlib.loads(text)
+        assert len(payload["roots"]) == expected, "%s emitted %d roots" % (
+            command,
+            len(payload["roots"]),
+        )
+
+
+def test_why_accepts_an_allocation_location():
+    """It is what `dirscape elsewhere` prints, so it is what a reader pastes
+    back in. `os.path.abspath` had already turned `cfs4/hpc-staff` into
+    `$PWD/cfs4/hpc-staff` and reported that as missing.
+    """
+    from dirscape.render import resolve_style
+
+    run = cli.Run()
+    away = Root("", role="archive")
+    away.allocated = confirmed("acct allocation on cfs4/acct")
+    away.mounted = refuted(VerdictCategory.NOT_MOUNTED_HERE, "no filesystem here")
+    away.policy = {
+        "allocation_location": "cfs4/acct",
+        "allocation_gb": 20480.0,
+        "allocation_accounts": ["acct"],
+    }
+    run.roots = [away]
+
+    text, code = cli._why(run, "cfs4/acct", resolve_style(color="never", stream=None))
+
+    assert code == cli.EXIT_OK
+    assert "cfs4/acct" in text
+    assert "an allocation, not a path on this node" in text
+    # 20480 DECIMAL GB is 20.48e12 bytes, which is 18.6 TiB and renders as
+    # 19T. The database publishes decimal GB and the display is binary, so the
+    # number a reader sees is smaller than the one in the allocation table;
+    # that is correct, and asserting 20T here was my arithmetic being wrong
+    # rather than the code.
+    assert "19T" in text, "the allocated size should be shown: %r" % (text,)
+    assert "does not exist" not in text
+
+
+def test_why_on_a_location_with_a_leading_slash_also_matches():
+    """A reader may type it either way."""
+    from dirscape.render import resolve_style
+
+    run = cli.Run()
+    away = Root("", role="archive")
+    away.allocated = confirmed()
+    away.mounted = refuted(VerdictCategory.NOT_MOUNTED_HERE)
+    away.policy = {"allocation_location": "cfs4/acct"}
+    run.roots = [away]
+
+    text, code = cli._why(run, "/cfs4/acct", resolve_style(color="never", stream=None))
+    assert code == cli.EXIT_OK
+    assert "an allocation" in text

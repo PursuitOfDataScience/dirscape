@@ -358,6 +358,20 @@ three days into the future reads as "dated ahead of this node" rather than as a
 negative age; and the `elsewhere` sizes are decimal GB matching the site tool
 exactly (256000 GB renders as 233T, which is 232.8 TiB).
 
+### Fourth hunt: two gaps between the views and the flags
+
+- **`--json` ignored the verb.** `dirscape stranded --json` emitted every
+  root, so a script asking for stranded storage had to re-implement the
+  filter, and `dirscape elsewhere --json` did the same. The three commands
+  that FILTER roots now filter them in JSON too; `matrix`, `tree` and `map`
+  are presentation variants of one set and are left alone.
+- **`why` could not consume what `elsewhere` prints.** An allocation location
+  such as `cfs4/hpc-staff` is exactly what a reader pastes back in, and
+  `os.path.abspath` had already turned it into `$PWD/cfs4/hpc-staff` and
+  reported that as missing. It matches on the raw argument now, with or
+  without a leading slash, and explains the allocation: size, account, and the
+  fact that the absence is about this node rather than about the storage.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

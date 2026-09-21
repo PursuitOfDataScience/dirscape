@@ -1047,6 +1047,51 @@ def _visible(run, show_all):
 # --------------------------------------------------------------------------
 
 
+def _why_allocation(root, style):
+    # type: (object, object) -> str
+    """Explain a root that the allocation database names and this node lacks.
+
+    Separate from `_why` because every probe it would print is inapplicable:
+    with no path there is nothing to stat, so no reach, no fileset and no
+    quota. What is known is the account, the size and the fact that the
+    absence is about this node rather than about the storage.
+    """
+    policy = root.policy or {}
+    location = str(policy.get("allocation_location") or "?")
+    out = [style.head(location), style.dim("  an allocation, not a path on this node"), ""]
+
+    gb = policy.get("allocation_gb")
+    if isinstance(gb, (int, float)) and gb > 0:
+        out.append("  %-11s %s" % ("size", render_fields.human_bytes(int(gb * 1000 * 1000 * 1000))))
+    accounts = policy.get("allocation_accounts")
+    if isinstance(accounts, (list, tuple)) and accounts:
+        out.append("  %-11s %s" % ("account", ", ".join(str(a) for a in accounts)))
+    if root.role:
+        out.append("  %-11s %s" % ("role", root.role))
+    out.append("")
+    out.append(
+        "  %s %-9s %s"
+        % (
+            root.allocated.glyph(),
+            "allocated",
+            style.dim(root.allocated.reason or root.allocated.label),
+        )
+    )
+    out.append(
+        "  %s %-9s %s"
+        % (root.mounted.glyph(), "mounted", style.dim(root.mounted.reason or root.mounted.label))
+    )
+    out.append("")
+    out.append(
+        style.dim(
+            "  Nothing here could be measured, because no path for it exists on\n"
+            "  this node. That is a fact about where you are standing and not\n"
+            "  about the storage."
+        )
+    )
+    return "\n".join(out)
+
+
 def _why(run, path, style):
     # type: (Run, str, object) -> Tuple[str, int]
     """One path, explained in a screen you can read.
@@ -1075,6 +1120,19 @@ def _why(run, path, style):
         if getattr(root, "path", "") == target:
             match = root
             break
+
+    if match is None:
+        # An allocation LOCATION, which is what `dirscape elsewhere` prints and
+        # what a reader will therefore paste back in. It is not a path, so the
+        # loop above cannot find it and `os.path.abspath` had already turned
+        # `cfs4/hpc-staff` into `$PWD/cfs4/hpc-staff` and reported that as
+        # missing. Matched on the raw argument, before that mangling.
+        typed = (path or "").strip().strip("/")
+        if typed:
+            for root in run.roots:
+                location = str((root.policy or {}).get("allocation_location") or "")
+                if location and location.strip("/") == typed:
+                    return _why_allocation(root, style), EXIT_OK
     if match is None:
         best = ""
         for root in run.roots:
@@ -1265,7 +1323,23 @@ def _render(run, opts, command, style, width):
 
     if _merge_flag(opts, "json", False):
         caveats = list(run.warnings)
-        return render_json(roots, meta=run.meta, changes=changes, caveats=caveats), EXIT_OK
+        # A command that FILTERS roots must filter them here too. `--json`
+        # used to ignore the verb entirely, so `dirscape stranded --json`
+        # emitted every root and a script asking for stranded storage had to
+        # re-implement the filter. `matrix`, `tree` and `map` are presentation
+        # variants of the same set and are left alone.
+        subject = roots
+        if command == "stranded":
+            subject = [r for r in run.roots if r.stranded]
+        elif command == "elsewhere":
+            subject = [r for r in run.roots if r.elsewhere]
+        elif command == "new":
+            changed = {c.path for c in changes if getattr(c, "path", "")}
+            subject = [r for r in run.roots if r.path and r.path in changed]
+        return (
+            render_json(subject, meta=run.meta, changes=changes, caveats=caveats),
+            EXIT_OK,
+        )
 
     if command == "why":
         return _why(run, opts.path, style)

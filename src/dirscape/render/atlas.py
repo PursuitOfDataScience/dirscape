@@ -60,20 +60,23 @@ __all__ = ["render", "COLUMNS", "DROP_STAGES", "KEEP_COLUMNS"]
 #: `used / quota` is one statement and the heading has to say so.
 #: Column headings, in order. **One word each, and one figure per cell.**
 #:
-#: **`limit` is NOT here, and that is what makes `free` a primary number.**
-#: The three-column form was `used`, `limit`, `free`, and the owner's
-#: objection landed: "why is the free column really needed? it makes no sense.
-#: it's just a product of the two previous columns." On a capped row it was
-#: exactly that, `limit` minus `used`, and a table that prints a subtraction
-#: it just showed you the operands for is padding with arithmetic.
+#: **`free` is NOT here. Only the two figures the filesystem actually
+#: reports are.** The three-column form was `used`, `limit`, `free`, and the
+#: owner's objection was that the third is arithmetic on the first two: "it's
+#: just a product of the two previous columns", then, after `limit` was
+#: dropped instead, "why is free column still there. makes no sense."
 #:
-#: Of the two, `free` is the one to keep. It answers the question that brought
-#: the reader ("can I put 2 TB here"), it is the number they act on, and it is
-#: answerable on every row: under a quota it is the remaining allowance, with
-#: no quota it is the filesystem's headroom, and where both are known it is
-#: the smaller. `limit` was answerable on six rows of ten and contributed four
-#: of the eight `?` marks the owner then asked about. It survives in `why` and
-#: in `--json`, and `used` plus `free` reconstructs it anyway.
+#: Dropping `limit` and keeping `free` was the wrong half. `used` and `limit`
+#: are what a quota backend measures and prints; `free` is a subtraction this
+#: view was performing and then displaying next to its own operands. A table
+#: shows what was measured, and a reader who wants the difference can take
+#: it, which is the same reason there is no percentage column.
+#:
+#: The cost is real and is accepted: on a mount with no quota system both
+#: cells read `?`, and the filesystem's own headroom (which `statvfs` knows
+#: and `free` used to show) is no longer on the table. It is not a per-user
+#: figure, so it never sat honestly beside two that are; it is in `why`,
+#: labelled, and in `--json`.
 #:
 #: `space` and `files / limit` were the last two headings carrying more than
 #: one measurement, and the owner named both: "simply saying 11T used but no
@@ -95,14 +98,21 @@ COLUMNS = (
     "kind",
     "path",
     "where",
-    "reach",
+    # `access`, not `reach`. Owner: "reach doesn't make sense either." It was
+    # the model's word for a tri-state (listable / traverse-only / closed) and
+    # it leaked out of the model onto a heading, which is the same mistake
+    # `role` made one round earlier. A reader asks what they can DO here, and
+    # `why` has labelled that field `access` all along, so the table and the
+    # detail view now use one word for one thing. `Reach` stays the type's
+    # name and `--json` still carries `reach`, which is the wire vocabulary.
+    "access",
     "used",
-    "free",
+    "limit",
     "files",
     "policy",
 )
 
-_ROLE, _PATH, _WHERE, _REACH, _USED, _FREE, _FILES, _POLICY = range(8)
+_ROLE, _PATH, _WHERE, _REACH, _USED, _LIMIT, _FILES, _POLICY = range(8)
 
 #: Never dropped. The path identifies the row and WHERE carries the answer this
 #: tool is for.
@@ -148,7 +158,7 @@ _ALIGNS = ("left", "left", "left", "left", "right", "right", "right", "left")
 #: smaller version of the fact but a different and false one, and every cell
 #: in these columns is short enough that squeezing one would never be the
 #: difference between fitting and not.
-_ATOMIC = (_PATH, _USED, _FREE, _FILES)
+_ATOMIC = (_PATH, _USED, _LIMIT, _FILES)
 
 _NOTE_LIMIT = 4
 
@@ -210,7 +220,7 @@ def _row(root, style, site):
         fields.where_cell(root, style),
         fields.reach_cell(root, style),
         used,
-        fields.free_cell(root, style),
+        fields.limit_cell(root, style),
         fields.file_count_cell(root, style),
         fields.policy_cell(root, site),
     ]
@@ -663,7 +673,7 @@ def render(
             # stopped appearing at all: a quotaless site rendered `?` for
             # every root while `statvfs` had the answer.
             facts = [
-                row[i] for i in (_WHERE, _REACH, _USED, _FREE) if row[i] and row[i] != "?"
+                row[i] for i in (_WHERE, _REACH, _USED, _LIMIT) if row[i] and row[i] != "?"
             ] or [row[_USED]]
             out.append(_INDENT + "  ".join(facts))
         out.append("")

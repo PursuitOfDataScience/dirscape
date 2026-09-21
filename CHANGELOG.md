@@ -874,6 +874,35 @@ contract rather than a label choice, and the `pytest.skip` guard keys on the
 cursor-hide escape for the same reason. Column headings are precisely the
 thing this project keeps rewording.
 
+### Twelfth pass: `access`, and the derived column is gone for real
+
+- **`reach` became `access`.** Owner: "reach doesn't make sense either." It
+  was the model's word for a tri-state (listable / traverse-only / closed)
+  and it leaked onto a heading, which is the mistake `role` made one round
+  earlier. A reader asks what they can DO here, and `why` has labelled that
+  field `access` all along, so the table and the detail view now use one word
+  for one thing. `Reach` stays the type's name and `--json` still carries
+  `reach`.
+- **`free` is off the table, and this time the right half was dropped.** The
+  previous round read the objection ("it's just a product of the two previous
+  columns") as a choice between `limit` and `free` and kept the wrong one.
+  The owner said so plainly: "why is free column still there. makes no
+  sense." `used` and `limit` are what a quota backend measures and prints.
+  `free` was a subtraction this view performed and then displayed next to its
+  own operands, which is the same reason there is no percentage column: a
+  table shows what was measured and a reader can take a difference.
+
+  **The cost is real and accepted.** On a mount with no quota system both
+  cells read `?`, and the filesystem's own headroom that `free` used to show
+  is no longer on the table. It was never a per-user figure, so it never sat
+  honestly beside two that are. It is in `why`, labelled, and in `--json`,
+  and `why` states in one line why the two cells cannot be filled: nothing is
+  counting, and finding out means walking the tree.
+
+The default view is now `kind`, `path`, `access`, `used`, `limit`, `files`:
+six columns, every heading one word, every figure cell one token, and nothing
+on it computed from anything else on it.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

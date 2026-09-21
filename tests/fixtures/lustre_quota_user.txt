@@ -1,0 +1,3 @@
+Disk quotas for usr someone (uid 5001):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+      /mnt/work 1048576 2097152 3145728       -    1234       0       0       -

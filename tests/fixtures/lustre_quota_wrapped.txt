@@ -1,0 +1,4 @@
+Disk quotas for prj 4242 (pid 4242):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+/mnt/work/a/very/long/project/mount/point/that/wraps
+                2097152 4194304 8388608       -    5678   10000   20000       -

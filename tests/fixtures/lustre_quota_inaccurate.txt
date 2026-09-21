@@ -1,0 +1,4 @@
+Disk quotas for usr someone (uid 5001):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+      /mnt/work [1048576]* 1000000 2000000 6d23h59m  [1234]       0       0       -
+Some errors happened when getting quota info. Some devices may be not working or deactivated. The data in "[]" is inaccurate.

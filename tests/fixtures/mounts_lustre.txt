@@ -1,0 +1,2 @@
+/dev/root / xfs rw,relatime 0 0
+mds@tcp:/work /mnt/work lustre rw,relatime 0 0

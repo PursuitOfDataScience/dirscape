@@ -1,0 +1,3 @@
+                         Block Limits                                    |     File Limits
+Filesystem type             KB      quota      limit   in_doubt    grace |    files   quota    limit in_doubt    grace  Remarks
+meadow3_cap FILESET     no limits                       DSS.hpc.local

@@ -123,9 +123,7 @@ class Completed(object):
         if self.returncode != 0:
             return True
         # Exited 0, said nothing, and complained. That is a failure.
-        if not self.stdout.strip() and self.stderr.strip():
-            return True
-        return False
+        return bool(not self.stdout.strip() and self.stderr.strip())
 
     @property
     def diagnostic(self):
@@ -305,9 +303,7 @@ class SubprocessRunner(Runner):
             elapsed = time.time() - started
             if self.budget is not None:
                 self.budget.charge(elapsed)
-            return Completed(
-                argv, None, out or "", err or "", elapsed_s=elapsed, timed_out=True
-            )
+            return Completed(argv, None, out or "", err or "", elapsed_s=elapsed, timed_out=True)
 
         if self.budget is not None:
             self.budget.charge(elapsed)

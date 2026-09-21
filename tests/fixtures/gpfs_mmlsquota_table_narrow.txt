@@ -1,0 +1,5 @@
+                         Block Limits                                  |   File Limits
+Filesystem  Fileset    type          KB      quota      limit in_doubt |  files  quota   limit  Remarks
+meadow3_cap software   USR    329430160          0          0        0 | 2608451      0       0  DSS.hpc.local
+meadow3_cap home       USR       858080   31457280   36700160  2229360 |   35939 300000 1000000 DSS.hpc.local
+meadow3_cap project-hpc USR  11765797488         0          0  7569424 | 3118908      0       0  DSS.hpc.local

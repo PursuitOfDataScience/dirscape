@@ -1,0 +1,13 @@
+ 
+Quota information updated at :  2026-09-21 08:30:00
+---------------------------------------------------------------------------
+fileset          type                   used      quota      limit    grace
+---------------- ---------------- ---------- ---------- ---------- --------
+Meadow2-home     blocks (user)         5.62M     30.00G     35.00G     none
+Meadow2-home     files  (user)           230     300000    1000000     none
+---------------- ---------------- ---------- ---------- ---------- --------
+Capacity Filesystem: project2 (GPFS)
+---------------- ---------------- ---------- ---------- ---------- --------
+hpc              blocks (group)      198.90T  unlimited  unlimited     none
+hpc              files  (group)     51961393  unlimited  unlimited     none
+---------------------------------------------------------------------------

@@ -1,0 +1,2 @@
+Disk quotas for usr someone (uid 5001):
+lfs quota: quota is off for /mnt/work

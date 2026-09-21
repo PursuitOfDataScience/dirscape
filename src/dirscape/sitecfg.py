@@ -375,9 +375,7 @@ class Site(object):
                             .replace("{cluster}", cluster)
                         )
             else:
-                out.append(
-                    template.replace("{user}", user).replace("{cluster}", cluster)
-                )
+                out.append(template.replace("{user}", user).replace("{cluster}", cluster))
         seen = set()
         deduped = []
         for path in out:
@@ -434,9 +432,7 @@ def _merge_ini(site, text, source):
                 site.role_globs.append((pattern.strip(), role))
 
     if parser.has_section("filesets"):
-        site.fileset_prefixes.extend(
-            _split_list(parser.get("filesets", "prefixes", fallback=""))
-        )
+        site.fileset_prefixes.extend(_split_list(parser.get("filesets", "prefixes", fallback="")))
         extra_groups = _split_list(parser.get("filesets", "group_prefixes", fallback=""))
         if extra_groups:
             # Replace rather than extend: a site that lists its own group
@@ -447,9 +443,7 @@ def _merge_ini(site, text, source):
 
     if parser.has_section("quota"):
         site.quota_order.extend(_split_list(parser.get("quota", "order", fallback="")))
-        site.wrapper_paths.extend(
-            _split_list(parser.get("quota", "wrapper_paths", fallback=""))
-        )
+        site.wrapper_paths.extend(_split_list(parser.get("quota", "wrapper_paths", fallback="")))
         extra_dirs = _split_list(parser.get("quota", "extra_bin_dirs", fallback=""))
         for directory in extra_dirs:
             if directory not in site.extra_bin_dirs:

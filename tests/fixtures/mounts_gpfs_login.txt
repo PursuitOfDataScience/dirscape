@@ -1,0 +1,17 @@
+/dev/sda1 /scratch/local xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sda1 /tmp xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+collie3_cap /gpfs/collie3/cap gpfs rw,relatime 0 0
+collie3_perf /gpfs/collie3/perf gpfs rw,relatime 0 0
+meadow3_perf /gpfs/meadow3/perf gpfs rw,relatime 0 0
+meadow3_cap /gpfs/meadow3/cap gpfs rw,relatime 0 0
+meadow3_cap /home gpfs rw,relatime 0 0
+meadow3_cap /project gpfs rw,relatime 0 0
+meadow3_perf /scratch/meadow3 gpfs rw,relatime 0 0
+meadow3_cap /software gpfs rw,relatime 0 0
+collie3_cap /collie3 gpfs rw,relatime 0 0
+collie3_perf /scratch/collie3 gpfs rw,relatime 0 0
+meadow3_cap /programs gpfs rw,relatime 0 0
+meadow2_cap /gpfs/meadow2/cap gpfs rw,relatime 0 0
+meadow2_perf /gpfs/meadow2/perf gpfs rw,relatime 0 0
+meadow2_cap /project2 gpfs rw,relatime 0 0
+meadow2_perf /scratch/meadow2 gpfs rw,relatime 0 0

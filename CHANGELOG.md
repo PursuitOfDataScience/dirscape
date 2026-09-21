@@ -30,6 +30,51 @@ All notable changes to `dirscape` are recorded here, newest first, following
 - `--site-template` prints a commented `/etc/dirscape/site.conf` so a site
   administrator can describe a cluster's layout without patching the package.
 
+### Fixed during integration
+
+These are defects that unit tests on the individual packages could not have
+caught, because each one lived in the wiring: a backend was right about a quota
+row and the consumer misapplied it. All six were found by running the tool
+against a live cluster, and each now has a regression test in `tests/test_cli.py`.
+
+- **Quota figures leaked across sibling directories.** A `project-hpc` row
+  whose mount had only been INFERRED as `/project` matched every `/project/*`
+  path by prefix, so `/project/abe`, `/project/bard`, `/project/dahlias`,
+  `/project/mdgreenwood` and `/project/pelican` each reported holding 11T,
+  which is a different PI's usage. Nineteen directories under
+  `/project2/reference` all read 928K the same way. Attribution now goes
+  through the fileset and never the path prefix, and a root whose fileset
+  cannot be established reports `?` rather than inheriting a parent's number.
+- **`mmlsattr` did not unmap a row it contradicted.** The contradiction test
+  was `path.startswith(row.mount + "/")`, which is False when the path IS the
+  mount, so confirming `/home` against a row whose guessed mount was exactly
+  `/home` did nothing and a `project-hpc` row kept a `/home` mount the probe
+  had just disowned.
+- **A fileset map was keyed on the bare fileset name.** `scratch` is a fileset
+  name on three of this node's six devices, so the collie3 scratch claimed the
+  junction for all of them and `/scratch/meadow3/jdoe42` printed `?` while
+  holding 22G. Keyed on `(device, fileset)` now, which is the collision
+  `QuotaRow.label` already qualified against.
+- **A quota was repeated on every subdirectory of its fileset.** A quota is a
+  property of a fileset, so it is reported once, at the point the fileset
+  enters the namespace for a fileset-scoped row and at the highest writable
+  point for a user-scoped one. Other roots in the fileset get a note saying
+  where the figure lives. Choosing the DEEPEST writable point was tried first
+  and put an 11T figure on `/project/hpc/jdoe42/.cache/tmp`.
+- **Global flags were dropped before the verb.** `dirscape new --json` worked
+  and `dirscape --json new` did not: the subcommand's copy of the flag wrote
+  its own default over the value the top-level parser had already stored.
+  Building fresh action objects per parser is necessary and not sufficient; the
+  subcommand copies now default to `argparse.SUPPRESS`.
+- **Internal bookkeeping reached a user-facing column.** Every row's POLICY
+  cell read `rank=primary`. Discovery's own keys are filtered out of the
+  rendered policy.
+
+Also corrected: the header counted mount-table entries rather than storage
+devices and reported 28 on a node with 9; allocation rows with no path printed
+`?` in every column and were indistinguishable, and now show their location
+marked as a location; and the quota backends were being asked twice per run.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

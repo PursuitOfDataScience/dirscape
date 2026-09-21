@@ -1,0 +1,6 @@
+Project quota on /work (/dev/sdb1)
+                               Inodes                     
+Project ID       Used      Soft      Hard    Warn/Grace   
+---------- --------------------------------------- 
+alpha           1234      2000      3000     00 [--------]
+bravo           4.1k         0         0     00 [--------]

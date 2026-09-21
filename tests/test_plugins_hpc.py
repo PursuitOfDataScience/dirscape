@@ -242,9 +242,7 @@ def test_detection_never_consults_the_hostname():
     source = inspect.getsource(HPCPlugin.detect)
     body = source.split('"""')
     code = body[0] + ("".join(body[2:]) if len(body) > 2 else "")
-    code = "\n".join(
-        line for line in code.splitlines() if not line.strip().startswith("#")
-    ).lower()
+    code = "\n".join(line for line in code.splitlines() if not line.strip().startswith("#")).lower()
 
     for forbidden in ("hostname", "gethostname", "uname", "fqdn", "nodename"):
         assert forbidden not in code, "detect() reads %s, which is unreliable" % forbidden

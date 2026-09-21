@@ -2,7 +2,6 @@
 an exit code is not a success signal.
 """
 
-
 import sys
 
 import pytest
@@ -16,7 +15,6 @@ from dirscape.runner import (
     SubprocessRunner,
     key_for,
 )
-
 
 # --------------------------------------------------------------------------
 # Exit codes lie

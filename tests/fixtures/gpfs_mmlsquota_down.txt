@@ -1,0 +1,3 @@
+Failed to connect to file system daemon: No such process
+mmlsquota: GPFS is down on this node.
+mmlsquota: Command failed. Examine previous error messages to determine cause.

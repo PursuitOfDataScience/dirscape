@@ -1,0 +1,6 @@
+
+Disk quotas for group hpc (gid 20008):
+                         Block Limits                                               |     File Limits
+Filesystem Fileset    type             KB      quota      limit   in_doubt    grace |    files   quota    limit in_doubt    grace  Remarks
+meadow3_cap home       GRP              16          0          0          0     none |        2       0        0        0     none DSS.hpc.local
+meadow3_cap project-hpc GRP               0          0          0          0     none |       13       0        0        0     none DSS.hpc.local

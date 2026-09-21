@@ -306,9 +306,7 @@ class HPCPlugin(SitePlugin):
             # about it. Those are reached through the mount table instead.
             return None
 
-        if name in group_set or ("pi-" + name) in group_set:
-            return True
-        return False
+        return bool(name in group_set or "pi-" + name in group_set)
 
     # -- history ---------------------------------------------------------
 
@@ -351,6 +349,7 @@ class HPCPlugin(SitePlugin):
         days = self._daily_files()
         answer = None  # type: Optional[float]
         if len(days) >= 2:
+
             def present(index):
                 # type: (int) -> bool
                 try:

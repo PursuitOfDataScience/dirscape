@@ -1,0 +1,4 @@
+/dev/root / xfs rw,relatime 0 0
+fsA /mnt/alpha gpfs rw,relatime 0 0
+fsA /mnt/alpha/inner gpfs rw,relatime 0 0
+fsB /mnt/bravo gpfs rw,relatime 0 0

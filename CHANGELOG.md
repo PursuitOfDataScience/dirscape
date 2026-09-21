@@ -538,6 +538,54 @@ fileset with 2.4G unaccounted reported that nowhere. It keys on the measurement
 now. An explanation that depends on its own decoration can be deleted by
 accident.
 
+### Sixth pass: one tone per column, and width stops being spent on blanks
+
+Four more questions off the finished table, and the last of them turned out to
+be a real defect rather than a matter of taste.
+
+- **`r-x` is the same weight as `rwx`.** The reach cell muted only the string
+  `rwx`, so on a ten row table the eight ordinary rows were grey and the one
+  read-only dataset was drawn in full brightness. Nothing was wrong with it.
+  Every answered reach state is now one tone, and the letters carry the
+  difference, which is what letters are for.
+- **The path is one colour.** It was rendered as a dim parent and a bright
+  leaf, so `/project2/reference` read as two facts in two greys. A path is one
+  string and a reader tracks a column by its tone.
+- **The percentage sits next to its numbers**, as `858M / 30G (3%)`, not
+  right-hung four columns away in a cell with no heading of its own. Detached
+  and unlabelled it read as a fourth number with no relationship to the three
+  beside it.
+- **Width is no longer spent on columns that get dropped.** WHERE reads `here`
+  on every row of an ordinary run and is removed as constant; FILES is
+  suppressed in the default view by policy; POLICY is `?` at a site that
+  publishes no purge rules. The fitting loop measured every candidate column
+  set against all seven anyway, so those three pushed each stage over budget
+  until the stage that gives up ROLE, and the caller then deleted them. At an
+  80 column terminal the reader lost the only informative column of the group:
+  the four survivors need 67 display columns of the 76 available. The constant
+  set is now excluded before fitting, so ROLE appears from 72 columns up.
+- **A confirmed attachment says nothing.** `why` opened with a bare `✓` and
+  "This storage is attached to the machine you are on" on a row that had just
+  printed a quota figure and a write answer, which had already demonstrated it.
+  That was the last unexplained mark in the view. The axis still speaks when
+  the storage is NOT attached here, which is the reading it exists for.
+
+**The frame stays sized to its content, and the alternative was measured rather
+than argued.** Filling the window was tried first, because a border stopping
+short of the right edge reads as a mistake. It reads worse: four columns come
+to about 68 display columns, so a 120 column terminal got a box ruled out to
+120 around a table hugging its left half, and the inner rule then had to choose
+between spanning the frame (a rule over nothing) or spanning the table (a
+second, shorter frame inside the first). There is no column set available to
+fill the gap with, DEVICE being the only unused one with real content and
+naming filesets like `meadow3_cap` that a reader has to ask about. Sized to the
+content there is no gap and the rule spans the text area by construction. It
+also keeps the static print and the interactive frame the same width, which
+they were not while the two disagreed.
+
+The README's sample output, its `▒` note and its `+2` note described a table
+that no longer exists, so all three were replaced from a live run.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

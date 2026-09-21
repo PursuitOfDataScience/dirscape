@@ -1013,6 +1013,68 @@ def test_the_drop_order_is_the_documented_one():
             assert kept not in stage, "path and the figure are never dropped"
 
 
+def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
+    """The fitting bug: ROLE lost to three columns that never rendered.
+
+    WHERE reads `here` on every row of an ordinary run and drops as constant,
+    and FILES and POLICY are empty on a site with no `site.conf`. The stage
+    loop measured every candidate set against all seven columns anyway, so
+    their headings alone pushed each stage over budget until the one that
+    gives up ROLE, and the caller then removed the three empty columns. The
+    reader lost the only column in that group carrying information.
+
+    The widths are the live ones from a meadow3 login node, because the bug
+    only bites once the real path and figure columns are in play: the four
+    surviving columns need 67 display columns of a 76 column body, and the
+    three empty ones cost 28 more with nothing in them.
+    """
+    from dirscape.render.atlas import (
+        _FILES,
+        _PATH,
+        _POLICY,
+        _REACH,
+        _ROLE,
+        _USED,
+        _WHERE,
+        _plan,
+    )
+
+    live = [
+        ("home", "/home/jdoe42", "857M / 30G (3%)  "),
+        ("project", "/project/hpc", " 11T / no limit  "),
+        ("scratch", "/scratch/collie3/jdoe42", "  0B / 400G (0%) "),
+        ("scratch", "/scratch/meadow3/jdoe42", " 22G / 100G (22%)"),
+        ("software", "/software", "314G / no limit  "),
+    ]
+    rows = []
+    for role, path, used in live:
+        row = [""] * 7
+        row[_ROLE], row[_PATH], row[_USED] = role, path, used
+        row[_REACH] = "rwx"
+        # Constant on every row, which is exactly why they get removed, and
+        # exactly why their widths must not be charged for: WHERE reads `here`
+        # wherever the storage is attached, the caller suppresses inode figures
+        # in the default view outright, and POLICY is `?` at a site that
+        # publishes no purge or backup rules.
+        row[_WHERE] = "here"
+        row[_FILES] = "37k / 300k"
+        row[_POLICY] = "?"
+        rows.append(row)
+
+    empty = [_WHERE, _FILES, _POLICY]
+
+    blind, _ = _plan(rows, 76)
+    assert _ROLE not in blind, (
+        "the bug this guards: measured against the empty columns too, the only "
+        "stage that fits is the one that gives up role"
+    )
+
+    columns, stacked = _plan(rows, 76, skip=empty)
+    assert not stacked
+    assert _ROLE in columns, "role fits at 80 columns and must not be dropped for blanks"
+    assert _PATH in columns and _USED in columns and _REACH in columns
+
+
 def test_why_does_not_print_one_line_per_symlink():
     """A home directory with eleven relocated dotfiles produced eleven
     near-identical `note` lines, which was most of a thirty-line screen.
@@ -1052,6 +1114,14 @@ def test_why_omits_a_probe_that_never_ran():
     ("allocated", "mounted") at a reader, so the assertion moved onto what it
     was always about. The allocation probe never ran and must be silent; the
     reachability probe answered and must show its answer.
+
+    Moved a second time when a CONFIRMED attachment went silent too, for the
+    reason `_findings` records: a row that has just printed a quota figure and
+    a write answer has demonstrated the storage is attached, so the sentence
+    restated it behind an unexplained `✓`. That makes the attachment axis a
+    poor witness for "the answered probe shows", so the witness is now the
+    access line, which is the reachability probe speaking in the same run. The
+    attachment axis gets its own case below, on the reading where it matters.
     """
     run = cli.Run()
     root = _measured(_root("/project/lab", "project-lab"))
@@ -1065,7 +1135,30 @@ def test_why_omits_a_probe_that_never_ran():
 
     assert "not probed" not in text, "a probe that never ran was reported anyway"
     assert "allocation" not in text, "the unasked allocation question must be silent"
-    assert "attached to the machine you are on" in text, "the answered probe must show"
+    assert "you can see what is in this directory" in text, "the answered probe must show"
+    assert "\u2713" not in text, "a confirmed axis has no mark to explain"
+
+
+def test_why_speaks_up_when_the_storage_is_not_attached_here():
+    """The attachment axis earns a sentence on the reading that matters.
+
+    Silence on a confirmed mount is the whole point of the previous test, and
+    it would be satisfied just as well by code that never mentioned attachment
+    at all. This is the case the axis exists for: `/cfs3` is there from a login
+    node and absent from a compute one, and a reader looking at a path they
+    cannot use needs to be told it is a fact about the machine.
+    """
+    run = cli.Run()
+    root = _root("/cfs3/kestrel-lab", "cfs3-night", device="cfs3")
+    root.mounted = refuted(VerdictCategory.NOT_MOUNTED_HERE)
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, _ = cli._why(run, "/cfs3/kestrel-lab", resolve_style(color="never", stream=None))
+
+    assert "not attached to the machine you are on" in text
+    assert "fact about this machine" in text, "and not a fact about the storage"
 
 
 # --------------------------------------------------------------------------

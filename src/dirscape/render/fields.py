@@ -495,7 +495,12 @@ def _figure_cell(root, snapshot, kind, formatter, style, percent=False):
         # Width 3 so 3%, 22% and 100% share a right edge. Left-aligned they
         # formed a ragged fringe down the column, which is the one place a
         # percentage is worth reading next to its neighbours.
-        text += "  " + style.tint("%3d%%" % (int(round(fraction * 100)),), fraction)
+        # Parenthesised and ADJACENT, not flung to the right edge of a wide
+        # cell. The alignment pass right-hangs this column, so a bare `3%`
+        # ended up far from the `839M / 30G` it describes and under no heading
+        # of its own, and the owner asked twice what it meant. Beside the two
+        # numbers, in brackets, it reads as what it is: those two divided.
+        text += " " + style.tint("(%d%%)" % (int(round(fraction * 100)),), fraction)
         if fraction >= 1.0:
             text += style.bad(g.warn)
     if row.in_doubt:
@@ -739,15 +744,18 @@ def reach_cell(root, style=None):
         return style.warn(text + g.warn)
     if root.reach == Reach.CLOSED:
         return style.bad(text)
-    if text == "rwx":
-        # Eight of ten rows of the live default view read `rwx`, so at full
-        # weight the column was a block of identical letters drawing the eye
-        # away from the one row that reads `r-x`. Muted rather than dim: it is
-        # a probe RESULT and not context, and the tiers are the two different
-        # things. The restricted rows keep full weight, which is the whole
-        # reason to quiet this one.
-        return style.muted(text)
-    return text
+    # Every ANSWERED reach reads the same weight, `rwx` and `r-x` alike.
+    #
+    # Muting only `rwx` was well meant and misfired: with eight of ten rows
+    # reading `rwx`, the one row reading `r-x` was the only bright cell in the
+    # column, so a read-only dataset directory looked flagged. The owner asked
+    # "why is r-x a different color?", which is the question a reader should
+    # never have to ask about a cell that is merely normal.
+    #
+    # Colour is reserved for the two states that are genuinely worth stopping
+    # on, and both are handled above: CLOSED in `bad`, traverse-only in `warn`
+    # with its own glyph. Not being able to write somewhere is ordinary.
+    return style.muted(text)
 
 
 def role_cell(root, style=None):

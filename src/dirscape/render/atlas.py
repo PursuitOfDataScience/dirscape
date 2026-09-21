@@ -147,10 +147,12 @@ def _path_cell(root, style=None):
         # `/project/hpc +2` and asked what it meant; the honest answer was "a
         # number you cannot use", and the count survives in `--json` and
         # `--summary` for anyone who wants it.
-        if style is None or not style.enabled:
-            return root.path
-        lead, sep, leaf = root.path.rpartition("/")
-        return style.dim(lead + sep) + leaf
+        # ONE tone. Dimming the parent directories and leaving the leaf bright
+        # was meant to put the eye on the part that differs between sibling
+        # rows; what it produced was a column of two-tone paths, and the owner
+        # read it as "some grey some green" and asked why. A path is one
+        # identifier and it reads as one.
+        return root.path
     location = root.policy.get("allocation_location") if root.policy else None
     if location:
         # The trailing marker is not decoration. It is the difference between
@@ -301,15 +303,29 @@ def _column_width(headers, rows, columns, indent="", gutter="  "):
     return total
 
 
-def _plan(rows, window):
-    # type: (Sequence[Sequence[str]], int) -> Tuple[List[int], bool]
+def _plan(rows, window, skip=()):
+    # type: (Sequence[Sequence[str]], int, Sequence[int]) -> Tuple[List[int], bool]
     """Choose the column set: ``(columns, stacked)``.
 
     The first stage that fits wins. When none does, the caller stacks, which is
     the only degradation left that does not shorten a path.
+
+    ``skip`` is the columns the caller has ALREADY decided not to render, and
+    passing it is load bearing rather than an optimisation. Without it this
+    measured every stage against the full seven columns and then the caller
+    removed the constant ones afterwards, so width was being spent on columns
+    that were about to be thrown away: at an 80 column terminal the widths of
+    WHERE, FILES and POLICY pushed every stage over budget until stage three,
+    which drops ROLE, and ROLE was then the only column the reader actually
+    lost. Measured without them the same table needs 67 columns of 76 and
+    keeps ROLE. A view that discards information to make room for blanks has
+    the fitting backwards.
     """
+    skip = set(skip)
     for dropped in DROP_STAGES:
-        columns = [i for i in range(len(COLUMNS)) if i not in dropped]
+        columns = [i for i in range(len(COLUMNS)) if i not in dropped and i not in skip]
+        if not columns:
+            continue
         if _column_width(COLUMNS, rows, columns, _INDENT, _GUTTER) <= window:
             return columns, False
     return [_PATH, _USED], True
@@ -631,7 +647,11 @@ def render(
         # more than a glance.
         constant = set(constant) | {_FILES}
 
-    columns, stacked = _plan(rows, budget)
+    # The constant set goes IN, so the stage loop never spends width on a
+    # column that is about to be removed. KEEP_COLUMNS are excluded from the
+    # skip list because `_constant_columns` already protects them and a stage
+    # that dropped PATH or USED would have nothing left to say.
+    columns, stacked = _plan(rows, budget, skip=[i for i in constant if i not in KEEP_COLUMNS])
     columns = [i for i in columns if i not in constant] or columns
     dropped = [COLUMNS[i] for i in range(len(COLUMNS)) if i not in columns]
     # A dropped-because-constant column is not news: the reader lost nothing.
@@ -727,7 +747,22 @@ def _finish(lines, style, window, frame):
     """Frame the block, or hand back the bare lines."""
     if not frame:
         return "\n".join(lines)
-    return panel(lines, style=style, size=window)
+    # `shrink=True`, and the alternative was MEASURED rather than reasoned
+    # about. Filling the window was tried first, because a border floating
+    # short of the right edge reads as a mistake. It reads worse: the four
+    # columns this view usually has come to about 65 display columns, so at a
+    # 120 column terminal the box was ruled out to 120 around a table hugging
+    # its left half, and the inner rule then had to choose between spanning
+    # the frame (a rule over nothing) or spanning the table (a second, shorter
+    # frame inside the first). There is no third column set to fill the gap
+    # with: WHERE reads `here` on every row and drops as constant, FILES and
+    # POLICY are empty on a site with no `site.conf`, and DEVICE is real but
+    # names filesets (`meadow3_cap`) that a reader has to ask about.
+    #
+    # Sized to the content there is no gap, the rule spans the whole text area
+    # by construction, and the box reads as one object. That is the only
+    # reason to draw a frame at all.
+    return panel(lines, style=style, size=window, shrink=True)
 
 
 def _alerts(census, stranded, changed, style):

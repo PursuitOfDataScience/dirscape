@@ -1256,6 +1256,16 @@ def _findings(root, style, axes=("mounted", "present", "allocated")):
     A confirmed `present` prints nothing. The figures and the access line above
     it cannot be there for a directory that is not, so the line only ever said
     `ok` about something already visible.
+
+    **A confirmed `mounted` prints nothing either, for the same reason and one
+    more.** Reason one: a row that just printed `0B / 400G` and `you can write
+    to it` has already demonstrated the storage is attached, so a sentence
+    asserting it is a restatement. Reason two: it was the last unexplained
+    mark left in this view. It rendered as a bare `✓` opening a sentence, and
+    a reader who has to ask what a mark means has been handed a puzzle instead
+    of an answer, which is the standing rule that removed the rest of them.
+    The axis still speaks when it is refuted or in doubt, which is the case
+    worth a sentence: `/cfs3` from a compute node.
     """
     g = style.g
     out = []  # type: List[Tuple[str, str]]
@@ -1266,14 +1276,8 @@ def _findings(root, style, axes=("mounted", "present", "allocated")):
         glyph = render_fields.verdict_glyph(verdict, g)
         if axis == "mounted":
             if verdict.confirmed:
-                out.append(
-                    (
-                        style.ok(glyph),
-                        "This storage is attached to the machine you are on, and not every "
-                        "machine has every filesystem.",
-                    )
-                )
-            elif verdict.refuted:
+                continue
+            if verdict.refuted:
                 # Two endings, because only one of them is always true. A row
                 # with no path here has nothing to measure, and saying so is
                 # the whole answer for an allocation; a row that HAS a path

@@ -1666,6 +1666,28 @@ def _why(run, path, style, size=None, verbose=False):
     out.extend(_field(style, room, "access", _access_phrase(match)))
     out.extend(_field(style, room, "backups", _keeping_phrase(match, run.site)))
 
+    # Why `used` is a question mark, in the one case where it always is.
+    #
+    # The owner, looking at two scratch rows reading `?` for used and files:
+    # "why is this place having so many '?'? what does it mean? you can't even
+    # get the numbers? or what?" The answer is literally yes, we cannot: these
+    # are mounted with no quota system, so nothing is accounting for per-user
+    # usage and the only way to find out is to walk the directory, which this
+    # tool does not do at any price. `?` is therefore correct and must not
+    # soften, but a reader should not have to guess that from the mark. One
+    # line, and only on the rows that have it.
+    row, _how, _reason = render_fields.pick_row(getattr(match, "quota", None), match.path, "blocks")
+    if row is None and (match.policy or {}).get("free_bytes") is not None:
+        out.extend(
+            _field(
+                style,
+                room,
+                "note",
+                "no quota is enforced here, so nobody is counting your usage: "
+                "use du or rdu for that. free is the whole filesystem, shared.",
+            )
+        )
+
     # 3. The one piece of provenance that is a fact about the STORAGE rather
     #    than about dirscape, so it stays in the default view.
     #

@@ -60,6 +60,21 @@ __all__ = ["render", "COLUMNS", "DROP_STAGES", "KEEP_COLUMNS"]
 #: `used / quota` is one statement and the heading has to say so.
 #: Column headings, in order. **One word each, and one figure per cell.**
 #:
+#: **`limit` is NOT here, and that is what makes `free` a primary number.**
+#: The three-column form was `used`, `limit`, `free`, and the owner's
+#: objection landed: "why is the free column really needed? it makes no sense.
+#: it's just a product of the two previous columns." On a capped row it was
+#: exactly that, `limit` minus `used`, and a table that prints a subtraction
+#: it just showed you the operands for is padding with arithmetic.
+#:
+#: Of the two, `free` is the one to keep. It answers the question that brought
+#: the reader ("can I put 2 TB here"), it is the number they act on, and it is
+#: answerable on every row: under a quota it is the remaining allowance, with
+#: no quota it is the filesystem's headroom, and where both are known it is
+#: the smaller. `limit` was answerable on six rows of ten and contributed four
+#: of the eight `?` marks the owner then asked about. It survives in `why` and
+#: in `--json`, and `used` plus `free` reconstructs it anyway.
+#:
 #: `space` and `files / limit` were the last two headings carrying more than
 #: one measurement, and the owner named both: "simply saying 11T used but no
 #: cap is very confusing. all the entries in space aren't consistent at all",
@@ -69,18 +84,25 @@ __all__ = ["render", "COLUMNS", "DROP_STAGES", "KEEP_COLUMNS"]
 #: number. Splitting them costs two columns of width and buys a table where
 #: every numeric cell is one token and every heading is one word.
 COLUMNS = (
-    "role",
+    # `kind`, not `role`. The column holds `home`, `project`, `scratch`,
+    # `dataset`, `software` and `local`, which is what KIND of storage each
+    # row is, and the owner named the heading: "the word role is poorly
+    # chosen." It was right in the model's terms, where a root's role is what
+    # the site uses it for, and wrong on screen: a reader does not ask what
+    # role their scratch directory plays, they ask what sort of place it is.
+    # The wire vocabulary is untouched: `--json` still carries `role`, because
+    # a consumer may switch on it. Same split as `CATEGORY_LABELS`.
+    "kind",
     "path",
     "where",
     "reach",
     "used",
-    "limit",
     "free",
     "files",
     "policy",
 )
 
-_ROLE, _PATH, _WHERE, _REACH, _USED, _LIMIT, _FREE, _FILES, _POLICY = range(9)
+_ROLE, _PATH, _WHERE, _REACH, _USED, _FREE, _FILES, _POLICY = range(8)
 
 #: Never dropped. The path identifies the row and WHERE carries the answer this
 #: tool is for.
@@ -105,10 +127,6 @@ DROP_STAGES = (
     # smaller version of this tool's answer but the absence of one. WHERE is
     # context and reads `here` on nearly every row anyway.
     (_POLICY, _FILES, _ROLE, _REACH, _WHERE),
-    # LIMIT before FREE, because FREE is the actionable half. "How much can I
-    # still put here" is the question that brought the reader, and a cap they
-    # cannot act on without subtracting is context.
-    (_POLICY, _FILES, _ROLE, _REACH, _WHERE, _LIMIT),
 )
 
 #: What the table is indented by, inside the frame, and the run of spaces
@@ -124,13 +142,13 @@ _GUTTER = "    "
 
 #: Every figure column is right-aligned, which is what `_align_figures` used
 #: to fake inside one composed cell and what real columns do for free.
-_ALIGNS = ("left", "left", "left", "left", "right", "right", "right", "right", "left")
+_ALIGNS = ("left", "left", "left", "left", "right", "right", "right", "left")
 
 #: No figure column may be squeezed. `314G` truncated to `31...` is not a
 #: smaller version of the fact but a different and false one, and every cell
 #: in these columns is short enough that squeezing one would never be the
 #: difference between fitting and not.
-_ATOMIC = (_PATH, _USED, _LIMIT, _FREE, _FILES)
+_ATOMIC = (_PATH, _USED, _FREE, _FILES)
 
 _NOTE_LIMIT = 4
 
@@ -192,7 +210,6 @@ def _row(root, style, site):
         fields.where_cell(root, style),
         fields.reach_cell(root, style),
         used,
-        fields.limit_cell(root, style),
         fields.free_cell(root, style),
         fields.file_count_cell(root, style),
         fields.policy_cell(root, site),
@@ -646,7 +663,7 @@ def render(
             # stopped appearing at all: a quotaless site rendered `?` for
             # every root while `statvfs` had the answer.
             facts = [
-                row[i] for i in (_WHERE, _REACH, _USED, _LIMIT, _FREE) if row[i] and row[i] != "?"
+                row[i] for i in (_WHERE, _REACH, _USED, _FREE) if row[i] and row[i] != "?"
             ] or [row[_USED]]
             out.append(_INDENT + "  ".join(facts))
         out.append("")

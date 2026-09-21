@@ -829,6 +829,51 @@ breaking. Asserted across every row at three window sizes, because a
 single-row test cannot see a width that varies BETWEEN rows, which is what
 the reader saw.
 
+### Eleventh pass: no derived column, one tone, and `kind`
+
+- **`limit` came off the table, which is what makes `free` a real number.**
+  The owner: "why is the free column really needed? it makes no sense. it's
+  just a product of the two previous columns." On a capped row it was exactly
+  `limit` minus `used`, and a table that prints a subtraction next to its own
+  operands is padding with arithmetic. Of the two, `free` is the one to keep:
+  it answers the question that brought the reader ("can I put 2 TB here"), it
+  is the number they act on, and it is answerable on every row. `limit` was
+  answerable on six rows of ten. It stays in `why` and in `--json`, and
+  `used` plus `free` reconstructs it.
+- **Half the question marks went with it**, from eight to four. The four that
+  remain are real and now say why. Owner: "why is this place having so many
+  '?'? what does it mean? you can't even get the numbers? or what?" The
+  answer is literally yes, we cannot: those mounts have no quota system, so
+  nothing is accounting for per-user usage and the only way to find out is to
+  walk the tree, which this tool does not do at any price. `why` says that in
+  one line on exactly the rows that have it, and points at `du` or `rdu`.
+- **The `used` column is one tone.** It was tinted by fullness where a
+  fraction existed and muted where none did, so `866M` (3% of a 30G quota)
+  was a graded blue beside `11T` (uncapped, so no fraction) in grey. Owner:
+  "in the used column, both entries have different colors. which is shit."
+  Correct, and structurally rather than as a matter of taste: a grading only
+  half the rows can carry is not a scale, it is two categories a reader has
+  to decode before comparing two numbers. `free` carries "how much room is
+  left" as a figure on every row, which is what the grading approximated.
+- **`role` became `kind`.** Owner: "the word role is poorly chosen." The
+  column holds `home`, `project`, `scratch`, `dataset`, `software`, `local`,
+  which is what sort of place each row is; nobody asks what role their
+  scratch directory plays. `--json` still carries `role`, because a consumer
+  may switch on it, which is the same wire-versus-display split as
+  `CATEGORY_LABELS`.
+
+**The pty test's trigger went stale for the THIRD time, and it is now
+anchored on something that cannot rot.** It waits for a marker in the output
+before sending keys, and that marker was a column heading: `used / quota`,
+then `space`, then `limit`. Each rename broke it silently in the worst
+possible way, because no keys are sent, the loop spins to its 90 second
+deadline, and the assertions pass on the first paint alone, so the suite went
+from 14 seconds to 100 while claiming to test a drill-down it never
+performed. It waits for the key hint line now, which is the interactive
+contract rather than a label choice, and the `pytest.skip` guard keys on the
+cursor-hide escape for the same reason. Column headings are precisely the
+thing this project keeps rewording.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

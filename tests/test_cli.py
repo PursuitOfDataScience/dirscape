@@ -666,7 +666,7 @@ def test_a_repeated_role_is_printed_once():
     # spaces, because the table is indented inside a frame now and every row
     # begins with whitespace.
     lines = _content(text)
-    heading = next(ln for ln in lines if ln.split()[:1] == ["role"])
+    heading = next(ln for ln in lines if ln.split()[:1] == ["kind"])
     at = heading.index("path")
     body = [ln for ln in lines if ln != heading and "/" in ln[at:]]
     roles = [ln[:at].strip() for ln in body]
@@ -714,11 +714,11 @@ def test_every_figure_column_is_right_aligned_and_one_token_per_cell():
         root.role = "project"
 
     lines = _content(atlas.render(roots, style=style, group=True, size=100))
-    heading = next(ln for ln in lines if "used" in ln and "limit" in ln)
+    heading = next(ln for ln in lines if "used" in ln and "free" in ln)
     body = [ln for ln in lines if re.search(r"/[abcd]\b", ln)]
     assert len(body) == 4
 
-    for column in ("used", "limit", "free"):
+    for column in ("used", "free"):
         at = heading.index(column) + len(column)
         for line in body:
             cell = line[:at]
@@ -1034,7 +1034,12 @@ def test_the_drop_order_is_the_documented_one():
     from dirscape.render import atlas
 
     assert atlas.DROP_STAGES[0] == ()
-    names = [[atlas.COLUMNS[i] for i in stage] for stage in atlas.DROP_STAGES]
+    # Indexed by the internal name, which is still `_ROLE`; the HEADING reads
+    # `kind` because that is what the column holds, and the two are allowed to
+    # differ exactly as `--json`'s `role` key and this heading do.
+    names = [
+        [atlas.COLUMNS[i].replace("kind", "role") for i in stage] for stage in atlas.DROP_STAGES
+    ]
     assert names == [
         [],
         ["policy"],
@@ -1042,10 +1047,6 @@ def test_the_drop_order_is_the_documented_one():
         ["policy", "files", "role"],
         ["policy", "files", "role", "reach"],
         ["policy", "files", "role", "reach", "where"],
-        # LIMIT before FREE: "how much can I still put here" is the question
-        # that brought the reader, and a cap they have to subtract from is
-        # context. The narrowest table is path, used and free.
-        ["policy", "files", "role", "reach", "where", "limit"],
     ]
     for earlier, later in zip(atlas.DROP_STAGES, atlas.DROP_STAGES[1:]):
         assert set(earlier) < set(later), "a stage may only add to the one before it"
@@ -1072,7 +1073,6 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
     from dirscape.render.atlas import (
         _FILES,
         _FREE,
-        _LIMIT,
         _PATH,
         _POLICY,
         _REACH,
@@ -1084,17 +1084,17 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
     )
 
     live = [
-        ("home", "/home/jdoe42", "857M", "30G", "29G"),
-        ("project", "/project/hpc", "11T", "none", "126T"),
-        ("scratch", "/scratch/collie3/jdoe42", "0B", "400G", "400G"),
-        ("scratch", "/scratch/meadow3/jdoe42", "22G", "100G", "78G"),
-        ("software", "/software", "314G", "none", "1.5P"),
+        ("home", "/home/jdoe42", "857M", "29G"),
+        ("project", "/project/hpc", "11T", "126T"),
+        ("scratch", "/scratch/collie3/jdoe42", "0B", "400G"),
+        ("scratch", "/scratch/meadow3/jdoe42", "22G", "78G"),
+        ("software", "/software", "314G", "1.5P"),
     ]
     rows = []
-    for role, path, used, limit, free in live:
+    for role, path, used, free in live:
         row = [""] * len(COLUMNS)
         row[_ROLE], row[_PATH], row[_USED] = role, path, used
-        row[_LIMIT], row[_FREE] = limit, free
+        row[_FREE] = free
         row[_REACH] = "rwx"
         # Constant on every row, which is exactly why they get removed, and
         # exactly why their widths must not be charged for: WHERE reads `here`
@@ -1108,13 +1108,13 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
 
     empty = [_WHERE, _FILES, _POLICY]
 
-    blind, _ = _plan(rows, 76)
+    blind, _ = _plan(rows, 64)
     assert _ROLE not in blind, (
         "the bug this guards: measured against the empty columns too, the only "
         "stage that fits is the one that gives up role"
     )
 
-    columns, stacked = _plan(rows, 76, skip=empty)
+    columns, stacked = _plan(rows, 64, skip=empty)
     assert not stacked
     assert _ROLE in columns, "role fits once the blanks are not charged for"
     assert _PATH in columns and _USED in columns and _REACH in columns
@@ -1171,13 +1171,16 @@ def test_spare_width_buys_a_column_first_and_then_fills_the_window():
         root.role = role
         roots.append(root)
 
-    narrow = atlas.render(roots, style=style, group=True, size=72)
+    # 60, measured: with `limit` off the table this fixture fits `files` from
+    # 64 columns up, so 60 is the first width below that. The point is to be
+    # under the threshold, wherever the threshold currently sits.
+    narrow = atlas.render(roots, style=style, group=True, size=60)
     wide = atlas.render(roots, style=style, group=True, size=110)
 
-    assert "files" not in narrow, "at 72 columns the file count is the first thing to go"
+    assert "files" not in narrow, "at 60 columns the file count is the first thing to go"
     assert "files" in wide, "at 110 columns the room must buy a column before whitespace"
 
-    for window, text in ((72, narrow), (110, wide)):
+    for window, text in ((60, narrow), (110, wide)):
         widths = {measure(line) for line in text.splitlines()}
         assert widths == {window}, "at %d columns the block is %s wide" % (
             window,
@@ -1295,20 +1298,24 @@ def test_an_uncapped_quota_says_none_and_never_a_missing_number():
     for root in (capped, uncapped, unmeasured):
         root.role = "project"
 
-    lines = _content(
-        atlas.render([capped, uncapped, unmeasured], style=style, group=True, size=100)
+    # Read from `why`, because `limit` left the TABLE: on a capped row it made
+    # `free` a visible subtraction of two columns beside it, which the owner
+    # called out ("it's just a product of the two previous columns"). The
+    # three-state guarantee is what this test is about and it moved with the
+    # field, not away.
+    from dirscape.render import fields
+
+    assert fields.plain(fields.limit_cell(capped, style)) == "30G", "a real cap is the figure"
+    assert fields.plain(fields.limit_cell(uncapped, style)) == "none", (
+        "an explicit zero means no limit is enforced"
     )
-    heading = next(ln for ln in lines if "limit" in ln)
-    at = heading.index("limit") + len("limit")
+    assert fields.plain(fields.limit_cell(unmeasured, style)) == "?", (
+        "and nobody measuring it is a different fact"
+    )
 
-    def cell(path):
-        line = next(ln for ln in lines if path in ln)
-        return line[:at].split()[-1]
-
-    assert cell("/a") == "30G", "a real cap is the figure"
-    assert cell("/b") == "none", "an explicit zero means no limit is enforced"
-    assert cell("/c") == "?", "and nobody measuring it is a different fact"
-    assert "no limit" not in " ".join(lines), "the two-word form prompted the question"
+    table = atlas.render([capped, uncapped, unmeasured], style=style, group=True, size=100)
+    assert "no limit" not in table, "the two-word form prompted the question"
+    assert "limit" not in table, "and the column itself is off the default view"
 
 
 def test_every_interactive_frame_is_the_same_width():

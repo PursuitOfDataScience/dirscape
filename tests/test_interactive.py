@@ -383,13 +383,20 @@ def test_a_real_pty_paints_moves_and_exits():
             if not chunk:
                 break
             out += chunk
-            # Waits for a HEADING that is still there. This trigger has been
-            # stale twice now, once as `used / quota` and once as `space`, and
-            # a stale trigger here does not fail: the keys are never sent and
-            # the loop spins to its 90 second deadline while the assertions
-            # below pass on the first paint alone. `limit` is asserted to be
-            # present at the end of the test for exactly that reason.
-            if not sent and b"limit" in out:
+            # Waits for the KEY HINTS, not for a column heading.
+            #
+            # This trigger went stale three times, as `used / quota`, then
+            # `space`, then `limit`, and each time it failed silently in the
+            # worst way: no keys are sent, the loop spins to its 90 second
+            # deadline, and the assertions below pass on the first paint
+            # alone, so the suite went from 14 seconds to 100 while claiming
+            # to test a drill-down it never performed. Column headings are
+            # exactly the thing this project keeps rewording.
+            #
+            # The hint line is the interactive contract rather than a label
+            # choice: if it is gone, there is no interactive mode to test and
+            # the assertions below say so directly.
+            if not sent and b"quit" in out:
                 time.sleep(0.4)
                 os.write(fd, b"\x1b[B\x1b[B")  # down, down
                 time.sleep(0.4)
@@ -404,8 +411,8 @@ def test_a_real_pty_paints_moves_and_exits():
         with contextlib.suppress(OSError):
             os.waitpid(pid, os.WNOHANG)
 
-    if "limit" not in text:
-        pytest.skip("no storage discoverable here, so there is nothing to browse")
+    if "\033[?25l" not in text:
+        pytest.skip("no interactive frame was drawn here, so there is nothing to browse")
 
     # **The trigger fired.** Without this the test is silently vacuous when
     # the heading it waits for is renamed: it sends no keys, spins for 90

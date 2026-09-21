@@ -603,14 +603,19 @@ def used_cell(root, style=None):
         text = "~" + text
     if row.guessed:
         caveats.append("the mount for this row was inferred from its name")
-    # Graded on fullness where a fraction exists, which is the one place
-    # colour earns its keep here: a column of figures where the nearly-full
-    # ones are warm is scannable in a way that a column of identical grey is
-    # not. The percentage itself is gone, because `free` answers what it was
-    # for ("how much can I still put here") in the unit the reader acts in.
-    fraction = row.fraction
-    text = style.tint(text, fraction) if fraction is not None else style.muted(text)
-    return text, "; ".join(caveats)
+    # **One tone for every cell in the column, and no grading.** This used to
+    # tint by fullness where a fraction existed and mute where none did, so on
+    # the live table `866M` (3% of a 30G quota) was a graded blue and `11T`
+    # (no cap, so no fraction) was grey, side by side in one column. The owner:
+    # "in the used column, both entries have different colors. which is shit."
+    #
+    # They are right, and the reason is structural rather than a matter of
+    # taste: a grading that only half the rows can carry is not a scale, it is
+    # two categories the reader has to decode before comparing two numbers.
+    # `free` now carries "how much room is left" as a figure on every row,
+    # which is what the grading was approximating, and this package's standing
+    # rule is that colour is never load bearing.
+    return style.muted(text), "; ".join(caveats)
 
 
 def limit_cell(root, style=None):

@@ -23,8 +23,10 @@ does not have to learn two sets of arrows, including two lessons that package
 learned from being used:
 
 * **Left at the root does nothing.** It used to return, and returning at the
-  root exits, so one stray press took the whole program down. Escape is not a
-  movement, so at the root Escape is what leaves.
+  root exits, so one stray press took the whole program down. Escape is what
+  leaves from the root, and inside a nested view it pops one level: a reader
+  who presses it in a detail view means "back to the table", never "close the
+  program", and `select` resolves which it is from its own depth.
 * **Right at a leaf does nothing.** It used to return the index, and a caller
   with nothing deeper to open read that as "step back", so Right at the detail
   view landed back on the list. Right means deeper everywhere, and at the
@@ -214,9 +216,19 @@ def read_key(readch=None):
 
     nxt = readch()
     if nxt != "[":
-        # A bare Escape. Not a movement, so it means "leave" rather than
-        # "step back", which is what a reader means by it.
-        return Key.QUIT
+        # A bare Escape, and it means BACK rather than QUIT. It used to return
+        # QUIT on the reading that Escape is not a movement, so "leave" was
+        # the honest translation. That reading was wrong in the one place it
+        # matters: pressing Escape inside a detail view closed the whole
+        # program instead of returning to the table, which is the opposite of
+        # what Escape does in every other nested view a reader has used, and
+        # the owner reported it as "esc doesn't work for going back".
+        #
+        # `select` resolves it against its own depth: BACK pops a level where
+        # there is one to pop, and falls through to QUIT at the root, so
+        # Escape still leaves from the top. Nothing else can decide this,
+        # because only the caller knows whether it is nested.
+        return Key.BACK
     final = readch()
     return {
         "A": Key.UP,
@@ -284,10 +296,16 @@ def select(
                     emit("\033[%dA\033[J" % (painted,))
                 return Key.QUIT
 
-            if key == Key.QUIT:
+            if key == Key.QUIT or (key == Key.BACK and not escapable):
+                # Escape at the root leaves, because there is no level to pop
+                # and a key that does nothing reads as a hung program.
                 if erase and painted:
                     emit("\033[%dA\033[J" % (painted,))
                 return Key.QUIT
+            if key == Key.BACK:
+                if erase and painted:
+                    emit("\033[%dA\033[J" % (painted,))
+                return Key.BACK
             if key == Key.UP:
                 cursor = (cursor - 1) % count
             elif key == Key.DOWN:

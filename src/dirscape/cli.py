@@ -1148,31 +1148,43 @@ def _kind_phrase(root):
     role = (getattr(root, "role", "") or "").strip()
     fstype = (getattr(root, "fstype", "") or "").strip()
     if role and fstype:
-        return "a %s directory on a %s filesystem" % (role, fstype)
+        return "%s directory, %s" % (role, fstype)
     if role:
-        return "a %s directory" % (role,)
+        return "%s directory" % (role,)
     if fstype:
-        return "a directory on a %s filesystem" % (fstype,)
+        return "%s filesystem" % (fstype,)
     return ""
 
 
 #: Reach, as something a reader can act on. `Reach.label` answers the model's
-#: question ("listable") and this answers the reader's ("can I see what is in
-#: it"), which is the same split `category_label` makes for a verdict.
-_REACH_PHRASE = {
-    Reach.LISTABLE: "you can see what is in this directory",
-    Reach.TRAVERSE: (
-        "you can use paths inside this directory that you already know, but you cannot "
-        "list what is in it"
-    ),
-    Reach.CLOSED: "you cannot get into this directory",
-    Reach.UNKNOWN: "dirscape could not work out what you can do here",
+#: question ("listable") and this answers the reader's ("can I read it"), which
+#: is the same split `category_label` makes for a verdict.
+#:
+#: These used to be sentences, and `TRAVERSE` was a twenty-word one. A field
+#: whose label is `access` does not need its value to restate the question, so
+#: each is now the shortest phrase that is still unambiguous. `traverse only`
+#: is the one that trades a little clarity for brevity and it earns it: a
+#: reader who does not know the word has a directory they can `cd` into and
+#: cannot `ls`, which no short phrase conveys anyway, and `--json` carries the
+#: full reason.
+_REACH_WORDS = {
+    Reach.LISTABLE: "read",
+    Reach.TRAVERSE: "traverse only, no listing",
+    Reach.CLOSED: "no access",
+    Reach.UNKNOWN: "unknown",
 }
 
 
 def _access_phrase(root):
     # type: (object) -> str
-    """Read and write in one sentence, and the write CONCLUSION only.
+    """Read and write as words, and the write CONCLUSION only.
+
+    **Words, not a sentence.** This read "you can see what is in this
+    directory, and you can write to it", which is fourteen words for two bits
+    of information in a field whose label already asks the question. The owner
+    ruled on the whole view at once: "i told you to avoid using verbose text
+    on anything." `read + write` is the same fact and a reader takes it in at
+    a glance, which is what a field list is for.
 
     The write verdict's reason is a paragraph of administration detail
     ("os.access reports write; not owner-confirmed, and W_OK can be wrong
@@ -1182,24 +1194,24 @@ def _access_phrase(root):
     `--probe-write` and `--json` pointers at the foot of the view.
     """
     reach = getattr(root, "reach", Reach.UNKNOWN)
-    phrase = _REACH_PHRASE.get(reach, Reach.label(reach))
+    phrase = _REACH_WORDS.get(reach, Reach.label(reach))
     write = getattr(root, "writable", None)
     if write is None:
         return phrase
     if write.confirmed:
-        return phrase + ", and you can write to it"
+        return phrase + " + write"
     if write.refuted:
-        return phrase + ", but you cannot write to it"
+        return phrase + ", no write"
     if write.category == VerdictCategory.NOT_PROBED:
         # A question nobody asked gets no answer printed, which is the rule
         # that keeps `? allocated not probed` off every mounted root.
         return phrase
-    return phrase + ", and whether you can write to it went unanswered (%s)" % (write.label,)
+    return phrase + ", write unanswered (%s)" % (write.label,)
 
 
 def _keeping_phrase(root, site):
     # type: (object, object) -> str
-    """Backed up, deleted on a schedule, or simply unpublished.
+    """Backed up, deleted on a schedule, or simply unpublished. In words.
 
     Silence means UNPUBLISHED and never "no". A site that says nothing about
     backups has not told us there are none, and of every field on this screen
@@ -1221,25 +1233,26 @@ def _keeping_phrase(root, site):
         # `isinstance(True, int)` is True, so the bool test comes first or a
         # site writing `purge_days=yes` prints "deleted after 1 days".
         if isinstance(days, bool) or days is None:
-            parts.append("this site publishes a deletion rule here that dirscape could not read")
+            parts.append("a deletion rule dirscape could not read")
         elif isinstance(days, (int, float)) and days > 0:
-            parts.append("files here are deleted %d days after they are written" % (int(days),))
+            parts.append("deleted %d days after writing" % (int(days),))
         elif isinstance(days, (int, float)):
-            parts.append("nothing here is deleted on a schedule")
+            parts.append("no scheduled deletion")
         else:
             parts.append("deleted: %s" % (render_fields.safe(days, limit=32) or "?",))
     elif "purge" in policy:
         parts.append("deleted: %s" % (render_fields.safe(policy.get("purge"), limit=32) or "?",))
 
     if policy.get("readonly"):
-        parts.append("the site publishes this path as read-only")
+        parts.append("published read-only")
 
     parts = [part for part in parts if part]
     if not parts:
         # Leads with the STATE and not with a reassurance. "not published" is
         # what is true; "nothing is deleted here" is what a reader would infer
-        # from silence, and it is the inference that loses data.
-        return "not published: this site says nothing about backups or deletion here"
+        # from silence, and it is the inference that loses data. The colon and
+        # the ten words that followed it restated the label, so they went.
+        return "not published"
     return "; ".join(parts)
 
 
@@ -1347,107 +1360,100 @@ def _scope_phrase(row):
     scope is the only field that says which was measured.
     """
     return {
-        "user": "your own usage",
+        # `user` returns nothing on purpose. It is the assumption a reader
+        # already brings to a quota figure, so saying it adds a clause to
+        # every row and distinguishes nothing; the other three CONTRADICT that
+        # assumption, which is the only reason this field exists.
+        "user": "",
         "group": "your group's usage",
-        "fileset": "everything stored there, not only your files",
-        "project": "everything stored there, not only your files",
+        "fileset": "everyone's files, not only yours",
+        "project": "everyone's files, not only yours",
     }.get(getattr(row, "scope", "") or "", "")
 
 
-def _space_notes(root, style, figures):
-    # type: (object, object, str) -> List[str]
-    """Where the figures came from, and what any mark on them means.
+def _quota_source(root):
+    # type: (object) -> str
+    """Which quota produced the figures, as a value and not a paragraph.
 
-    This is the answer to "why does `du` say something else", which is the
-    question a reader brings to a quota number and the one the old screen
-    answered with the word `mmlsquota` in a value column.
+    This was three sentences of mechanism:
 
-    A mark is explained only when it is actually ON the screen: `figures` is
-    the rendered text of the space and files cells, and each legend below is
-    gated on finding its own glyph in there. That way the legend cannot
-    outlive a change to how `render.fields` draws a figure.
+        The figures above are your own usage under the quota named project-hpc
+        on the filesystem meadow3_cap, counted by the filesystem itself rather
+        than by walking this directory, so du can report a different number.
+        The filesystem did not say which directory this quota covers, so
+        dirscape matched the two by name.
 
-    That docstring is now half wrong and the half that is wrong is worth
-    recording: keying an explanation to its own glyph is exactly how the
-    in-doubt sentence got deleted by accident when the glyph left the table.
-    The `~` legend below still keys on the mark, because `~` is still drawn;
-    the in-doubt sentence keys on the measurement.
+    The owner's verdict was blunt and correct: "this chunk of verbose text
+    makes no fucking sense. it says the figures above. what figures?" Prose
+    that points at other lines on the screen ("the figures above") only works
+    if the reader is reading top to bottom, and nobody reads a detail view
+    that way. As a labelled field it points at nothing and needs no anchor:
+
+        quota     project-hpc on meadow3_cap, matched by name
+
+    The mechanism sentence went entirely. "Counted by the filesystem rather
+    than by walking the directory" is implied by naming a quota as the source,
+    it is stated once in the README where a reader meets the tool, and it was
+    costing two lines on every single path.
     """
-    out = []  # type: List[str]
-    row, how, why = render_fields.pick_row(getattr(root, "quota", None), root.path, "blocks")
-
+    row, how, _why = render_fields.pick_row(getattr(root, "quota", None), root.path, "blocks")
     if row is None:
         free = (root.policy or {}).get("free_bytes")
         if isinstance(free, int) and free >= 0:
-            out.append(
-                "No quota was measured for this directory, so the figure above is what the "
-                "whole filesystem has left, shared with everyone using it, and not room set "
-                "aside for you."
-            )
-        else:
-            # `why` comes back populated from every branch of `pick_row`, so
-            # the fallback is belt and braces rather than a real case.
-            out.append(
-                "dirscape could not measure the space here: %s." % (why or "no reading was taken",)
-            )
-        return out
+            # The figure above it reads `886G free`, so this says whose it is.
+            return "none here; the figure is the whole filesystem, shared"
+        return "none measured"
 
-    scope = _scope_phrase(row)
     fileset = getattr(row, "fileset", "") or ""
     device = getattr(row, "device", "") or ""
     if fileset and device and fileset != device:
-        where = "the quota named %s on the filesystem %s" % (fileset, device)
+        where = "%s on %s" % (fileset, device)
     elif fileset or device:
         # One name, and it is the name of a QUOTA. Calling it the filesystem
         # would be a claim about which of the two the backend answered for,
         # and `QuotaRow` keeps them apart precisely because one device here is
         # mounted at four places with four different quotas.
-        where = "the quota named %s" % (fileset or device,)
+        where = fileset or device
     else:
-        where = "the quota the filesystem reports for this path"
-    out.append(
-        "The figures above are %s%s, counted by the filesystem itself rather than by "
-        "walking this directory, so du can report a different number."
-        % (("%s under " % (scope,)) if scope else "", where)
-    )
+        where = "reported for this path"
 
-    # Conditioned on the FACT, not on a glyph being on screen.
-    #
-    # This was `if g.doubt in figures`, which tied the explanation to the mark
-    # appearing in the rendered figure. That was a reasonable-looking rule and
-    # it was fragile: the mark was removed from the table (a reader asked what
-    # it was, which is the only test a glyph has to pass) and the explanation
-    # silently left with it, so a home fileset with 2.4G handed out and not
-    # counted reported that nowhere at all. An explanation that depends on its
-    # own decoration is an explanation that can be deleted by accident.
+    # Whose usage this counts, but only where it is not the reader's own. A
+    # fileset-scoped figure is the whole group's data and a reader who takes
+    # it for their own has the wrong number by however much everybody else
+    # stored, which is the one thing in this field worth a clause.
+    scope = _scope_phrase(row)
+    if scope:
+        where += ", " + scope
+    if how == "inferred":
+        where += ", attributed by dirscape"
+    elif getattr(row, "guessed", False):
+        where += ", matched by name"
+    return where
+
+
+def _uncounted(root):
+    # type: (object) -> str
+    """Space handed out and not yet charged, as a figure.
+
+    `blockInDoubt` / `filesInDoubt`: measured on this home fileset at 2.4 GB
+    against 858 MB used, nearly three times the figure it qualifies, so it is
+    the difference a reader cross-checking with `du` actually sees. It is the
+    one number worth keeping out of the paragraph that used to explain it.
+
+    Conditioned on the FACT, never on a glyph being on screen. The earlier
+    version was `if g.doubt in figures`, which tied the explanation to the
+    mark appearing in the rendered figure; the mark was later removed from the
+    table and the explanation silently left with it, so a fileset with 2.4G
+    handed out reported that nowhere at all.
+    """
     held = []  # type: List[str]
     blocks = render_fields.in_doubt_of(root)
     if blocks:
-        held.append("%s of space" % (render_fields.human_bytes(blocks),))
+        held.append(render_fields.human_bytes(blocks))
     files_row, _, _ = render_fields.pick_row(getattr(root, "inode_quota", None), root.path, "files")
     if files_row is not None and files_row.in_doubt:
         held.append("%s files" % (render_fields.human_count(files_row.in_doubt),))
-    if held:
-        # `blockInDoubt` / `filesInDoubt`: handed out to a writer and not yet
-        # charged to anybody. Measured on this home fileset at 2.4 GB against
-        # 858 MB used, nearly three times the figure it qualifies, so it is
-        # the difference a reader who cross-checks with du actually sees.
-        out.append(
-            "The filesystem has handed out %s here and not yet counted it, which is the "
-            "other reason a du walk disagrees." % (" and ".join(held),)
-        )
-
-    if how == "inferred" and "~" in figures:
-        out.append(
-            "~ marks a figure dirscape matched to this directory rather than one the "
-            "filesystem published."
-        )
-    elif getattr(row, "guessed", False):
-        out.append(
-            "The filesystem did not say which directory this quota covers, so dirscape "
-            "matched the two by name."
-        )
-    return out
+    return ", ".join(held)
 
 
 def _because_phrase(root):
@@ -1458,17 +1464,16 @@ def _because_phrase(root):
     the old screen: three internal constants from `discover.candidates`, which
     is a wire vocabulary shown to a human. `model.py` already owns the fix for
     that mistake (`category_label`, after nodetop's NT-5), so the sources got
-    the same treatment and `discover.source_label` holds the sentences.
+    the same treatment and `discover.source_label` holds the wording.
+
+    It was then a sentence, and the sentence was 25 words for a three item
+    list: "dirscape shows you this directory because its name matches your
+    user name or one of your groups, a group you belong to owns it, and the
+    filesystem's own records say you hold space in it." It is a `found` field
+    now, and `source_label(short=True)` supplies the noun phrases.
     """
-    clauses = [source_label(name) for name in getattr(root, "sources", ()) or ()]
-    clauses = [clause for clause in clauses if clause]
-    if not clauses:
-        return ""
-    # Serial comma, and the last clause joined with "and": three sources read
-    # as a list of reasons rather than as a comma-separated token dump, which
-    # is the whole complaint about the line this replaces.
-    joined = clauses[0] if len(clauses) == 1 else ", ".join(clauses[:-1]) + ", and " + clauses[-1]
-    return "dirscape shows you this directory because %s." % (joined,)
+    clauses = [source_label(name, short=True) for name in getattr(root, "sources", ()) or ()]
+    return ", ".join([clause for clause in clauses if clause])
 
 
 def _why_allocation(root, style, size=None):
@@ -1615,7 +1620,32 @@ def _why(run, path, style, size=None):
     #    sentence in a labelled row, because the label is a word a researcher
     #    would use and it is doing work.
     out.extend(_field(style, room, "access", _access_phrase(match)))
+    # 3. Where the figures came from, which is what makes a disagreeing `du`
+    #    make sense instead of looking like a bug in one of the two tools. A
+    #    FIELD and not a paragraph: see `_quota_source`.
+    out.extend(_field(style, room, "quota", _quota_source(match)))
+    uncounted = _uncounted(match)
+    if uncounted:
+        out.extend(_field(style, room, "uncounted", uncounted))
     out.extend(_field(style, room, "backups", _keeping_phrase(match, run.site)))
+    # 4. Why this directory is on the reader's screen at all.
+    found = _because_phrase(match)
+    if found:
+        out.extend(_field(style, room, "found", found))
+    # 5. The repetitive part, collapsed. Eleven symlinks out of a home
+    #    directory are one fact about that directory, not eleven facts.
+    crossings = [n for n in match.notes if "resolves to" in n]
+    if crossings:
+        targets = sorted({n.split("resolves to")[1].split(",")[0].strip() for n in crossings})
+        out.extend(
+            _field(
+                style,
+                room,
+                "symlinks",
+                "%d into %s, billed there (dirscape tree)"
+                % (len(crossings), ", ".join(targets[:2]) + (", ..." if len(targets) > 2 else "")),
+            )
+        )
     if match.labels:
         out.extend(_field(style, room, "changed", ", ".join(match.labels)))
 
@@ -1627,44 +1657,11 @@ def _why(run, path, style, size=None):
         for glyph, sentence in findings:
             out.extend(_bullet(style, room, glyph, sentence))
 
-    # 5. Where the figures come from, which is what makes a disagreeing `du`
-    #    make sense instead of looking like a bug in one of the two tools.
-    notes = _space_notes(match, style, "%s %s" % (figure, inodes))
-    if notes:
-        out.append("")
-        for note in notes:
-            out.extend(_prose(style, room, note))
-
-    # 6. Why this directory is on the screen at all.
-    because = _because_phrase(match)
-    if because:
-        out.append("")
-        out.extend(_prose(style, room, because))
-
-    # 7. The repetitive part, collapsed. Eleven symlinks out of a home
-    #    directory are one fact about that directory, not eleven facts.
-    crossings = [n for n in match.notes if "resolves to" in n]
+    # 7. Anything the backends said that is not already a field above. Two at
+    #    most, and every one dropped is behind the `--json` pointer.
     others = [
         n for n in match.notes if "resolves to" not in n and not restates_source(n, match.sources)
     ]
-    if crossings:
-        targets = sorted({n.split("resolves to")[1].split(",")[0].strip() for n in crossings})
-        out.append("")
-        out.extend(
-            _bullet(
-                style,
-                room,
-                style.warn(style.g.warn),
-                "%d path%s here are symlinks into other storage (%s), so what they hold counts "
-                "against that storage and not against this directory. dirscape tree shows the "
-                "whole picture."
-                % (
-                    len(crossings),
-                    "" if len(crossings) == 1 else "s",
-                    ", ".join(targets[:2]) + ("..." if len(targets) > 2 else ""),
-                ),
-            )
-        )
     if others:
         out.append("")
         for note in others[:2]:
@@ -1674,15 +1671,14 @@ def _why(run, path, style, size=None):
                 _prose(style, room, "%d more notes are in dirscape --json." % (len(others) - 2,))
             )
 
-    # 8. The escape hatches, named once each and only where they apply. Every
-    #    caveat this screen dropped is behind one of them, which is the trade
-    #    the rewrite makes: a paragraph of administration detail off the screen
-    #    and one line saying where it went.
+    # 8. One escape hatch, one line. Every caveat this screen dropped is
+    #    behind it, which is the trade the rewrite makes: the administration
+    #    detail off the screen and one line saying where it went.
     out.append("")
-    hatch = "Every field behind this is in dirscape why %s --json." % (match.path or shown,)
+    hatch = style.dim("dirscape why %s --json" % (match.path or shown,))
     if match.writable.confirmed and match.writable.source == "os.access":
-        hatch += " Add --probe-write to settle the write answer by writing a file."
-    out.extend(_prose(style, room, hatch))
+        hatch += style.dim("   --probe-write to test writing for real")
+    out.append("  " + hatch)
 
     return "\n".join(out), EXIT_OK
 
@@ -2167,7 +2163,12 @@ def _detail(run, root, style, cols=None, window=None):
     detail, _ = _why(run, root.path or "/", style, size=inner)
     lines = _fit(
         detail.splitlines()
-        + ["", style.dim("   %s back   %s quit" % (style.accent("left"), style.accent("q")))],
+        + [
+            "",
+            style.dim(
+                "   %s back   %s quit" % (style.accent("esc/left"), style.accent("q")),
+            ),
+        ],
         inner,
     )
     if window:

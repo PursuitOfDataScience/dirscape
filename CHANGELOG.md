@@ -586,6 +586,85 @@ they were not while the two disagreed.
 The README's sample output, its `▒` note and its `+2` note described a table
 that no longer exists, so all three were replaced from a live run.
 
+### Seventh pass: one column, one kind of number, and no paragraphs left
+
+Four reports, and the first one found a genuine modelling mistake rather than
+a wording problem.
+
+- **The `space` column carried two different measurements in one shape.** It
+  read `11T / no limit` on one row and `886G free` on the next, under a
+  `used / quota` heading claiming both were the same thing. The owner asked
+  the obvious question: "why is there no `/` in front of free? what does free
+  mean here? there is no limit, but why is there also free?" The `/` was
+  promising two numbers where there was one. There are three things this
+  column can honestly say and each cell now names its own:
+
+  | Cell | Means |
+  | :- | :- |
+  | `859M / 30G (3%)` | your usage against your quota |
+  | `11T used` | your usage, with no quota set here |
+  | `886G free` | the whole filesystem's headroom, shared with everyone |
+
+  `used` and `free` are opposites, so no reader mistakes one for the other,
+  and the heading is `space`, the only word true of all three.
+
+- **Escape steps back instead of closing the program.** It decoded to QUIT on
+  the reading that Escape is not a movement, so "leave" was the honest
+  translation. Wrong in the one place it matters: pressing it in a detail view
+  closed the whole program instead of returning to the table. It decodes to
+  BACK now, and `select` resolves it against its own depth, because BACK from
+  the top level would be a key that does nothing and a key that does nothing
+  reads as a hung program. Escape still leaves from the root, and the detail
+  view's hint names it.
+
+- **The table fills the window.** Asked twice, so it does. `render.style.table`
+  takes a `spread` flag that puts the leftover room in the gutter before the
+  last column, which keeps the left group tight and right-flushes the figures
+  against the frame. Dividing the slack evenly across every gutter was tried
+  first and put 20 spaces between `role` and `path` at 120 columns, which no
+  reader can track a row across. This supersedes the previous entry's
+  reasoning for a content-sized frame: the frame is still sized to its
+  content, and the content is now the window.
+
+- **The detail view is a field list.** It was four paragraphs under the
+  fields, and the owner's verdict was "this chunk of verbose text makes no
+  fucking sense. it says the figures above. what figures?" Two defects in that
+  one sentence. Prose that points at other lines on the screen assumes a
+  reader going top to bottom, and nobody reads a detail view that way. And
+  three sentences of mechanism ("counted by the filesystem itself rather than
+  by walking this directory, so du can report a different number") were
+  costing six lines on every path to say what naming the quota already says.
+  Nineteen lines became twelve, every one of them a field:
+
+  ```
+  /project/hpc
+    project directory, gpfs
+
+    space     11T used
+    files     3.1M used
+    access    read + write
+    quota     project-hpc on meadow3_cap, matched by name
+    uncounted 6.7G, 1.5k files
+    backups   not published
+    found     your name or group, group ownership, the quota records
+
+    dirscape why /project/hpc --json   --probe-write to test writing for real
+  ```
+
+  Nothing measured was dropped. The in-doubt figure became the `uncounted`
+  field, the discovery sources became `found` (with `source_label(short=True)`
+  supplying noun phrases instead of clauses), the symlink bullet became
+  `symlinks`, and the quota's scope is still printed where it is NOT the
+  reader's own usage, which is the case that contradicts what a reader
+  assumes. `access` went from "you can see what is in this directory, and you
+  can write to it" to `read + write`, and `backups` dropped the ten words that
+  restated its own label.
+
+A structural test rather than a word count guards it: every line of the view
+is the heading, a blank, a `label value` field, or the one footer, and none of
+them wraps. That is also what keeps `_browse`'s repaint arithmetic true, which
+is the property a prose block broke twice.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

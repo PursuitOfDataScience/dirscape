@@ -546,6 +546,7 @@ def table(
     drop_empty=True,  # type: bool
     gutter="  ",  # type: str
     underline=True,  # type: bool
+    spread=False,  # type: bool
 ):
     # type: (...) -> Tuple[str, List[str]]
     """An aligned table, measured in display columns, fitted by DROPPING.
@@ -567,6 +568,16 @@ def table(
     atlas asks for four. ``underline`` draws the dashed rule under the
     headings, and a view that rules ABOVE its headings instead turns it off
     rather than getting two rules.
+
+    ``spread`` widens the gutter before the LAST column by whatever room is
+    left over, so the table reaches the full window instead of ending wherever
+    its content happens to. One gutter and not all of them, which is the part
+    that took two attempts to get right: dividing the slack evenly across
+    every gutter put 20 spaces between `role` and `path` at a 120 column
+    terminal, and a reader cannot track a row across that. Spent on the last
+    gutter alone it reads as one left group and one right column, which is
+    what a dashboard does with a metric, and the figures end up flush against
+    the frame where the eye can compare them down the column.
     """
     style = style or Style()
     window = size if size else style.size
@@ -630,6 +641,21 @@ def table(
         widths[slack.index(max(slack))] -= 1
         guard += 1
 
+    # One gutter string per join position, so `spread` can widen exactly one
+    # of them. Equal to `[gutter] * n` unless it does.
+    gutters = [gutter] * max(0, len(live) - 1)
+    if spread and gutters:
+        room = window - (sum(widths) + width(gutter) * (len(live) - 1) + width(indent))
+        if room > 0:
+            gutters[-1] = gutter + " " * room
+
+    def join(pieces):
+        # type: (Sequence[str]) -> str
+        out = pieces[0] if pieces else ""
+        for offset in range(1, len(pieces)):
+            out += gutters[offset - 1] + pieces[offset]
+        return out
+
     lines = []
     head_cells = []
     for offset, index in enumerate(live):
@@ -637,11 +663,9 @@ def table(
         if index not in atomic and width(text) > widths[offset]:
             text = truncate(text, widths[offset], style.g.ellipsis)
         head_cells.append(style.column(pad(text, widths[offset], align[index])))
-    lines.append((indent + gutter.join(head_cells)).rstrip())
+    lines.append((indent + join(head_cells)).rstrip())
     if underline:
-        lines.append(
-            indent + gutter.join(style.dim(style.g.h * widths[i]) for i in range(len(live)))
-        )
+        lines.append(indent + join([style.dim(style.g.h * widths[i]) for i in range(len(live))]))
     for row in cells:
         out = []
         for offset, index in enumerate(live):
@@ -649,7 +673,7 @@ def table(
             if index not in atomic and width(text) > widths[offset]:
                 text = truncate(text, widths[offset], style.g.ellipsis)
             out.append(pad(text, widths[offset], align[index]))
-        lines.append((indent + gutter.join(out)).rstrip())
+        lines.append((indent + join(out)).rstrip())
     return "\n".join(lines), dropped
 
 

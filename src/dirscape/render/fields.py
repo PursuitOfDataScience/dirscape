@@ -38,7 +38,7 @@ from ..model import (
     sanitize,
     unknown,
 )
-from .style import Style
+from .style import Style, plain
 
 __all__ = [
     "UNKNOWN",
@@ -461,7 +461,29 @@ def _figure_cell(root, snapshot, kind, formatter, style, percent=False):
         # dense. `why` states it in a sentence, `--legend` names it, and
         # `--json` carries `in_doubt` for anything mechanical.
         used = used
-    text = "%s / %s" % (used, _limit_text(row, formatter, style))
+    limit = _limit_text(row, formatter, style)
+    if plain(limit) == "no limit":
+        # **`11T / no limit` became `11T used`.** The owner read this column
+        # and asked why one row said `no limit` while another said `free`,
+        # with no `/` in front of it: "there is no limit, but why is there
+        # also free?" The column was carrying two different measurements in
+        # two different shapes, and the shared `used / quota` heading claimed
+        # both were the same thing.
+        #
+        # There are three things this column can honestly say, and each cell
+        # now says which one it is in a word rather than in punctuation:
+        #
+        #     839M / 30G (3%)   your usage against your quota
+        #     11T used          your usage, with no quota set here
+        #     886G free         the filesystem's headroom, shared with everyone
+        #
+        # `used` and `free` are opposites, so no reader mistakes one for the
+        # other, and the `/` now appears only where there really are two
+        # numbers to divide. The heading is `space`, because that is the only
+        # word true of all three.
+        text = "%s %s" % (used, style.dim("used"))
+    else:
+        text = "%s / %s" % (used, limit)
     caveats = []  # type: List[str]
     if how == "inferred":
         # `~` before the figure, so a reader scanning the column sees which

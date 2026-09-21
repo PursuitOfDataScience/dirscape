@@ -138,15 +138,36 @@ SOURCE_RESTATEMENTS = {
 }
 
 
-def source_label(source):
-    # type: (str) -> str
+#: The same six sources as noun phrases, for a `found` field rather than a
+#: sentence. `SOURCE_LABELS` reads as a clause after "because", which is how
+#: `why` used to print it; three of those clauses joined into a 25 word
+#: sentence for what is really a three item list, so the short forms exist to
+#: be comma-joined. Both tables are kept because `--json` and the long views
+#: still want the clause.
+SOURCE_SHORT = {
+    SOURCE_MOUNTS: "a mount point",
+    SOURCE_ENV: "an environment variable",
+    SOURCE_GROUP_TEMPLATE: "your name or group",
+    SOURCE_DIR_OWNER: "group ownership",
+    SOURCE_QUOTA_FILESET: "the quota records",
+    SOURCE_DATASET_ROOT: "a shared data collection",
+    SOURCE_ALLOCATION: "an allocation record",
+}
+
+
+def source_label(source, short=False):
+    # type: (str, bool) -> str
     """The human clause for a discovery source, never the token itself.
 
     Falls back to the de-hyphenated token rather than raising, exactly as
     `model.category_label` does: a source with no label is a test failure, and
     it should not take down a user's terminal in the meantime.
+
+    ``short`` returns the noun phrase instead of the clause, for the `found`
+    field in `why`.
     """
-    return SOURCE_LABELS.get(source, (source or "").replace("-", " "))
+    table = SOURCE_SHORT if short else SOURCE_LABELS
+    return table.get(source, (source or "").replace("-", " "))
 
 
 def restates_source(note, sources):

@@ -63,7 +63,7 @@ COLUMNS = (
     "path",
     "where",
     "reach",
-    "used / quota",
+    "space",
     "files / limit",
     "policy",
 )
@@ -226,17 +226,19 @@ def _align_figures(blocks, index):
             if sep:
                 parts.append((head, sep, tail))
                 continue
-            # A capacity fallback reads "886G free" and has no separator, so
-            # the split above skips it and the number sits hard against the
-            # column edge while every quota figure is right-aligned. Treated
-            # as a figure with an empty limit so it joins the same column.
+            # Two cells read as one number plus one word and have no
+            # separator, so the split above skips them and the number sits
+            # hard against the column edge while every quota figure is
+            # right-aligned: `886G free` (the filesystem's headroom) and
+            # `11T used` (usage with no quota set). Both are treated as a
+            # figure with an empty limit so they join the same column.
             bare, space, word = cell.rpartition(" ")
             # Compared with the escapes stripped. The cell is dimmed, so the
             # last token is `free\x1b[0m` and an equality test against "free"
             # silently failed, which is why the capacity rows were never
             # aligned at all: `886G free` sat four columns in while every
             # quota figure sat five.
-            if space and _strip(word) == "free":
+            if space and _strip(word) in ("free", "used"):
                 parts.append((bare, "", word))
                 continue
             parts.append(None)
@@ -693,6 +695,11 @@ def render(
         # the first one; one full-width rule separates the title from the
         # table and leaves the headings sitting on nothing.
         underline=False,
+        # The owner asked twice why the view did not take the whole width, so
+        # it takes it. `spread` puts the leftover room in the gutter before
+        # the figure column, which right-flushes the figures against the frame
+        # and leaves the left group tight.
+        spread=True,
     )
     # A blank line, then the rule. The blank is what stops the title reading
     # as a first row of the table, and the rule is what stops the headings

@@ -76,9 +76,47 @@ def test_an_arrow_is_decoded_as_one_key_and_not_three():
     assert read_key(readch) == Key.DOWN
 
 
-def test_a_bare_escape_leaves_rather_than_stepping_back():
-    """Escape is not a movement, so it means what a reader means by it."""
-    assert read_key(_chars("\x1bz")) == Key.QUIT
+def test_a_bare_escape_steps_back_and_leaves_only_from_the_root():
+    """This REVERSES an earlier decision, and the reversal is the right way.
+
+    Escape used to decode to QUIT, on the reading that it is not a movement so
+    "leave" is the honest translation. Wrong in the one place it matters: in a
+    detail view it closed the program instead of returning to the table, which
+    is the opposite of Escape in every nested view a reader has used. Owner's
+    report: "esc doesn't work for going back".
+
+    Decoding it as BACK is only half the answer, because BACK from the top
+    level would be a key that does nothing, and a key that does nothing reads
+    as a hung program. `select` resolves it against its own depth, which is
+    the only place that knows: it pops a level where there is one, and leaves
+    at the root.
+    """
+    assert read_key(_chars("\x1bz")) == Key.BACK
+
+    # Nested: Escape pops one level.
+    assert (
+        select(
+            lambda i: ["a", "b"],
+            2,
+            keys=_reader([Key.BACK]),
+            write=lambda text: None,
+            escapable=True,
+            raw=False,
+        )
+        == Key.BACK
+    )
+    # At the root there is nothing to pop, so it leaves.
+    assert (
+        select(
+            lambda i: ["a", "b"],
+            2,
+            keys=_reader([Key.BACK]),
+            write=lambda text: None,
+            escapable=False,
+            raw=False,
+        )
+        == Key.QUIT
+    )
 
 
 def test_end_of_input_is_a_quit_and_not_a_hang():
@@ -345,7 +383,7 @@ def test_a_real_pty_paints_moves_and_exits():
             if not chunk:
                 break
             out += chunk
-            if not sent and b"used / quota" in out:
+            if not sent and b"space" in out:
                 time.sleep(0.4)
                 os.write(fd, b"\x1b[B\x1b[B")  # down, down
                 time.sleep(0.4)
@@ -360,7 +398,7 @@ def test_a_real_pty_paints_moves_and_exits():
         with contextlib.suppress(OSError):
             os.waitpid(pid, os.WNOHANG)
 
-    if "used / quota" not in text:
+    if "space" not in text:
         pytest.skip("no storage discoverable here, so there is nothing to browse")
 
     assert "\033[7m" in text, "no row was highlighted"

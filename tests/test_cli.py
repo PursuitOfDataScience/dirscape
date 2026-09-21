@@ -673,19 +673,24 @@ def test_a_repeated_role_is_printed_once():
 
 def test_figures_align_on_the_separator():
     """So the column reads as a set of magnitudes a reader can compare."""
+    # All three carry a real limit. An explicit zero limit used to render
+    # `11T / no limit`, which put a separator in the cell and made it a valid
+    # sample here; it renders `11T used` since the owner asked why one row said
+    # `no limit` and another said `free`, so a no-limit row has no separator to
+    # align and belongs in the capacity test below.
     roots = [
         _measured(_root("/a", "fa"), used=876_543_210, limit=32_212_254_720),
-        _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=0),
-        _measured(_root("/c", "fc"), used=950_272, limit=0),
+        _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=99_000_000_000_000),
+        _measured(_root("/c", "fc"), used=950_272, limit=1_073_741_824),
     ]
     for root in roots:
         root.role = "project"
 
-    # The heading carries "used / quota", so rows are taken by their path. The
+    # The heading carries "space", so rows are taken by their path. The
     # comparison is case-sensitive and the heading went lower case, which made
     # this filter stop excluding it: with the heading in the sample the
     # separator offsets were two and the test was measuring the wrong thing.
-    lines = [ln for ln in _content(_render_default(roots)) if " / " in ln and "quota" not in ln]
+    lines = [ln for ln in _content(_render_default(roots)) if " / " in ln and "space" not in ln]
     assert len(lines) == 3
     offsets = {ln.index(" / ") for ln in lines}
     assert len(offsets) == 1, "every separator must sit in one column: %s" % (offsets,)
@@ -783,7 +788,7 @@ def test_a_capacity_figure_aligns_with_the_quota_figures():
     # disappears with it.
     edges = set()
     for line in rows:
-        match = re.search(r"(\d[\d.]*[KMGTPB]?)(?= / | free)", line)
+        match = re.search(r"(\d[\d.]*[KMGTPB]?)(?= / | free| used)", line)
         assert match, "no figure found in %r" % (line,)
         edges.add(match.end())
     assert len(edges) == 1, "figures end at columns %s" % (sorted(edges),)
@@ -1075,6 +1080,119 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
     assert _PATH in columns and _USED in columns and _REACH in columns
 
 
+def test_the_table_fills_the_window_it_was_given():
+    """The owner asked twice why the view did not take the whole width.
+
+    Four columns come to about 68 display columns, so at anything past that
+    the box used to stop wherever the content did. `spread` puts the leftover
+    room in the gutter before the figure column, which keeps the left group
+    tight and right-flushes the figures against the frame.
+
+    Asserted at three widths, because a fill that only works at one is an
+    accident. The check is on the FRAME rows, which are the only lines
+    guaranteed to be the full width: a body row ends at its own last
+    character, since trailing spaces are stripped.
+    """
+    from dirscape.render import atlas, resolve_style
+    from dirscape.render.style import width as measure
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    roots = []
+    for path, role in (
+        ("/home/me", "home"),
+        ("/project/one", "project"),
+        ("/scratch/meadow3/me", "scratch"),
+        ("/software", "software"),
+    ):
+        root = _measured(_root(path, "fs" + role), used=876_543_210, limit=32_212_254_720)
+        root.role = role
+        roots.append(root)
+
+    for window in (80, 100, 132):
+        text = atlas.render(roots, style=style, group=True, size=window)
+        edges = [ln for ln in text.splitlines() if ln[:1] in ("\u256d", "\u2570")]
+        assert edges, "no frame was drawn at %d columns" % (window,)
+        for line in edges:
+            assert measure(line) == window, "at %d columns the frame is %d wide: %r" % (
+                window,
+                measure(line),
+                line,
+            )
+
+
+def test_a_no_limit_figure_says_used_rather_than_pairing_with_a_limit():
+    """`11T / no limit` next to `886G free` was one column, two measurements.
+
+    The owner read the two side by side and asked "why is there no / in front
+    of free? what does free mean here? there is no limit, but why is there
+    also free?" The `/` promised two numbers where there was one, and the
+    shared `used / quota` heading claimed both rows measured the same thing.
+
+    Three shapes now, each naming itself, under a heading true of all three:
+
+        876M / 30G (3%)   your usage against your quota
+        11T used          your usage, with no quota set
+        886G free         the filesystem's headroom, shared
+    """
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+
+    quota = _measured(_root("/a", "fa"), used=876_543_210, limit=32_212_254_720)
+    unlimited = _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=0)
+    capacity = _root("/c", "fc")
+    capacity.reach = Reach.LISTABLE
+    capacity.writable = confirmed()
+    capacity.policy = {"free_bytes": 951_000_000_000}
+    for root in (quota, unlimited, capacity):
+        root.role = "project"
+
+    text = atlas.render([quota, unlimited, capacity], style=style, group=True, size=100)
+
+    assert "space" in text, "one heading, true of all three shapes"
+    assert "no limit" not in text, "the words that prompted the question are gone"
+    row = next(ln for ln in text.splitlines() if "/b" in ln)
+    assert "used" in row and " / " not in row, "a no-limit row has one number: %r" % (row,)
+    free = next(ln for ln in text.splitlines() if "/c" in ln)
+    assert "free" in free and " / " not in free, "a capacity row has one number: %r" % (free,)
+    both = next(ln for ln in text.splitlines() if "/a" in ln)
+    assert " / " in both, "a real quota still pairs used with its limit: %r" % (both,)
+
+
+def test_the_detail_view_is_fields_and_not_paragraphs():
+    """The owner's verdict on the old one: "this chunk of verbose text makes
+    no fucking sense. it says the figures above. what figures?"
+
+    Two separate defects in that sentence. Prose that points at other lines
+    ("the figures above") assumes the reader is going top to bottom, which
+    nobody does in a detail view. And three paragraphs of mechanism were
+    costing six lines on every path to say what naming the quota says.
+
+    The property asserted is structural rather than a word count: every line
+    is either the heading, blank, a `label value` field, or the one footer.
+    Nothing wraps, which is what makes it scannable and also what keeps
+    `_browse`'s repaint arithmetic true.
+    """
+    run = cli.Run()
+    root = _measured(_root("/project/lab", "project-lab"), used=876_543_210, limit=0)
+    root.role = "project"
+    root.writable = confirmed()
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
+    lines = text.splitlines()
+
+    assert len(lines) <= 14, "a detail view is a field list, not a page: %d lines" % (len(lines),)
+    body = [ln for ln in lines[1:] if ln.strip()]
+    for line in body:
+        assert len(line.split()) <= 9, "%r is a sentence, not a field" % (line,)
+    assert "the figures above" not in text, "prose must not point at other lines"
+    assert "counted by the filesystem itself" not in text, "the mechanism paragraph is gone"
+    assert "  quota     " in text, "the quota source survives as a field"
+
+
 def test_why_does_not_print_one_line_per_symlink():
     """A home directory with eleven relocated dotfiles produced eleven
     near-identical `note` lines, which was most of a thirty-line screen.
@@ -1099,7 +1217,12 @@ def test_why_does_not_print_one_line_per_symlink():
     assert text.count("resolves to") == 0, "the per-symlink lines must be collapsed"
     # Matched against the whitespace-normalised text, because the sentence is
     # wrapped to the window and the line it breaks on moves with the width.
-    assert "6 paths here are symlinks into other storage" in " ".join(text.split())
+    # Re-anchored when the bullet became a `symlinks` field. The count and
+    # the "billed there" consequence are the two things this test is about, and
+    # both survived the rewrite; the sentence around them did not.
+    flat = " ".join(text.split())
+    assert "symlinks 6 into" in flat, flat
+    assert "billed there" in flat, "the consequence is the point, not the count"
     assert len(text.splitlines()) < 20, "why is a screen, not a transcript"
 
 
@@ -1135,7 +1258,9 @@ def test_why_omits_a_probe_that_never_ran():
 
     assert "not probed" not in text, "a probe that never ran was reported anyway"
     assert "allocation" not in text, "the unasked allocation question must be silent"
-    assert "you can see what is in this directory" in text, "the answered probe must show"
+    # The reach phrases became words when the owner ruled out verbose text,
+    # so the witness is the field rather than the sentence it used to hold.
+    assert "access    read + write" in text, "the answered probe must show"
     assert "\u2713" not in text, "a confirmed axis has no mark to explain"
 
 
@@ -1736,8 +1861,12 @@ def test_no_discovery_source_token_reaches_the_prose():
     for token in discover.SOURCE_LABELS:
         assert token not in text, "%r is a wire token and reached the screen" % (token,)
     flat = " ".join(text.split())
-    assert "dirscape shows you this directory because" in flat
-    assert discover.source_label("dir-owner") in flat
+    assert "found " in flat, "the sources are a field now, not a sentence"
+    # The SHORT form, because the `found` field takes noun phrases. The long
+    # clause form still exists and `--json` and the long views use it; what
+    # this test guards either way is that the wire token never appears and its
+    # human twin does.
+    assert discover.source_label("dir-owner", short=True) in flat
 
 
 def test_no_verdict_category_token_reaches_the_detail_view():
@@ -1796,7 +1925,7 @@ def test_an_unmeasured_figure_is_not_explained_as_a_measured_one():
     flat = " ".join(text.split())
 
     assert "space     ?" in text, "an unmeasured figure is the unknown mark: %r" % (text,)
-    assert "could not measure the space here" in flat
+    assert "quota none measured" in flat
     assert "counted by the filesystem itself" not in flat
 
 
@@ -1821,7 +1950,7 @@ def test_a_published_policy_is_spelled_out():
     flat = " ".join(text.split())
 
     assert "not backed up" in flat
-    assert "deleted 30 days after they are written" in flat
+    assert "deleted 30 days after writing" in flat
     assert "purge_days" not in flat
 
 

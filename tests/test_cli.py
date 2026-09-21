@@ -673,3 +673,90 @@ def test_the_summary_lines_count_the_unfiltered_roots():
     assert "dirscape stranded" in text
     assert "dirscape elsewhere" in text
     assert "11G" in text, "the stranded total must be summed and shown"
+
+
+def test_a_capacity_figure_aligns_with_the_quota_figures():
+    """The comparison that failed was `word == "free"` on a DIMMED cell.
+
+    The cell is `\\x1b[38;5;248m886G free\\x1b[0m`, so the last token is
+    `free\\x1b[0m` and the equality test silently missed, which is why the
+    capacity rows were never aligned at all: `886G free` sat four columns in
+    while every quota figure sat five. Nothing raised; they were just wrong.
+    """
+    import re
+
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="always", ascii_only=False, stream=None)
+
+    quota = _measured(_root("/a", "fa"), used=950_272, limit=0)
+    quota.role = "project"
+    bare = _root("/b", "fb")
+    bare.role = "project"
+    bare.reach = Reach.LISTABLE
+    bare.writable = confirmed()
+    bare.policy = {"free_bytes": 951_000_000_000}
+
+    text = atlas.render([quota, bare], style=style, group=True)
+
+    plain = [re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", ln) for ln in text.splitlines()]
+    rows = [ln for ln in plain if "/a" in ln or "/b" in ln]
+    assert len(rows) == 2
+
+    # Both figures must END at the same column of the line. Anchored on the
+    # figure itself rather than on a neighbouring column, because a column
+    # whose value is identical on every row is dropped and an anchor there
+    # disappears with it.
+    edges = set()
+    for line in rows:
+        match = re.search(r"(\d[\d.]*[KMGTPB]?)(?= / | free)", line)
+        assert match, "no figure found in %r" % (line,)
+        edges.add(match.end())
+    assert len(edges) == 1, "figures end at columns %s" % (sorted(edges),)
+
+
+def test_why_does_not_print_one_line_per_symlink():
+    """A home directory with eleven relocated dotfiles produced eleven
+    near-identical `note` lines, which was most of a thirty-line screen.
+    """
+    run = cli.Run()
+    root = _measured(_root("/home/me", "home"))
+    root.role = "home"
+    root.reach = Reach.LISTABLE
+    root.writable = confirmed()
+    for name in (".cache", ".local", ".conda", ".triton", ".codex", ".nv"):
+        root.add_note(
+            "/home/me/%s resolves to /project/lab/me/%s, so its contents are "
+            "billed against /project/lab/me and not against this root" % (name, name)
+        )
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, code = cli._why(run, "/home/me", resolve_style(color="never", stream=None))
+
+    assert code == cli.EXIT_OK
+    assert text.count("resolves to") == 0, "the per-symlink lines must be collapsed"
+    assert "6 paths here are symlinks billed elsewhere" in text
+    assert len(text.splitlines()) < 20, "why is a screen, not a transcript"
+
+
+def test_why_omits_a_probe_that_never_ran():
+    """`? allocated not probed` appeared on every mounted root.
+
+    The allocation database is only consulted for storage with no path here,
+    so a question mark against a question nobody asked teaches a reader to
+    skip the column.
+    """
+    run = cli.Run()
+    root = _measured(_root("/project/lab", "project-lab"))
+    root.reach = Reach.LISTABLE
+    root.writable = confirmed()
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
+
+    assert "allocated" not in text
+    assert "mounted" in text

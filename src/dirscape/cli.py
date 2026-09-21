@@ -1010,7 +1010,18 @@ def _visible(run, show_all):
 
 def _why(run, path, style):
     # type: (Run, str, object) -> Tuple[str, int]
-    """Every probe that touched one path, and what each one actually said."""
+    """One path, explained in a screen you can read.
+
+    The first version printed everything it knew: raw byte counts, every
+    backend note verbatim, and one line per symlink out of the directory. On a
+    home directory with eleven relocated dotfiles that was thirty-odd lines,
+    ten of them the same sentence with a different path in it, and the two
+    numbers a reader actually wanted were in the middle in bytes.
+
+    So: the headline first, the verdicts as a block, and anything repetitive
+    collapsed to a count with a command that expands it. `--json` still
+    carries every field for anyone who wants the lot.
+    """
     target = os.path.abspath(os.path.expanduser(path))
     match = None
     for root in run.roots:
@@ -1018,8 +1029,6 @@ def _why(run, path, style):
             match = root
             break
     if match is None:
-        # Fall back to the enclosing root, since asking about a file inside a
-        # project directory is a reasonable thing to do.
         best = ""
         for root in run.roots:
             candidate = getattr(root, "path", "")
@@ -1027,76 +1036,115 @@ def _why(run, path, style):
                 if len(candidate) > len(best):
                     best, match = candidate, root
 
-    lines = []  # type: List[str]
     if match is None:
-        lines.append("dirscape found no root at or above %s" % (target,))
-        lines.append("")
-        lines.append(
-            "That is a statement about discovery, not about the path: it may "
-            "exist and be perfectly readable."
+        return (
+            "dirscape found no root at or above %s.\n\n"
+            "That is a statement about discovery and not about the path: it may\n"
+            "exist and be perfectly readable. Try `dirscape --all`." % (target,),
+            EXIT_PATH,
         )
-        lines.append("Run `dirscape --all` to include secondary roots.")
-        return "\n".join(lines), EXIT_PATH
 
-    lines.append("%s" % (match.path,))
+    out = []  # type: List[str]
+    out.append(style.head(match.path))
     if match.path != target:
-        lines.append("  (the enclosing root of %s)" % (target,))
-    lines.append("")
-    lines.append("  role          %s" % (match.role or "unclassified",))
-    lines.append("  device        %s" % (match.device or "?",))
-    lines.append("  fileset       %s" % (match.fileset or "?",))
-    lines.append("  fstype        %s" % (match.fstype or "?",))
-    lines.append("")
+        out.append(style.dim("  the enclosing root of %s" % (target,)))
+
+    where = [x for x in (match.role, match.fstype, match.fileset) if x]
+    if match.device and match.fileset:
+        where = [x for x in (match.role, match.fstype) if x]
+        where.append("%s:%s" % (match.device, match.fileset))
+    out.append(style.dim("  " + "  ".join(where)))
+    out.append("")
+
+    # The headline: the two numbers and the one-word access summary.
+    figure, caveat = render_fields.quota_cell(match, style, show_bar=True)
+    out.append("  %-9s %s" % ("space", figure))
+    inodes, _ = render_fields.inode_cell(match, style)
+    if inodes and inodes != render_fields.UNKNOWN:
+        out.append("  %-9s %s" % ("files", inodes))
+    out.append(
+        "  %-9s %s%s"
+        % (
+            "access",
+            Reach.label(match.reach),
+            ", writable" if match.writable.confirmed else "",
+        )
+    )
+    if match.elsewhere:
+        out.append("  %-9s %s" % ("where", style.warn("allocated, but not mounted on this node")))
+    out.append("")
+
+    # The probes, one line each, with the glyph doing the work.
     for label, verdict in (
-        ("allocated", match.allocated),
-        ("mounted here", match.mounted),
+        ("mounted", match.mounted),
         ("present", match.present),
         ("writable", match.writable),
+        ("allocated", match.allocated),
     ):
+        # A probe that was never run has nothing to report. `? allocated not
+        # probed` appeared on every mounted root, because the allocation
+        # database is only consulted for storage that has no path here, and a
+        # question mark against a question nobody asked is noise that teaches
+        # a reader to skip the column.
+        if verdict.category == VerdictCategory.NOT_PROBED:
+            continue
         detail = verdict.reason or verdict.label
-        source = (" via %s" % verdict.source) if verdict.source else ""
-        lines.append("  %-13s %s  %s%s" % (label, verdict.glyph(), detail, source))
-    lines.append("  %-13s %s  %s" % ("reach", Reach.label(match.reach), match.reach_reason or ""))
-    lines.append("")
+        out.append("  %s %-9s %s" % (verdict.glyph(), label, style.dim(detail)))
+    out.append("")
 
-    if match.quota is not None:
-        snap = match.quota
-        lines.append("  quota         from %s" % (snap.source or "?",))
-        if not snap.available:
-            lines.append("                unavailable: %s" % (snap.reason or snap.category,))
-        for row in snap.rows:
-            limit = row.limit
-            lines.append(
-                "                %s used=%s limit=%s%s"
-                % (
-                    row.label,
-                    row.used if row.used is not None else "?",
-                    limit if limit is not None else "? (no limit reported)",
-                    " [inferred mount]" if row.guessed else "",
+    # Provenance, short.
+    if match.quota is not None and match.quota.source:
+        out.append("  %-9s %s" % ("quota", style.dim(match.quota.source)))
+    if match.sources:
+        out.append("  %-9s %s" % ("found by", style.dim(", ".join(match.sources))))
+    if match.labels:
+        out.append("  %-9s %s" % ("changed", style.dim(", ".join(match.labels))))
+
+    # The repetitive part, collapsed. Eleven symlinks out of a home directory
+    # are one fact about that directory, not eleven facts.
+    crossings = [n for n in match.notes if "resolves to" in n]
+    others = [n for n in match.notes if "resolves to" not in n]
+    if crossings:
+        targets = sorted({n.split("resolves to")[1].split(",")[0].strip() for n in crossings})
+        out.append("")
+        out.append(
+            "  %s %d path%s here are symlinks billed elsewhere: %s"
+            % (
+                style.warn(style.g.warn),
+                len(crossings),
+                "" if len(crossings) == 1 else "s",
+                ", ".join(targets[:2]) + ("..." if len(targets) > 2 else ""),
+            )
+        )
+        out.append(style.dim("    %s for the whole picture" % (style.accent("dirscape tree"),)))
+    for note in others[:3]:
+        out.append("  %-9s %s" % ("note", style.dim(note)))
+    if len(others) > 3:
+        out.append(
+            style.dim(
+                "  %-9s %d more (%s)" % ("", len(others) - 3, style.accent("dirscape --json"))
+            )
+        )
+    if caveat:
+        # Deduplicated. Each backend appends its own caveat and the blocks and
+        # inodes rows append the same ones again, so the raw string said "the
+        # mount for this row was inferred from its name" twice in one line and
+        # then said it a third time in longer words.
+        # One caveat, not four. Each backend appends its own and the blocks
+        # and inodes rows append the same ones again, so the raw string made
+        # the same point about an inferred mount three times in three
+        # different phrasings, which substring dedupe cannot catch and which
+        # was the longest line on the screen. The rest are in `--json`.
+        pieces = [piece.strip() for piece in caveat.split("; ") if piece.strip()]
+        out.append("  %-9s %s" % ("caveat", style.dim(pieces[0])))
+        if len(pieces) > 1:
+            out.append(
+                style.dim(
+                    "  %-9s %d more (%s)" % ("", len(pieces) - 1, style.accent("dirscape --json"))
                 )
             )
-            if row.in_doubt:
-                lines.append(
-                    "                %s in doubt, which is why a du walk will "
-                    "disagree" % (row.in_doubt,)
-                )
-        for note in (snap.time_note, snap.figure_note):
-            if note:
-                lines.append("                note: %s" % (note,))
-    else:
-        lines.append("  quota         ? no backend produced a row for this path")
-    lines.append("")
 
-    lines.append("  found by      %s" % (", ".join(match.sources) or "?",))
-    if match.symlink_target:
-        lines.append("  symlink to    %s" % (match.symlink_target,))
-        if match.crosses_boundary:
-            lines.append("                this crosses a quota boundary")
-    for note in match.notes:
-        lines.append("  note          %s" % (note,))
-    if match.labels:
-        lines.append("  since last    %s" % (", ".join(match.labels),))
-    return "\n".join(lines), EXIT_OK
+    return "\n".join(out), EXIT_OK
 
 
 def _elsewhere(run):
@@ -1344,6 +1392,21 @@ def _browse(run, opts, style, width):
         ),
     ]
 
+    def leave():
+        # type: () -> int
+        """Put the report back on screen on the way out.
+
+        The interactive frame is erased when it exits, and erasing the last
+        frame left the user looking at a blank terminal where their scrollback
+        used to be: "the entire terminal turns empty rather than staying at
+        where it was". Printing the static report once on exit means a browse
+        ends the way a plain run ends, with the table in the scrollback, and it
+        is robust to the cursor arithmetic being off by a line.
+        """
+        text, _ = _render(run, opts, "atlas", style, width)
+        _write(text)
+        return EXIT_OK
+
     cursor = 0
     while True:
         chosen = interactive.select(
@@ -1353,7 +1416,7 @@ def _browse(run, opts, style, width):
             escapable=False,
         )
         if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
-            return EXIT_OK
+            return leave()
         cursor = int(chosen)  # type: ignore[arg-type]
         root = roots[cursor]
         detail, _ = _why(run, root.path or "/", style)
@@ -1377,7 +1440,7 @@ def _browse(run, opts, style, width):
             openable=False,
         )
         if outcome == interactive.Key.QUIT:
-            return EXIT_OK
+            return leave()
 
 
 def main(argv=None):

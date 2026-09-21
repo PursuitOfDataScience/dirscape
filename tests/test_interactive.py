@@ -368,3 +368,68 @@ def test_a_real_pty_paints_moves_and_exits():
     assert "\033[?25h" in text, "the cursor was never restored"
     assert "\033[J" in text, "no frame was erased, so frames would stack up"
     assert "move" in text and "open" in text, "the key hints were not shown"
+
+
+# --------------------------------------------------------------------------
+# The highlight has to be one band, not ragged emphasis
+# --------------------------------------------------------------------------
+
+
+def _plain(text):
+    import re
+
+    return re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", text)
+
+
+def test_the_band_is_the_same_width_on_every_row():
+    """Otherwise the cursor looks like a different shape on each line.
+
+    Measured in a pty before the fix: three rows highlighted at 47, 69 and 74
+    columns, each stopping exactly where its own text ran out.
+    """
+    rows = ["short", "a much longer row than that one", "middle length"]
+    widths = set()
+    for index in range(len(rows)):
+        painted = highlight(rows, index)
+        widths.add(len(_plain(painted[index])))
+    assert len(widths) == 1, "bands of %s columns" % (sorted(widths),)
+    assert widths == {len(max(rows, key=len))}
+
+
+def test_an_embedded_reset_re_asserts_the_inverse():
+    """The load-bearing one, and the actual cause of the ragged band.
+
+    The table's cells carry their own colours, so a row contains `\\033[0m`
+    several times along its length. Wrapping such a line in inverse turns the
+    band OFF at the first embedded reset and the highlight stops mid-row.
+    """
+    line = "left \033[31mred\033[0m middle \033[32mgreen\033[0m right"
+    painted = highlight([line], 0)[0]
+
+    body = painted[len(interactive.RESET + interactive.INVERSE) : -len(interactive.RESET)]
+    # Every reset inside the body must be immediately followed by an inverse,
+    # or the band ends at that point.
+    cursor = 0
+    while True:
+        at = body.find(interactive.RESET, cursor)
+        if at < 0:
+            break
+        after = body[at + len(interactive.RESET) :]
+        assert after.startswith(interactive.INVERSE), (
+            "a reset at offset %d is not followed by an inverse, so the band stops there" % (at,)
+        )
+        cursor = at + len(interactive.RESET)
+    assert body.count(interactive.RESET) == 2, "the fixture has two embedded resets"
+
+
+def test_the_band_covers_the_padding_and_then_stops():
+    painted = highlight(["ab", "abcdef"], 0)[0]
+    assert painted.startswith(interactive.RESET + interactive.INVERSE)
+    assert painted.endswith(interactive.RESET)
+    assert _plain(painted) == "ab    ", "the pad is inside the band"
+
+
+def test_pad_to_overrides_the_measured_width():
+    """So a caller that knows the window can fill it."""
+    painted = highlight(["ab"], 0, pad_to=10)[0]
+    assert len(_plain(painted)) == 10

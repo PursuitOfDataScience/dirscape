@@ -42,6 +42,11 @@ __all__ = ["Key", "supported", "read_key", "select", "raw_session", "MIN_LINES"]
 #: better than a screen that repaints on top of itself.
 MIN_LINES = 10
 
+#: SGR reset and inverse. Named because `highlight` has to reason about where
+#: they appear inside text it did not write.
+RESET = "\033[0m"
+INVERSE = "\033[7m"
+
 
 class Key(object):
     """Decoded keypresses. Names rather than bytes, so callers read cleanly."""
@@ -296,20 +301,42 @@ class _Nothing(object):
         return False
 
 
-def highlight(lines, index, style=None):
-    # type: (Sequence[str], int, Optional[object]) -> List[str]
+def highlight(lines, index, style=None, pad_to=None):
+    # type: (Sequence[str], int, Optional[object], Optional[int]) -> List[str]
     """Paint one line of an already-rendered block in inverse video.
 
     Inverse rather than a colour, because it survives `NO_COLOR`, a 16-colour
     console and a light background alike, and because it does not collide with
     the colours the table already uses to mean something.
+
+    **The line is PADDED to the block's width first.** Without that the bar of
+    inverse video is as long as whatever text the row happened to contain, so
+    a row reading `24T free` highlighted about half as wide as one carrying a
+    usage bar, and the cursor looked like a different shape on every row
+    instead of a band moving down a column. Padding is what makes it read as
+    one selection rather than as ragged emphasis.
     """
+    from .render.style import width as measure
+
+    room = pad_to
+    if room is None:
+        room = max([measure(line) for line in lines] or [0])
+
     out = []  # type: List[str]
     for position, line in enumerate(lines):
         if position == index:
-            # Reset first, so a line that already ends mid-colour cannot leak
-            # its state into the highlight.
-            out.append("\033[0m\033[7m" + line + "\033[0m")
+            gap = " " * max(0, room - measure(line))
+            # Every reset ALREADY IN the line has to re-assert the inverse,
+            # and this is the whole trick. The table's cells carry their own
+            # colours, so a row ends up with `\033[0m` several times along its
+            # length; wrapping such a line in inverse turns the band off at
+            # the first embedded reset and the highlight stops mid-row. That
+            # is what made the cursor look like a different width on every
+            # line: measured in a pty, three rows highlighted at 47, 69 and 74
+            # columns, each stopping exactly where its first coloured cell
+            # ended.
+            body = line.replace(RESET, RESET + INVERSE)
+            out.append(RESET + INVERSE + body + gap + RESET)
         else:
             out.append(line)
     return out

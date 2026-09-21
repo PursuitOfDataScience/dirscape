@@ -197,6 +197,37 @@ gets highlighted, a frame gets erased, the drill-down opens and the cursor is
 restored. Scripted readers verify the logic and can say nothing about any of
 that.
 
+### Three UI defects, all reported from real use
+
+- **The highlight was a different width on every row.** The cause was not
+  padding, it was that the table's cells carry their own colours, so a row
+  contains `\033[0m` several times along its length; wrapping such a line in
+  inverse video turns the band OFF at the first embedded reset and the
+  highlight stops mid-row. Measured in a pty: three rows highlighted at 47, 69
+  and 74 columns, each stopping exactly where its first coloured cell ended.
+  Every embedded reset now re-asserts the inverse, and the line is padded to
+  the block width so the band is one shape moving down a column.
+- **`why` was a wall of text.** Thirty-odd lines on a home directory, eleven of
+  them the same sentence with a different path in it, raw byte counts
+  (`used=874348544`) where a reader wanted `834M`, and the same in-doubt fact
+  stated three times in three phrasings. Now nineteen lines: the two numbers
+  and a one-word access summary first, the probes as a block, the symlinks
+  collapsed to a count with `dirscape tree` to expand them, and one caveat
+  rather than four. A probe that never ran is omitted entirely, since
+  `? allocated not probed` on every mounted root teaches a reader to skip the
+  column.
+- **Quitting left a blank terminal.** Erasing the last interactive frame wiped
+  the screen the user had been looking at. A browse now ends the way a plain
+  run ends, by printing the report once on the way out, which also makes it
+  robust to the cursor arithmetic being off by a line.
+
+And one alignment bug that had been silently wrong since the capacity fallback
+landed: the check for it was `word == "free"` against a DIMMED cell, so the
+real token was `free\x1b[0m`, the equality missed, and the branch never ran.
+Nothing raised; `886G free` simply sat four columns in while every quota figure
+sat five. Every figure now ends at the same column, verified by measuring the
+rendered output rather than by reading it.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

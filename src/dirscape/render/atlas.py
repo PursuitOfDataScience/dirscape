@@ -29,6 +29,7 @@ beneath it. A path wider than the window is printed whole and left to the
 terminal's own wrap, which loses no characters.
 """
 
+import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..model import Root, VerdictCategory, category_label
@@ -117,6 +118,15 @@ def _row(root, style, site, show_bar):
     return cells, both
 
 
+_ANSI = re.compile("\033\\[[0-9;?]*[A-Za-z]")
+
+
+def _strip(text):
+    # type: (str) -> str
+    """The text a reader sees, with the escapes removed."""
+    return _ANSI.sub("", text).strip()
+
+
 def _align_figures(blocks, index):
     # type: (Sequence[List[str]], int) -> None
     """Right-align the used and limit figures inside an already-built cell.
@@ -158,7 +168,12 @@ def _align_figures(blocks, index):
             # column edge while every quota figure is right-aligned. Treated
             # as a figure with an empty limit so it joins the same column.
             bare, space, word = cell.rpartition(" ")
-            if space and word == "free":
+            # Compared with the escapes stripped. The cell is dimmed, so the
+            # last token is `free\x1b[0m` and an equality test against "free"
+            # silently failed, which is why the capacity rows were never
+            # aligned at all: `886G free` sat four columns in while every
+            # quota figure sat five.
+            if space and _strip(word) == "free":
                 parts.append((bare, "", word))
                 continue
             parts.append(None)

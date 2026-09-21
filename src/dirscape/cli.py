@@ -75,16 +75,30 @@ _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 def parse_duration(text):
     # type: (str) -> float
     """`30d`, `12h`, `90` (seconds). Raises ValueError on anything else."""
-    raw = (text or "").strip().lower()
+    original = (text or "").strip()
+    raw = original.lower()
     if not raw:
         raise ValueError("empty duration")
     unit = 1
     if raw[-1] in _DURATION_UNITS:
         unit = _DURATION_UNITS[raw[-1]]
         raw = raw[:-1]
-    value = float(raw)
+    try:
+        value = float(raw)
+    except ValueError:
+        # Report what the USER typed. Letting float's own message out said
+        # "could not convert string to float: 'bogu'", having silently eaten
+        # the last character as a unit, which sends a reader looking for a
+        # typo they did not make.
+        # `from None` rather than chaining: float's own message is exactly the
+        # thing being replaced, so keeping it in the traceback puts the
+        # misleading text back.
+        raise ValueError(
+            "%r is not a duration; use a number optionally followed by %s"
+            % (original, "/".join(sorted(_DURATION_UNITS)))
+        ) from None
     if value < 0:
-        raise ValueError("duration cannot be negative")
+        raise ValueError("a duration cannot be negative")
     return value * unit
 
 
@@ -1347,17 +1361,26 @@ def _render(run, opts, command, style, width):
         # other people's filesets for ever, under a heading that said "1
         # change since the baseline". The table and its own count disagreed.
         # It keeps its alert line and its own subcommand.
+        # Warnings are appended to the short-message paths below as well.
+        # Without that, `dirscape new --since bogus` answered "No change since
+        # the last run" and never mentioned that the flag had been ignored, so
+        # a typo silently changed which baseline was compared against.
+        alerts = _surfaceable(run)
+        note = (
+            ("\n\n" + "\n".join("  %s %s" % (chr(0x25B2), w) for w in alerts[:2])) if alerts else ""
+        )
+
         moved = [c for c in changes if getattr(c, "label", "") != "stranded"]
         if not moved:
             standing = len(changes) - len(moved)
             if standing:
                 return (
                     "No change since the last run. %d fileset%s still hold "
-                    "space you cannot reach: dirscape stranded"
-                    % (standing, "" if standing == 1 else "s"),
+                    "space you cannot reach: dirscape stranded%s"
+                    % (standing, "" if standing == 1 else "s", note),
                     EXIT_OK,
                 )
-            return ("No change since the last run.", EXIT_OK)
+            return ("No change since the last run." + note, EXIT_OK)
         # The atlas renders the delta panel, so it is reused rather than
         # reimplemented. It is handed the roots the changes REFER TO, not an
         # empty list: with no rows the atlas has nothing to hang the panel on

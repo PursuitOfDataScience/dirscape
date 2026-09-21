@@ -333,6 +333,31 @@ records: lineage retention keeps 30 entries plus the oldest anchor, 643 KB
 against the 1 MiB ceiling, a 49-hour span with the 20-hour gap sitting just
 after the anchor, so `--since 30d` still has something to compare against.
 
+### Third hunt: the quiet-flag round
+
+- **`--since bogus` was accepted and ignored in silence.** `dirscape new`
+  answered "No change since the last run" and never said the flag had not been
+  understood, so a typo quietly changed which baseline was compared against.
+  The short-message paths carry their warnings now.
+- **A bad duration reported a mangled string.** Letting `float`'s own error
+  out said "could not convert string to float: 'bogu'", having silently eaten
+  the last character as a unit, which sends a reader hunting for a typo they
+  did not make. It names what was typed and lists the units.
+- **The treemap and the table disagreed about what had been measured.** The
+  map said "no quota reading was taken" for the very roots the atlas was
+  showing a figure for, because it knew only about quota rows while the
+  capacity fallback lives elsewhere. The tile stays unsized on purpose, since
+  `statvfs` reports the whole filesystem's headroom and sizing by it would let
+  a shared `/tmp` dwarf the user's own project directory, but it now says
+  which figure exists instead of denying there is one.
+
+Checked and found sound, recorded so nobody re-tests them: eight concurrent
+runs leave the state file valid JSON (last writer wins, two snapshots lost, no
+corruption); a symlink loop through `$TMPDIR` terminates; a baseline dated
+three days into the future reads as "dated ahead of this node" rather than as a
+negative age; and the `elsewhere` sizes are decimal GB matching the site tool
+exactly (256000 GB renders as 233T, which is 232.8 TiB).
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

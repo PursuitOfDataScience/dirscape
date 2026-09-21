@@ -997,3 +997,66 @@ def test_the_stranded_summary_is_not_repeated_as_a_warning():
     ]
     surfaced = cli._surfaceable(run)
     assert surfaced == ["ignored malformed config /etc/dirscape/site.conf"]
+
+
+@pytest.mark.parametrize("bad", ["bogus", "5y", "", "  ", "d", "-3"])
+def test_a_bad_duration_names_what_the_user_typed(bad):
+    """float's own message said "could not convert string to float: 'bogu'",
+    having silently eaten the last character as a unit, which sends a reader
+    looking for a typo they did not make.
+    """
+    with pytest.raises(ValueError) as caught:
+        cli.parse_duration(bad)
+    message = str(caught.value)
+    if bad.strip():
+        assert repr(bad.strip()) in message or "negative" in message, message
+
+
+def test_an_ignored_since_flag_is_mentioned_rather_than_swallowed():
+    """`dirscape new --since bogus` answered "No change since the last run"
+    and never said the flag had been ignored, so a typo silently changed which
+    baseline was compared against.
+    """
+
+    class Changes(object):
+        no_baseline = False
+        warnings = ()
+        records = ()
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    run = cli.Run()
+    run.roots = [_measured(_root("/project/lab", "project-lab"))]
+    run.changes = Changes()
+    run.warnings = ["ignored --since 'bogus': 'bogus' is not a duration"]
+    opts = cli.build_parser().parse_args(["new", "--since", "bogus"])
+
+    text, code = cli._render(run, opts, "new", style=None, width=None)
+
+    assert code == cli.EXIT_OK
+    assert "No change since the last run" in text
+    assert "ignored --since" in text, "the ignored flag must be mentioned"
+
+
+def test_the_treemap_and_the_table_agree_about_what_was_measured():
+    """The treemap said "no quota reading was taken" for the very roots the
+    atlas was showing a figure for, because it knew only about quota rows and
+    the capacity fallback lives elsewhere. Two views of one run disagreeing
+    about whether anything was measured is worse than either answer.
+    """
+    from dirscape.render import fields
+
+    root = _root("/tmp", "", device="xfs")
+    root.policy = {"free_bytes": 951_000_000_000}
+
+    reason = fields.trouble(root)
+    assert "no quota reading was taken" not in reason
+    assert "free" in reason, reason
+    # And the cell stays unsized: statvfs reports the whole filesystem's
+    # headroom, so sizing a tile by it would let a shared /tmp dwarf the
+    # user's own project directory.
+    assert "nothing of yours to size" in reason

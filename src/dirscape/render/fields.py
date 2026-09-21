@@ -522,6 +522,23 @@ def trouble(root):
     """
     snap = root.quota
     if snap is None:
+        free = (root.policy or {}).get("free_bytes")
+        if isinstance(free, int):
+            # The treemap said "no quota reading was taken" for the very roots
+            # the atlas was showing a figure for, because it only knew about
+            # quota rows and the capacity fallback lives elsewhere. Two views
+            # of one run disagreeing about whether anything was measured is
+            # worse than either answer.
+            #
+            # The cell stays UNSIZED on purpose: `statvfs` reports the whole
+            # filesystem's headroom, shared with everyone on the node, and
+            # sizing a tile by that would let a shared `/tmp` dwarf the user's
+            # own project directory. Saying which figure exists is the fix,
+            # not sizing by the wrong one.
+            return (
+                "no per-user figure here, so there is nothing of yours to size; "
+                "the filesystem reports %s free" % (human_bytes(free),)
+            )
         return "no quota reading was taken"
     parts = []  # type: List[str]
     row, _, why = pick_row(snap, root.path, "blocks")

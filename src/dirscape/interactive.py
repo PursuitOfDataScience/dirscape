@@ -36,7 +36,16 @@ import shutil
 import sys
 from typing import Callable, List, Optional, Sequence
 
-__all__ = ["Key", "supported", "read_key", "select", "raw_session", "MIN_LINES"]
+__all__ = [
+    "Key",
+    "supported",
+    "read_key",
+    "select",
+    "raw_session",
+    "highlight",
+    "window_rows",
+    "MIN_LINES",
+]
 
 #: A terminal shorter than this cannot hold a frame, so the static print is
 #: better than a screen that repaints on top of itself.
@@ -59,6 +68,22 @@ class Key(object):
     QUIT = "quit"
     BACK = "back"
     OTHER = "other"
+
+
+def window_rows():
+    # type: () -> int
+    """The terminal's height, or 0 when it cannot be determined.
+
+    Separate from `supported` because the two answer different questions:
+    `supported` asks whether anybody can type at all, and this asks whether
+    what a caller is about to draw will fit. A caller that skips the second
+    check repaints a block taller than the window and the cursor arithmetic
+    lands in the wrong place.
+    """
+    try:
+        return int(shutil.get_terminal_size().lines)
+    except Exception:  # pragma: no cover
+        return 0
 
 
 def supported(stream=None):

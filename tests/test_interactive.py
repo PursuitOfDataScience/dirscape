@@ -433,3 +433,33 @@ def test_pad_to_overrides_the_measured_width():
     """So a caller that knows the window can fill it."""
     painted = highlight(["ab"], 0, pad_to=10)[0]
     assert len(_plain(painted)) == 10
+
+
+def test_window_rows_is_separate_from_supported():
+    """They answer different questions: whether anyone can type, and whether
+    what is about to be drawn will fit.
+    """
+    rows = interactive.window_rows()
+    assert isinstance(rows, int)
+    assert rows >= 0
+
+
+def test_a_frame_taller_than_the_window_is_the_caller_s_problem(monkeypatch):
+    """`supported()` cannot catch it: it knows the window height but not what
+    is about to be drawn in it.
+
+    Measured: a `--all` run in a 14 row terminal asked to move the cursor up
+    71 lines, which lands at the top of the WINDOW rather than the top of the
+    block because the block has scrolled, and the erase that follows wipes
+    whatever the user had above. That is the "entire terminal turns empty"
+    report.
+    """
+
+    class Size(object):
+        lines = 14
+        columns = 100
+
+    monkeypatch.setattr(interactive.shutil, "get_terminal_size", lambda *a: Size())
+    assert interactive.window_rows() == 14
+    # A 71 line block does not fit, and the caller is expected to notice.
+    assert interactive.window_rows() < 71 + 1

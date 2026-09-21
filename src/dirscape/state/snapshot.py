@@ -1022,9 +1022,25 @@ class Lineage(object):
         try:
             with open(where) as handle:
                 payload = json.load(handle)
-        except (OSError, ValueError):
+        except OSError as exc:
+            # A file that is simply not there is the normal first run and says
+            # nothing. A file that exists and cannot be READ is a different
+            # thing and the user needs to know, because the answer they are
+            # about to get is "no baseline" for a history they may have been
+            # building for a month.
+            if os.path.exists(where):
+                lineage.notes.append("could not read the lineage at %s: %s" % (where, exc))
+            return lineage
+        except ValueError as exc:
             # ValueError covers JSONDecodeError, which is a subclass of it and
             # is spelled differently across the versions this has to run on.
+            # Silently starting over here discarded a month of history without
+            # a word, while a FOREIGN file three lines below did warn. Same
+            # outcome, so the same courtesy.
+            lineage.notes.append(
+                "the lineage at %s is damaged (%s); starting a new history "
+                "rather than misreading it" % (where, exc)
+            )
             return lineage
         if not isinstance(payload, dict) or payload.get("tool") != TOOL:
             lineage.notes.append("%s is not a dirscape lineage; ignoring it" % (where,))

@@ -453,6 +453,7 @@ def render(
     legend_on=False,
     all_roots=None,
     group=False,
+    warnings=(),
 ):
     # type: (...) -> str
     """The atlas, as one string.
@@ -621,6 +622,30 @@ def render(
     # Two separate one-line advisories both ending in `dirscape why <path>` is
     # the same sentence twice.
     notes = len(_notes(roots, caveats, style))
+    # Run-level warnings, which had nowhere to go at all. They were collected
+    # into `Run.warnings` and only ever reached `--json`, so a malformed
+    # `/etc/dirscape/site.conf`, a damaged baseline, a failed plugin and a
+    # baseline that could not be written were every one of them silent in the
+    # view a user actually reads.
+    trouble = [text for text in warnings if text]
+    if trouble:
+        out.append("")
+        for text in trouble[:2]:
+            body = "%s %s" % (style.g.warn, text)
+            for line in wrap(body, indent="  ", size=window, style=style).splitlines():
+                out.append(style.warn(line))
+        if len(trouble) > 2:
+            out.append(
+                style.dim(
+                    "  %d more warning%s (%s)"
+                    % (
+                        len(trouble) - 2,
+                        "" if len(trouble) - 2 == 1 else "s",
+                        style.accent("--json"),
+                    )
+                )
+            )
+
     tail = _footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on, notes=notes)
     if tail:
         out.extend(tail)

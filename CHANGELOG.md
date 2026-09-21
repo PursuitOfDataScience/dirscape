@@ -292,6 +292,47 @@ The load-bearing one runs in STRICT mode, where a backend reaching for a tool
 the fixture never recorded raises instead of guessing: on a real foreign
 cluster that guess is a wrong answer nobody can see.
 
+### Second hunt: the silent-failure round
+
+Six more, and the theme is that a failure nobody is told about is worse than a
+crash.
+
+- **A path from argv was printed unsanitised**, so a directory named
+  `evil\n/project/FORGED  999T  100%\x1b[31m` forged a table row inside `why`
+  and put an escape sequence on the terminal. `Root.path` is cleaned at
+  construction; this string never was. That is rapiDU's RD-6 arriving through
+  the one string the model does not own. Two of the four sites were missed on
+  the first pass and caught by the test.
+- **A failed save was silent and then claimed success.** `Lineage.save`
+  returns False rather than raising when it cannot write, and only the raise
+  was handled, so on an unwritable state directory the run reported "a
+  baseline has been recorded" while nothing reached the disk, and said it again
+  on every run afterwards. It exits 1 and says so.
+- **A damaged baseline was discarded without a word**, while a FOREIGN file
+  three lines away did warn. Same outcome, so the same courtesy: a user who
+  has been running this for a month and is told "no baseline yet" needs to know
+  the file was unreadable. "Absent" and "present but unreadable" are now
+  different answers.
+- **`Run.warnings` reached `--json` and nothing else.** A malformed
+  `/etc/dirscape/site.conf`, a damaged baseline, a plugin that failed to list
+  allocations and a baseline that could not be written were every one of them
+  invisible in the view a user actually reads. The table shows up to two with a
+  count.
+- **The interactive frame could be taller than the window.** A `--all` run in
+  a 14-row terminal asked to move the cursor up 71 lines, which lands at the
+  top of the WINDOW rather than the top of the block because the block has
+  scrolled, and the erase that follows wipes whatever was above it. That is the
+  "entire terminal turns empty" report, and `supported()` could not catch it
+  because it knows the window height and not what is about to be drawn in it.
+  A frame that does not fit falls back to the static print and says why.
+- The stranded summary was about to be repeated as a warning, having already
+  earned its own alert line.
+
+Verified rather than assumed, on the real 61-root set rather than synthetic
+records: lineage retention keeps 30 entries plus the oldest anchor, 643 KB
+against the 1 MiB ceiling, a 49-hour span with the 20-hour gap sitting just
+after the anchor, so `--since 30d` still has something to compare against.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

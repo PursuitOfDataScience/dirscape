@@ -41,7 +41,7 @@ from .discover import (
     read_identity,
     read_mount_table,
 )
-from .model import Reach, VerdictCategory, confirmed, refuted, unknown
+from .model import Reach, VerdictCategory, confirmed, refuted, sanitize, unknown
 from .plugins import detect_plugins
 from .quota import default_backends, filesets_seen, read_all, select_snapshot
 from .render import fields as render_fields
@@ -282,6 +282,7 @@ class Run(object):
         "timings",
         "discovery",
         "baseline_at",
+        "saved",
     )
 
     def __init__(self):
@@ -301,6 +302,8 @@ class Run(object):
         self.timings = []  # type: List[Tuple[str, float]]
         self.discovery = unknown(VerdictCategory.NOT_PROBED)
         self.baseline_at = None  # type: Optional[float]
+        # False once a save has been attempted and failed.
+        self.saved = True
 
 
 def _apply_plugin_defaults(site, plugins):
@@ -771,6 +774,10 @@ def _record_state(run, opts):
         run.warnings.append("could not read the snapshot lineage: %s" % (exc,))
         run.lineage = Lineage()
 
+    # The lineage records why it could not use a file it found. Nothing was
+    # reading these, so a damaged or foreign baseline was discarded in silence.
+    run.warnings.extend(getattr(run.lineage, "notes", []) or [])
+
     previous = run.lineage.latest()
     since = None
     raw_since = getattr(opts, "since", None)
@@ -803,9 +810,20 @@ def _record_state(run, opts):
 
     run.lineage.append(run.snapshot)
     try:
-        run.lineage.save(fingerprint=fingerprint)
+        saved = run.lineage.save(fingerprint=fingerprint)
     except Exception as exc:
+        saved = False
         run.warnings.append("could not save the snapshot lineage: %s" % (exc,))
+    if not saved:
+        # `save` RETURNS False rather than raising when it cannot write, and
+        # only the raise was handled. So on an unwritable state directory the
+        # run reported "a baseline has been recorded" while nothing reached
+        # the disk, and the next run said the same thing again, for ever.
+        run.warnings.append(
+            "the baseline was NOT saved to %s, so the next run will have "
+            "nothing to compare against" % (run.lineage.path or "the state directory",)
+        )
+        run.saved = False
 
 
 #: The order a reader's eye should travel: your own space first, shared data
@@ -1030,6 +1048,14 @@ def _why(run, path, style):
     carries every field for anyone who wants the lot.
     """
     target = os.path.abspath(os.path.expanduser(path))
+    # Sanitised for DISPLAY only, and matched on the raw value. A path from
+    # argv is foreign text: `Root.path` is cleaned at construction but this
+    # string never was, so a directory whose name contains a newline forged a
+    # table row in this very view and an ESC sequence reached the terminal.
+    # That is rapiDU's RD-6 arriving through the one string the model does not
+    # own. Measured with a directory literally named
+    # "evil\n/project/FORGED  999T  100%\x1b[31m".
+    shown = sanitize(target, limit=4096)
     match = None
     for root in run.roots:
         if getattr(root, "path", "") == target:
@@ -1056,24 +1082,24 @@ def _why(run, path, style):
         # enclosing root is X", naming the same path twice.
         return (
             "%s does not exist.\n\n"
-            "The enclosing root is %s, if that is what you meant." % (target, match.path or "?"),
+            "The enclosing root is %s, if that is what you meant." % (shown, match.path or "?"),
             EXIT_PATH,
         )
 
     if match is None:
         if not os.path.exists(target):
-            return ("%s does not exist." % (target,), EXIT_PATH)
+            return ("%s does not exist." % (shown,), EXIT_PATH)
         return (
             "dirscape found no root at or above %s.\n\n"
             "That is a statement about discovery and not about the path: it\n"
-            "exists and may be perfectly readable. Try `dirscape --all`." % (target,),
+            "exists and may be perfectly readable. Try `dirscape --all`." % (shown,),
             EXIT_PATH,
         )
 
     out = []  # type: List[str]
     out.append(style.head(match.path))
     if match.path != target:
-        out.append(style.dim("  the enclosing root of %s" % (target,)))
+        out.append(style.dim("  the enclosing root of %s" % (shown,)))
 
     where = [x for x in (match.role, match.fstype, match.fileset) if x]
     if match.device and match.fileset:
@@ -1237,7 +1263,7 @@ def _render(run, opts, command, style, width):
                 return render_ncdu(root), EXIT_OK
         return (
             "dirscape has no root at %s, so there is nothing to export.\n"
-            "Run `dirscape` to see the roots it found." % (target,),
+            "Run `dirscape` to see the roots it found." % (sanitize(target, limit=4096),),
             EXIT_PATH,
         )
 
@@ -1285,6 +1311,12 @@ def _render(run, opts, command, style, width):
                 EXIT_USAGE,
             )
         count = len(run.snapshot.records)
+        if not run.saved:
+            return (
+                "Could not record a baseline: %s"
+                % ("; ".join(run.warnings[-1:]) or "the state file is not writable",),
+                EXIT_USAGE,
+            )
         return (
             "Recorded %d root(s) as a baseline. Run `dirscape new` after the "
             "next change." % (count,),
@@ -1297,6 +1329,12 @@ def _render(run, opts, command, style, width):
                 EXIT_OK,
             )
         if getattr(run.changes, "no_baseline", False):
+            if not run.saved:
+                return (
+                    "No baseline yet, and this run could not save one: %s"
+                    % ("; ".join(run.warnings[-1:]) or "the state file is not writable",),
+                    EXIT_USAGE,
+                )
             return (
                 "No baseline yet, so nothing can honestly be called new. "
                 "A baseline of %d root(s) has been recorded; run this again "
@@ -1378,6 +1416,7 @@ def _render(run, opts, command, style, width):
             # default view deliberately holds back.
             all_roots=run.roots,
             group=not show_all,
+            warnings=_surfaceable(run),
         ),
         EXIT_OK,
     )
@@ -1406,6 +1445,25 @@ def _write(text):
                 sys.stdout.close()
             return
         raise
+
+
+def _surfaceable(run):
+    # type: (Run) -> List[str]
+    """Warnings worth a line in the table.
+
+    The stranded summary is excluded: it already has its own alert line with a
+    subcommand, and repeating it as a warning said the same thing twice. The
+    seeded-baseline note is excluded for the same reason, since the `new` view
+    says it in full.
+    """
+    skip = ("holds space in ", "no baseline yet, seeded")
+    out = []  # type: List[str]
+    for text in run.warnings:
+        if any(text.startswith(prefix) for prefix in skip):
+            continue
+        if text not in out:
+            out.append(text)
+    return out
 
 
 def _browse(run, opts, style, width):
@@ -1476,6 +1534,26 @@ def _browse(run, opts, style, width):
         """
         text, _ = _render(run, opts, "atlas", style, width)
         _write(text)
+        return EXIT_OK
+
+    # A frame taller than the window cannot be repainted in place. Moving the
+    # cursor up by the block's height lands at the TOP OF THE WINDOW rather
+    # than the top of the block, because the block has scrolled, and the erase
+    # that follows then wipes whatever the user had above it. Measured: a
+    # `--all` run in a 14 row terminal asked to move up 71 lines, which is the
+    # "entire terminal turns empty" symptom.
+    #
+    # `interactive.supported()` cannot catch this: it knows the window height
+    # but not what is about to be drawn in it.
+    rows = interactive.window_rows()
+    first = frame(0) + footer
+    if rows and len(first) + 1 > rows:
+        text, _ = _render(run, opts, "atlas", style, width)
+        _write(text)
+        sys.stderr.write(
+            "\n(%d rows to show in a %d row window, so this is the static "
+            "report; widen the window or use dirscape --all less)\n" % (len(first), rows)
+        )
         return EXIT_OK
 
     cursor = 0

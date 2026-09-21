@@ -905,3 +905,95 @@ def test_stranded_is_not_reported_as_a_change():
     assert code == cli.EXIT_OK
     assert "No change since the last run" in text
     assert "still hold space you cannot reach" in text
+
+
+def test_an_argv_path_is_sanitised_before_it_is_printed():
+    """A path from argv is foreign text, and this view printed it raw.
+
+    Measured with a directory literally named
+    `evil\\n/project/FORGED  999T  100%\\x1b[31m`: the newline broke the line
+    and forged a table row inside `why`, and the escape sequence reached the
+    terminal. `Root.path` is cleaned at construction; this string never was.
+    """
+    run = cli.Run()
+    run.roots = [_measured(_root("/tmp", "", device="xfs"))]
+
+    from dirscape.render import resolve_style
+
+    hostile = "/tmp/evil\n/project/FORGED  999T  100%\x1b[31m"
+    text, _ = cli._why(run, hostile, resolve_style(color="never", stream=None))
+
+    assert "\n/project/FORGED" not in text, "a newline forged a row"
+    assert "\x1b" not in text, "an escape sequence reached the output"
+    assert "FORGED" in text, "the name itself is still shown, just defused"
+
+
+def test_a_hostile_path_is_sanitised_in_the_ncdu_error_too():
+    run = cli.Run()
+    run.roots = [_measured(_root("/tmp", "", device="xfs"))]
+    opts = cli.build_parser().parse_args(["ncdu", "/tmp/x\nFORGED"])
+
+    from dirscape.render import resolve_style
+
+    text, code = cli._render(run, opts, "ncdu", resolve_style(color="never", stream=None), None)
+
+    assert code == cli.EXIT_PATH
+    assert "\nFORGED" not in text
+
+
+def test_a_failed_save_is_reported_rather_than_claimed():
+    """`Lineage.save` returns False rather than raising when it cannot write,
+    and only the raise was handled, so the run reported "a baseline has been
+    recorded" while nothing reached the disk.
+    """
+
+    class Changes(object):
+        no_baseline = True
+        records = ()
+        warnings = ()
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    run = cli.Run()
+    run.roots = [_measured(_root("/project/lab", "project-lab"))]
+    run.changes = Changes()
+    run.saved = False
+    run.warnings = ["the baseline was NOT saved to /nowhere/x.json"]
+    opts = cli.build_parser().parse_args(["new"])
+
+    text, code = cli._render(run, opts, "new", style=None, width=None)
+
+    assert code == cli.EXIT_USAGE
+    assert "could not save" in text
+    assert "has been recorded" not in text
+
+
+def test_run_warnings_reach_the_table():
+    """They were collected into `Run.warnings` and only ever reached `--json`,
+    so a malformed site.conf, a damaged baseline and a failed plugin were all
+    silent in the view a user actually reads.
+    """
+    from dirscape.render import atlas
+
+    root = _measured(_root("/project/lab", "project-lab"))
+    root.role = "project"
+    text = atlas.render(
+        [root], group=True, warnings=["ignored malformed config /etc/dirscape/site.conf"]
+    )
+    assert "malformed config" in text
+
+
+def test_the_stranded_summary_is_not_repeated_as_a_warning():
+    """It already has its own alert line with a subcommand."""
+    run = cli.Run()
+    run.warnings = [
+        "holds space in 5 fileset(s) with no reachable path: project-abe",
+        "no baseline yet, seeded one from this run (61 roots)",
+        "ignored malformed config /etc/dirscape/site.conf",
+    ]
+    surfaced = cli._surfaceable(run)
+    assert surfaced == ["ignored malformed config /etc/dirscape/site.conf"]

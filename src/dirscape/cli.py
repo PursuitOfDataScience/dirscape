@@ -506,14 +506,22 @@ def _attach_capacity(run):
     read and `?` was the literal truth and useless anyway: the filesystem
     knows exactly how much room is left and `df` prints it.
 
-    Stored as free BYTES rather than as a quota row, and rendered as
-    "<n> free" rather than as `used / limit`, because it is not your usage.
-    It is the whole filesystem's headroom, shared with everyone else on the
-    node. Labelling it as a quota would be the fabrication this tool exists to
-    avoid; withholding it when `df` would answer is just unhelpful.
+    Stored as free BYTES rather than as a quota row, because it is not your
+    usage: it is the whole filesystem's headroom, shared with everyone else on
+    the node. Labelling it as a quota would be the fabrication this tool
+    exists to avoid; withholding it when `df` would answer is just unhelpful.
+
+    **Read for EVERY root now, not only the ones with no quota.** It used to
+    skip anything a backend had spoken for, which left the `free` column
+    reading `?` on six of ten rows: every uncapped fileset knows its usage and
+    has no allowance to subtract, so the filesystem's headroom is the only
+    answer available to "how much can I still put here". Where both are known
+    `free_cell` takes the smaller, because a 40T allowance on a filesystem
+    with 2T left is 2T of writes. One `statvfs` per root is a single syscall
+    against a mount that is already known to be present.
     """
     for root in run.roots:
-        if root.quota is not None or not root.path:
+        if not root.path:
             continue
         if not root.present.confirmed:
             continue
@@ -1401,8 +1409,8 @@ def _quota_source(root):
     if row is None:
         free = (root.policy or {}).get("free_bytes")
         if isinstance(free, int) and free >= 0:
-            # The figure above it reads `886G free`, so this says whose it is.
-            return "none here; the figure is the whole filesystem, shared"
+            # `free` is its own field now, so this says whose figure it is.
+            return "none; free is the whole filesystem, shared"
         return "none measured"
 
     fileset = getattr(row, "fileset", "") or ""
@@ -1611,9 +1619,16 @@ def _why(run, path, style, size=None):
 
     # 1. How much room, and how full. The question that brought the reader
     #    here, so it is the first thing on the screen.
-    figure, _caveat = render_fields.quota_cell(match, style)
-    out.extend(_field(style, room, "space", figure))
-    inodes, _inode_caveat = render_fields.inode_cell(match, style)
+    #
+    #    The SAME four fields the table's columns carry, named the same way.
+    #    This used to print one composed `space` cell, so the detail view and
+    #    the table disagreed about how to say the one thing both are for, and
+    #    a reader who opened a row saw the figures reshuffled.
+    figure, _caveat = render_fields.used_cell(match, style)
+    out.extend(_field(style, room, "used", figure))
+    out.extend(_field(style, room, "limit", render_fields.limit_cell(match, style)))
+    out.extend(_field(style, room, "free", render_fields.free_cell(match, style)))
+    inodes = render_fields.file_count_cell(match, style)
     if inodes and inodes != render_fields.UNKNOWN:
         out.extend(_field(style, room, "files", inodes))
 

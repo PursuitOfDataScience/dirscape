@@ -177,20 +177,84 @@ def _emit(text):
         pass
 
 
-def read_key(readch=None):
-    # type: (Optional[Callable[[], str]]) -> str
+#: How long to wait for the rest of an escape sequence before concluding the
+#: key was a bare Escape. An arrow's `[` follows its `ESC` in the same read
+#: from the terminal driver, so any real sequence is already buffered and this
+#: never actually elapses; a human cannot press two keys inside it either way.
+ESCAPE_GRACE = 0.05
+
+
+def _readch():
+    # type: () -> str
+    """One byte, straight off the file descriptor.
+
+    **Not `sys.stdin.read(1)`, and the difference is load bearing.** That is a
+    `TextIOWrapper` over a buffered reader, so asking it for one character
+    pulls a whole chunk off the fd into a Python-level buffer. `_pending` then
+    asks the KERNEL whether more input is waiting and is told no, because the
+    rest of the arrow sequence is sitting in the buffer rather than in the
+    terminal. Measured in a pty: a down arrow decoded as `back` followed by
+    `other`, so every arrow press was read as an Escape.
+
+    Reading the fd directly keeps the two in agreement: whatever has not been
+    decoded yet is still where `select` can see it.
+    """
+    try:
+        return os.read(sys.stdin.fileno(), 1).decode("utf-8", "replace")
+    except Exception:  # pragma: no cover - closed or non-readable stdin
+        return ""
+
+
+def _pending(timeout=ESCAPE_GRACE):
+    # type: (float) -> bool
+    """Is there more input already waiting on the terminal?
+
+    The question `read_key` cannot answer with a blocking read, and the whole
+    reason Escape did not work. See the note there.
+
+    Asks about the file DESCRIPTOR, which is only a correct answer because
+    `_readch` also reads the descriptor. Pairing this with a buffered reader
+    is the trap documented above.
+    """
+    try:
+        import select
+
+        ready, _, _ = select.select([sys.stdin.fileno()], [], [], timeout)
+        return bool(ready)
+    except Exception:  # pragma: no cover - no select, or a closed stdin
+        # Assume more is coming, which degrades to the old blocking behaviour
+        # rather than misreading an arrow as an Escape. A stuck Escape is a
+        # worse failure than an arrow that jumps out of the view.
+        return True
+
+
+def read_key(readch=None, pending=None):
+    # type: (Optional[Callable[[], str]], Optional[Callable[[], bool]]) -> str
     """One decoded keypress.
 
     Arrows arrive as three bytes (`ESC [ A`), so a bare Escape is only Escape
     once no bracket follows it. A lone `ESC` read as the first byte of an arrow
     would swallow the next keypress, which is why the sequence is decoded here
     rather than by the caller.
+
+    **And that is why Escape appeared not to work at all.** Deciding what an
+    `ESC` means took a second BLOCKING read, so a bare Escape sat waiting for
+    a byte that was never coming: the view did not move, and the keypress was
+    only consumed when the reader pressed something else, at which point that
+    second key was eaten deciding the first. Owner's report, twice: "esc
+    doesn't work". The earlier fix to this made Escape mean BACK instead of
+    QUIT, which was necessary and did nothing on its own, because the key was
+    never reaching the branch.
+
+    It was also invisible to every test here. A scripted `readch` returning
+    `"\x1bz"` always has a next character, so the decode looked correct; only
+    a real terminal with nothing more to give exposes it. `pending` is
+    injectable for exactly that reason and the test drives it.
     """
     if readch is None:
-
-        def readch():
-            # type: () -> str
-            return sys.stdin.read(1)
+        readch = _readch
+    if pending is None:
+        pending = _pending
 
     char = readch()
     if not char:
@@ -213,6 +277,11 @@ def read_key(readch=None):
         raise KeyboardInterrupt
     if char != "\x1b":
         return Key.OTHER
+
+    # Nothing more waiting means the reader pressed Escape and let go. Asked
+    # BEFORE the read, because the read is the thing that would block.
+    if not pending():
+        return Key.BACK
 
     nxt = readch()
     if nxt != "[":

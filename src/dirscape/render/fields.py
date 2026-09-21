@@ -557,6 +557,116 @@ def inode_cell(root, style=None):
     return _figure_cell(root, root.inode_quota, "files", human_count, style)
 
 
+#: Explicitly uncapped, as opposed to unmeasured. Two different facts and the
+#: package has never allowed them to converge: `?` means nobody measured this
+#: and must never soften into a blank, a zero or a word. A backend that printed
+#: `0` for the limit said "no limit is enforced here", which is knowledge.
+NO_LIMIT = "none"
+
+
+def _governing(root):
+    # type: (Root) -> Tuple[object, str]
+    """The block quota row for this root, and how it was attributed."""
+    row, how, _why = pick_row(getattr(root, "quota", None), root.path, "blocks")
+    return row, how
+
+
+def used_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> Tuple[str, str]
+    """Your usage. ONE token, or the unknown mark.
+
+    **This is the column that used to hold three different shapes**, which is
+    the defect the split fixes. It read `866M / 30G (3%)` on one row, `11T
+    used` on the next and `886G free` on a third, under a heading that claimed
+    all three were the same measurement. The owner, twice: "why is there no /
+    in front of free? ... there is no limit, but why is there also free?" and
+    then "simply saying 11T used but no cap is very confusing. all the entries
+    in space aren't consistent at all."
+
+    Both readings were right, and adding a word to each cell (`used`, `free`)
+    did not fix it, because the shapes still differed. Three facts were being
+    packed into one cell, so they are three columns now: `used`, `limit`,
+    `free`. Every cell in every one of them is a single figure or `?`, which
+    is what makes a numeric column scannable, and `limit` says `none` where
+    there is genuinely no cap rather than leaving the reader to infer it from
+    a missing second number.
+    """
+    style = style or Style()
+    row, how = _governing(root)
+    if row is None:
+        return UNKNOWN, ""
+    text = human_bytes(row.used)
+    caveats = []  # type: List[str]
+    if how == "inferred":
+        # `~` before the figure, so a reader scanning the column sees which
+        # numbers were attributed rather than published.
+        text = "~" + text
+    if row.guessed:
+        caveats.append("the mount for this row was inferred from its name")
+    # Graded on fullness where a fraction exists, which is the one place
+    # colour earns its keep here: a column of figures where the nearly-full
+    # ones are warm is scannable in a way that a column of identical grey is
+    # not. The percentage itself is gone, because `free` answers what it was
+    # for ("how much can I still put here") in the unit the reader acts in.
+    fraction = row.fraction
+    text = style.tint(text, fraction) if fraction is not None else style.muted(text)
+    return text, "; ".join(caveats)
+
+
+def limit_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> str
+    """Your cap: a figure, `none` when uncapped, `?` when unmeasured."""
+    style = style or Style()
+    row, _how = _governing(root)
+    if row is None:
+        return UNKNOWN
+    if row.limit is not None:
+        return style.muted(human_bytes(row.limit))
+    if row.soft == 0 or row.hard == 0:
+        return style.dim(NO_LIMIT)
+    return UNKNOWN
+
+
+def free_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> str
+    """What you can still write here, which is the question the tool is for.
+
+    Two sources, and the choice between them is the whole content of this
+    cell. Under a quota the answer is your own remaining allowance; with no
+    quota it is the filesystem's headroom, shared with everyone on the node.
+    The SMALLER of the two wins where both are known, because a 40T allowance
+    on a filesystem with 2T left is 2T of writes and reporting 40T would be
+    the fabrication this package exists to avoid.
+    """
+    style = style or Style()
+    room = None  # type: Optional[int]
+    row, _how = _governing(root)
+    if row is not None and row.limit is not None and row.used is not None:
+        room = max(0, int(row.limit) - int(row.used))
+    disk = (root.policy or {}).get("free_bytes")
+    if isinstance(disk, int) and disk >= 0:
+        room = disk if room is None else min(room, disk)
+    if room is None:
+        return UNKNOWN
+    return style.muted(human_bytes(room))
+
+
+def file_count_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> str
+    """How many files you hold. The COUNT only, and no limit beside it.
+
+    The heading was `files / limit`, which the owner named directly: "these
+    column names are so ugly". It was also the second cell in the table
+    carrying two numbers in one box, and an inode ceiling is the rarest thing
+    on this screen to be near. `--json` and `why` carry the limit.
+    """
+    style = style or Style()
+    row, _how, _why = pick_row(getattr(root, "inode_quota", None), root.path, "files")
+    if row is None:
+        return UNKNOWN
+    return style.muted(human_count(row.used))
+
+
 def in_doubt_of(root):
     # type: (Root) -> Optional[int]
     """Bytes the backend says are allocated but not yet accounted for."""

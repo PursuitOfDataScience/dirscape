@@ -705,6 +705,87 @@ PATH. That is a different situation from `dsc`, which is still rejected
 because the colliding package ships a `dsc` command. `dirs` also stays
 rejected: it is a bash builtin, so a script of that name never runs.
 
+### Ninth pass: three facts, three columns, and arrows that were decoding as Escape
+
+One cell was carrying three different measurements and the reader had to work
+out which before comparing two rows. The owner, across two rounds: "simply
+saying 11T used but no cap is very confusing. all the entries in space aren't
+consistent at all", then "space has no /? these column names are so ugly".
+
+**`space` and `files / limit` became `used`, `limit`, `free` and `files`.** One
+word per heading, one figure per cell, every figure column right-aligned:
+
+```
+   role       path                       reach     used     limit      free    files
+   home       /home/jdoe42               rwx       867M       30G       29G      37k
+   project    /project/hpc               rwx        11T      none      126T     3.1M
+              /scratch/local/jdoe42      rwx          ?         ?      886G        ?
+```
+
+- **`free` is the column that was missing**, and it is the one the tool is
+  for: how much can I still put here. Under a quota it is the remaining
+  allowance; with no quota it is the filesystem's headroom; where both are
+  known it is the SMALLER, because a 40T allowance on a filesystem with 2T
+  left is 2T of writes. `statvfs` is read for every root now rather than only
+  for roots no backend spoke for, which is what made the column answerable on
+  the six rows that had a usage figure and no cap.
+- **`limit: none` and `limit: ?` stay distinct.** A backend that printed `0`
+  said no quota is enforced, which is knowledge; `?` is the absence of a
+  measurement. Collapsing them is the failure this package exists to avoid and
+  a test now asserts all three states of that cell.
+- **The percentage is gone** along with the bar before it. `free` answers what
+  both were approximating, as a figure in the unit the reader acts in rather
+  than a ratio to multiply back out. Fullness survives as the graded colour on
+  the used figure.
+- **`_align_figures` is deleted.** It right-aligned the parts of a composed
+  cell on the `/` separator, which real columns do for free. It had also
+  carried a silent bug: it compared a cell's trailing word against `"free"`
+  without stripping colour, so every capacity row sat one column short of
+  every quota row and nothing raised.
+- **`why` uses the same four field names**, so opening a row no longer
+  reshuffles the figures it was showing.
+
+**The table fills the window, and this time it is not padding.** Asked for a
+third time, and the two earlier answers failed for a reason upstream of the
+stretching: with four columns there was nothing to spread BETWEEN, so the
+leftover room became one 40 space gap. With seven columns the same room is a
+few characters per gutter. The rule is ordered: spare width buys a real column
+first (`files` returns when it fits), and only what remains is shared out
+evenly, remainder to the rightmost gutters so the wider gaps fall between
+figures rather than between the role and the path.
+
+**Two interactive bugs, and the second was the worse one.**
+
+- **A bare Escape did nothing.** Deciding what an `ESC` byte meant took a
+  second blocking read, so Escape sat waiting for a byte that was never
+  coming: the view did not move, and the key was only consumed when the
+  reader pressed something else, which was then eaten deciding the first.
+  Owner, twice: "esc doesn't work". The previous round's fix (Escape means
+  BACK, resolved against the view's depth) was necessary and did nothing on
+  its own, because the key never reached that branch.
+- **Then every arrow decoded as Escape.** The obvious fix is to ask `select`
+  whether more input is waiting, and paired with `sys.stdin.read(1)` that is
+  wrong: a `TextIOWrapper` pulls a whole chunk off the descriptor into a
+  Python-level buffer, so the kernel is asked about a descriptor whose
+  remaining bytes are sitting in userspace and answers no. Measured in a pty:
+  a down arrow decoded as `back` then `other`. Reading the descriptor
+  directly with `os.read` keeps the two in agreement. Every key is now
+  verified in a real pty: CR, bare Escape, and all four arrows.
+- **The pty test that should have caught the arrows was silently vacuous.** It
+  waits for a column heading before sending keys, and the heading had been
+  renamed twice, so it sent nothing, spun to its 90 second deadline and passed
+  on the first paint alone. It asserts that its own trigger fired now, and the
+  suite went from 100 seconds back to 14.
+
+**The hostname came off the header**, which is now `dirscape · jdoe42`. Owner:
+"this meadow node needs to be shown? for what reason?" The reason is real and
+is not the reader's: mounts are per node, so a SNAPSHOT has to record where it
+was taken or a diff would compare a login node against a compute node.
+`state.same_vantage` already enforces that by refusing to compare across node
+classes, and somebody looking at their own storage on the machine they are
+typing on knows which machine it is. Still in `--json`, `why`, `new` and every
+snapshot record.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

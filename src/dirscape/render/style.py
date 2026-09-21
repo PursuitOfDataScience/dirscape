@@ -546,6 +546,7 @@ def table(
     drop_empty=True,  # type: bool
     gutter="  ",  # type: str
     underline=True,  # type: bool
+    spread=False,  # type: bool
 ):
     # type: (...) -> Tuple[str, List[str]]
     """An aligned table, measured in display columns, fitted by DROPPING.
@@ -568,14 +569,17 @@ def table(
     headings, and a view that rules ABOVE its headings instead turns it off
     rather than getting two rules.
 
-    **There is no option here to stretch the table to the window, and there
-    was.** `spread` widened the gutter before the last column until the box
-    reached the right edge. Tried two ways and both were worse than not
-    reaching it: the slack divided across every gutter put 20 spaces between
-    `role` and `path` at 120 columns, and spent on the last gutter alone it
-    was one 40 space gap at 126. Padding is not use. Spare width buys a real
-    column (see `atlas`, which brings back `files / limit` when it fits) and
-    whatever is left is margin.
+    ``spread`` widens the table to the full window, sharing whatever room is
+    left over EVENLY across the gutters. The owner asked three times for the
+    view to use the whole width, so it does. Two earlier attempts were worse
+    and both were worse for the same reason, which is worth recording so the
+    third is not undone: putting the whole slack in one gutter produced a
+    single 40 space gap at 126 columns, and doing it while the view had only
+    four columns meant there was nothing to spread. Both are fixed by having
+    real columns to spread between: spare width buys a column FIRST (see
+    `atlas`, which restores `files` when it fits) and only what is left after
+    that is shared out, so the gutters grow by a few characters rather than
+    tens.
     """
     style = style or Style()
     window = size if size else style.size
@@ -639,6 +643,28 @@ def table(
         widths[slack.index(max(slack))] -= 1
         guard += 1
 
+    # One gutter string per join position, so the leftover room is shared out
+    # rather than dumped in one place. Equal to `[gutter] * n` unless spread
+    # is on and there is room going spare.
+    gutters = [gutter] * max(0, len(live) - 1)
+    if spread and gutters:
+        room = window - (sum(widths) + width(gutter) * len(gutters) + width(indent))
+        if room > 0:
+            share, extra = divmod(room, len(gutters))
+            for position in range(len(gutters)):
+                # The remainder goes to the RIGHTMOST gutters, so the one or
+                # two wider gaps sit between the figure columns rather than
+                # between the role and the path a reader tracks across.
+                bonus = 1 if position >= len(gutters) - extra else 0
+                gutters[position] = gutter + " " * (share + bonus)
+
+    def join(pieces):
+        # type: (Sequence[str]) -> str
+        out = pieces[0] if pieces else ""
+        for offset in range(1, len(pieces)):
+            out += gutters[offset - 1] + pieces[offset]
+        return out
+
     lines = []
     head_cells = []
     for offset, index in enumerate(live):
@@ -646,7 +672,7 @@ def table(
         if index not in atomic and width(text) > widths[offset]:
             text = truncate(text, widths[offset], style.g.ellipsis)
         head_cells.append(style.column(pad(text, widths[offset], align[index])))
-    lines.append((indent + gutter.join(head_cells)).rstrip())
+    lines.append((indent + join(head_cells)).rstrip())
     if underline:
         lines.append(
             indent + gutter.join(style.dim(style.g.h * widths[i]) for i in range(len(live)))
@@ -658,7 +684,7 @@ def table(
             if index not in atomic and width(text) > widths[offset]:
                 text = truncate(text, widths[offset], style.g.ellipsis)
             out.append(pad(text, widths[offset], align[index]))
-        lines.append((indent + gutter.join(out)).rstrip())
+        lines.append((indent + join(out)).rstrip())
     return "\n".join(lines), dropped
 
 

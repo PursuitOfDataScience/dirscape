@@ -676,29 +676,68 @@ def test_a_repeated_role_is_printed_once():
     assert sum(1 for r in roles if not r) == 2, "two rows inherit their role"
 
 
-def test_figures_align_on_the_separator():
-    """So the column reads as a set of magnitudes a reader can compare."""
-    # All three carry a real limit. An explicit zero limit used to render
-    # `11T / no limit`, which put a separator in the cell and made it a valid
-    # sample here; it renders `11T used` since the owner asked why one row said
-    # `no limit` and another said `free`, so a no-limit row has no separator to
-    # align and belongs in the capacity test below.
+def test_every_figure_column_is_right_aligned_and_one_token_per_cell():
+    """What `_align_figures` used to fake, real columns do for free.
+
+    The figures were composed into ONE cell (`866M / 30G (3%)`) and a helper
+    then right-aligned the parts inside it on the separator, so the column
+    read as a set of magnitudes. It could only ever half work, because the
+    cell had three different shapes depending on what was known: a pair with
+    a percentage, `11T used` where no cap was set, `886G free` where no quota
+    existed at all, and `?`. The owner, having asked twice about it: "simply
+    saying 11T used but no cap is very confusing. all the entries in space
+    aren't consistent at all."
+
+    `used`, `limit` and `free` are separate columns now. `table` right-aligns
+    each, `_align_figures` is deleted, and the property to hold is the one
+    that made the cell unreadable: every cell in a figure column is a SINGLE
+    token, so nothing has to be parsed before two rows can be compared.
+    """
+    import re
+
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
     roots = [
+        # One of each state the figure cell can be in, which is the set that
+        # used to produce four different shapes in one column.
         _measured(_root("/a", "fa"), used=876_543_210, limit=32_212_254_720),
-        _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=99_000_000_000_000),
+        _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=0),
         _measured(_root("/c", "fc"), used=950_272, limit=1_073_741_824),
     ]
+    bare = _root("/d", "fd")
+    bare.reach = Reach.LISTABLE
+    bare.writable = confirmed()
+    bare.policy = {"free_bytes": 951_000_000_000}
+    roots.append(bare)
     for root in roots:
         root.role = "project"
 
-    # The heading carries "space", so rows are taken by their path. The
-    # comparison is case-sensitive and the heading went lower case, which made
-    # this filter stop excluding it: with the heading in the sample the
-    # separator offsets were two and the test was measuring the wrong thing.
-    lines = [ln for ln in _content(_render_default(roots)) if " / " in ln and "space" not in ln]
-    assert len(lines) == 3
-    offsets = {ln.index(" / ") for ln in lines}
-    assert len(offsets) == 1, "every separator must sit in one column: %s" % (offsets,)
+    lines = _content(atlas.render(roots, style=style, group=True, size=100))
+    heading = next(ln for ln in lines if "used" in ln and "limit" in ln)
+    body = [ln for ln in lines if re.search(r"/[abcd]\b", ln)]
+    assert len(body) == 4
+
+    for column in ("used", "limit", "free"):
+        at = heading.index(column) + len(column)
+        for line in body:
+            cell = line[:at]
+            assert cell.endswith(tuple("0123456789BKMGTP?e")), (
+                "%r does not end at the %r column's right edge: %r" % (cell[-12:], column, line)
+            )
+
+    # One token per cell: no figure cell pairs two numbers, which is what
+    # `11T used`, `886G free` and `866M / 30G (3%)` each did.
+    figures_at = heading.index("used")
+    for line in body:
+        assert " / " not in line[figures_at:], "a figure cell is pairing two numbers again"
+        assert "%" not in line, "the percentage was folded into free"
+
+    # And the heading is one word per column. `_content` strips the frame, so
+    # line widths vary here by design; the uniform-width guarantee belongs to
+    # the framed block and is asserted where the frame is drawn.
+    for word in heading.split():
+        assert "/" not in word, "%r is a compound heading again" % (word,)
 
 
 def test_a_column_with_one_value_everywhere_is_dropped():
@@ -759,44 +798,18 @@ def test_the_summary_lines_count_the_unfiltered_roots():
     assert "11G" in text, "the stranded total must be summed and shown"
 
 
-def test_a_capacity_figure_aligns_with_the_quota_figures():
-    """The comparison that failed was `word == "free"` on a DIMMED cell.
-
-    The cell is `\\x1b[38;5;248m886G free\\x1b[0m`, so the last token is
-    `free\\x1b[0m` and the equality test silently missed, which is why the
-    capacity rows were never aligned at all: `886G free` sat four columns in
-    while every quota figure sat five. Nothing raised; they were just wrong.
-    """
-    import re
-
-    from dirscape.render import atlas, resolve_style
-
-    style = resolve_style(color="always", ascii_only=False, stream=None)
-
-    quota = _measured(_root("/a", "fa"), used=950_272, limit=0)
-    quota.role = "project"
-    bare = _root("/b", "fb")
-    bare.role = "project"
-    bare.reach = Reach.LISTABLE
-    bare.writable = confirmed()
-    bare.policy = {"free_bytes": 951_000_000_000}
-
-    text = atlas.render([quota, bare], style=style, group=True)
-
-    plain = [re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", ln) for ln in text.splitlines()]
-    rows = [ln for ln in plain if "/a" in ln or "/b" in ln]
-    assert len(rows) == 2
-
-    # Both figures must END at the same column of the line. Anchored on the
-    # figure itself rather than on a neighbouring column, because a column
-    # whose value is identical on every row is dropped and an anchor there
-    # disappears with it.
-    edges = set()
-    for line in rows:
-        match = re.search(r"(\d[\d.]*[KMGTPB]?)(?= / | free| used)", line)
-        assert match, "no figure found in %r" % (line,)
-        edges.add(match.end())
-    assert len(edges) == 1, "figures end at columns %s" % (sorted(edges),)
+# `test_a_capacity_figure_aligns_with_the_quota_figures` lived here. It guarded
+# a bug in `_align_figures`, which right-aligned the parts of one composed
+# `used / limit` cell and compared the trailing word against "free" WITHOUT
+# stripping the cell's colour, so `free\x1b[0m` never matched and every
+# capacity row sat one column short of every quota row. Nothing raised; the
+# numbers were just misaligned.
+#
+# Both the helper and the composed cell are gone. `used`, `limit` and `free`
+# are real columns that `table` right-aligns, so there is no trailing word to
+# compare and no second code path for a capacity figure to fall down.
+# `test_every_figure_column_is_right_aligned_and_one_token_per_cell` asserts
+# the property that replaced it, on all four states the figure cell can be in.
 
 
 def test_the_selected_row_is_one_flat_band_with_no_colour_in_it():
@@ -851,14 +864,20 @@ def test_the_selected_row_is_one_flat_band_with_no_colour_in_it():
     assert len(widths) == 1, "the band is %s columns wide on different rows" % (sorted(widths),)
 
 
-def test_the_table_draws_no_bar_and_keeps_the_percentage():
+def test_the_table_draws_no_bar_and_no_percentage_either():
     """Eight cells of blocks for a lossy copy of the number beside them.
 
     "why do we need this bar here? ... if you can't [fix it], just get rid of
     it." It was also blank on five of the ten rows of the live view, since an
     unlimited quota has no fraction and a capacity fallback has no quota, so
     the one thing a meter column is for, being scanned down, it could not do.
-    The graded colour on the percentage carries fullness now.
+
+    **The percentage that replaced it has since gone the same way.** It was
+    one of the three shapes crowded into a single `space` cell, and `free`
+    answers what it was for ("how much can I still put here") as a figure in
+    the unit the reader acts in rather than as a ratio they have to multiply
+    back out. Fullness survives as the graded COLOUR on the used figure, which
+    is what the bar and the percentage were both approximating.
     """
     from dirscape.render import atlas, resolve_style
 
@@ -869,8 +888,9 @@ def test_the_table_draws_no_bar_and_keeps_the_percentage():
 
     for glyph in "▏▎▍▌▋▊▉█░":
         assert glyph not in text, "the bar is gone, and %r is one of its cells" % (glyph,)
-    assert "3%" in text, "the percentage is what replaced it"
-    # And the colour is on the percentage, which is the whole substitution.
+    assert "%" not in text, "the percentage went with it: free is the answer now"
+    assert "29G" in text, "and free is a real figure, not a ratio"
+    # The grading survives, on the used figure.
     assert "\033[38;" in text
 
 
@@ -959,24 +979,31 @@ def test_a_title_that_wraps_does_not_break_the_frame_open():
     style = resolve_style(color="never", ascii_only=False, stream=None)
     roots = [_measured(_root("/home/me", "fs-home"))]
     roots[0].role = "home"
-    # The wrap is forced with a long user and host rather than with the node
-    # class and device count, which used to be on this line and were removed:
-    # the owner read them and asked what they meant. The GUARANTEE this test
-    # exists for is unchanged and still bites, because a long login name or a
-    # long hostname wraps the title exactly the same way.
-    meta = {
-        "host": "an-unusually-long-hostname-for-a-login-node",
-        "user": "a-rather-long-login-name",
-    }
+    # The wrap is forced with a long USER, which is all that is left on the
+    # line. The node class, the device count, the baseline age and finally the
+    # hostname have each come off in turn, every one of them because the owner
+    # read it and asked what it was for. The GUARANTEE this test exists for is
+    # unchanged and still bites: a login name long enough to wrap does to the
+    # frame exactly what a long hostname used to.
+    # Long enough to wrap off the title line (13 + 44 > 56), short enough to
+    # fit whole on a line of its own, so the assertion below is about WRAPPING
+    # and not about truncation.
+    meta = {"user": "a-rather-long-login-name-for-just-one-person"}
     lines = atlas.render(roots, meta=meta, style=style, group=True, size=60).splitlines()
 
     assert lines[1].count("dirscape") == 1
     for line in lines[1:-1]:
         assert line.startswith("│") and line.endswith("│"), "the frame opened: %r" % (line,)
     assert len({len(line) for line in lines}) == 1
+    assert "an-unusually-long" not in " ".join(lines), (
+        "the hostname is off the default header: the owner asked what the node was for"
+    )
     # And the title really did need two lines, or this proves nothing.
-    assert any("an-unusually-long-hostname" in line for line in lines[1:4])
-    assert "an-unusually-long-hostname" not in lines[1]
+    # The tail of the wrapped title is on a line of its own, INSIDE the box.
+    assert any("just-one-person" in line for line in lines[1:4]), (
+        "the wrapped remainder vanished instead of taking a second line"
+    )
+    assert "just-one-person" not in lines[1], "it must not still be on the first line"
 
 
 def test_a_path_too_wide_for_a_frame_is_printed_whole_and_unframed():
@@ -1011,10 +1038,14 @@ def test_the_drop_order_is_the_documented_one():
     assert names == [
         [],
         ["policy"],
-        ["policy", "files / limit"],
-        ["policy", "files / limit", "role"],
-        ["policy", "files / limit", "role", "reach"],
-        ["policy", "files / limit", "role", "reach", "where"],
+        ["policy", "files"],
+        ["policy", "files", "role"],
+        ["policy", "files", "role", "reach"],
+        ["policy", "files", "role", "reach", "where"],
+        # LIMIT before FREE: "how much can I still put here" is the question
+        # that brought the reader, and a cap they have to subtract from is
+        # context. The narrowest table is path, used and free.
+        ["policy", "files", "role", "reach", "where", "limit"],
     ]
     for earlier, later in zip(atlas.DROP_STAGES, atlas.DROP_STAGES[1:]):
         assert set(earlier) < set(later), "a stage may only add to the one before it"
@@ -1040,26 +1071,30 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
     """
     from dirscape.render.atlas import (
         _FILES,
+        _FREE,
+        _LIMIT,
         _PATH,
         _POLICY,
         _REACH,
         _ROLE,
         _USED,
         _WHERE,
+        COLUMNS,
         _plan,
     )
 
     live = [
-        ("home", "/home/jdoe42", "857M / 30G (3%)  "),
-        ("project", "/project/hpc", " 11T / no limit  "),
-        ("scratch", "/scratch/collie3/jdoe42", "  0B / 400G (0%) "),
-        ("scratch", "/scratch/meadow3/jdoe42", " 22G / 100G (22%)"),
-        ("software", "/software", "314G / no limit  "),
+        ("home", "/home/jdoe42", "857M", "30G", "29G"),
+        ("project", "/project/hpc", "11T", "none", "126T"),
+        ("scratch", "/scratch/collie3/jdoe42", "0B", "400G", "400G"),
+        ("scratch", "/scratch/meadow3/jdoe42", "22G", "100G", "78G"),
+        ("software", "/software", "314G", "none", "1.5P"),
     ]
     rows = []
-    for role, path, used in live:
-        row = [""] * 7
+    for role, path, used, limit, free in live:
+        row = [""] * len(COLUMNS)
         row[_ROLE], row[_PATH], row[_USED] = role, path, used
+        row[_LIMIT], row[_FREE] = limit, free
         row[_REACH] = "rwx"
         # Constant on every row, which is exactly why they get removed, and
         # exactly why their widths must not be charged for: WHERE reads `here`
@@ -1081,29 +1116,29 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
 
     columns, stacked = _plan(rows, 76, skip=empty)
     assert not stacked
-    assert _ROLE in columns, "role fits at 80 columns and must not be dropped for blanks"
+    assert _ROLE in columns, "role fits once the blanks are not charged for"
     assert _PATH in columns and _USED in columns and _REACH in columns
 
 
-def test_spare_width_buys_a_column_and_never_a_gutter():
-    """Padding is not use, and this is the test that says so.
+def test_spare_width_buys_a_column_first_and_then_fills_the_window():
+    """Both halves of the width policy, and it took three tries to get here.
 
-    The first attempt at "take the whole width" made `table` stretch the
-    gutter before the last column until the box reached the window. At a 126
-    column terminal that was a single 40 space gap between `reach` and
-    `space`, and the owner's verdict was immediate: "a lot of space is
-    available and unoccupied, why is there still ..." and then "the space
-    should be utilized well. but now it's terrible". They were right. A reader
-    cannot track a row across a gulf, and the box reaching the edge bought
-    nothing.
+    The owner asked for the view to use the whole horizontal space, and the
+    first two answers were bad in the same way. Stretching one gutter gave a
+    single 40 space gap at 126 columns; stretching them all gave 20 spaces
+    between `role` and `path`. Both were padding, and the owner's verdict was
+    "the space should be utilized well. but now it's terrible."
 
-    Spare width goes to a real column instead. `files / limit` has data on
-    every row of a live run and was being suppressed unconditionally as
-    detail, so it is the column the room buys.
+    The reason both failed was upstream of the stretching: the view had four
+    columns because the figures were crowded into one cell and the file count
+    was suppressed outright, so there was nothing to spread BETWEEN. With
+    seven columns the same leftover room is a few characters per gutter.
 
-    Both halves are asserted, because either alone is satisfiable by doing
-    nothing: the column has to APPEAR when there is room and GO when there is
-    not, and no row may contain a gulf at any width.
+    So the policy is ordered, and both halves are asserted, because either
+    alone is satisfiable by doing nothing:
+
+    1. spare width buys a real column, so `files` appears when it fits;
+    2. what is left over fills the window, so the frame reaches the edge.
     """
     from dirscape.render import atlas, resolve_style
     from dirscape.render.style import width as measure
@@ -1121,12 +1156,17 @@ def test_spare_width_buys_a_column_and_never_a_gutter():
             ("/software", "software"),
         )
     ):
+        # Limits and inode limits vary too. A column identical on every row is
+        # dropped as a caption, and a fixture that repeats one is measuring
+        # the constant-column rule rather than the width rule: with one shared
+        # limit, `limit` vanished and `files` fitted at 72 columns, which made
+        # this test fail for a reason that had nothing to do with it.
         root = _measured(
             _root(path, "fs" + role),
             used=876_543_210 * (offset + 1),
-            limit=32_212_254_720,
+            limit=32_212_254_720 * (offset + 1),
             inodes=37_000 * (offset + 1),
-            inode_limit=300_000,
+            inode_limit=300_000 * (offset + 1),
         )
         root.role = role
         roots.append(root)
@@ -1135,22 +1175,14 @@ def test_spare_width_buys_a_column_and_never_a_gutter():
     wide = atlas.render(roots, style=style, group=True, size=110)
 
     assert "files" not in narrow, "at 72 columns the file count is the first thing to go"
-    assert "files" in wide, "at 110 columns the room must buy a column, not whitespace"
+    assert "files" in wide, "at 110 columns the room must buy a column before whitespace"
 
-    # And the box is sized to what it holds, never stretched to the window.
-    # This is the half that forbids the gulf: a frame that has to reach the
-    # right edge can only get there by padding once every column that has
-    # data is already on screen.
     for window, text in ((72, narrow), (110, wide)):
-        lines = text.splitlines()
-        edge = measure(lines[0])
-        content = max(measure(ln) for ln in lines[1:-1])
-        assert edge == content, "the frame is %d wide around %d of content at window %d" % (
-            edge,
-            content,
+        widths = {measure(line) for line in text.splitlines()}
+        assert widths == {window}, "at %d columns the block is %s wide" % (
             window,
+            sorted(widths),
         )
-        assert edge <= window, "the frame overflowed the window"
 
 
 def test_the_interactive_frame_does_not_truncate_the_last_column():
@@ -1238,43 +1270,45 @@ def test_the_interactive_frame_does_not_truncate_the_last_column():
         cli.render_atlas = real
 
 
-def test_a_no_limit_figure_says_used_rather_than_pairing_with_a_limit():
-    """`11T / no limit` next to `886G free` was one column, two measurements.
+def test_an_uncapped_quota_says_none_and_never_a_missing_number():
+    """Three facts, three columns, and `none` is not `?`.
 
-    The owner read the two side by side and asked "why is there no / in front
-    of free? what does free mean here? there is no limit, but why is there
-    also free?" The `/` promised two numbers where there was one, and the
-    shared `used / quota` heading claimed both rows measured the same thing.
+    This replaces two earlier attempts at the same complaint. The cell first
+    read `11T / no limit`, then `11T used`, and the owner's answer to the
+    second was "simply saying 11T used but no cap is very confusing". Both
+    tried to say two things in one box.
 
-    Three shapes now, each naming itself, under a heading true of all three:
-
-        876M / 30G (3%)   your usage against your quota
-        11T used          your usage, with no quota set
-        886G free         the filesystem's headroom, shared
+    Split, the only remaining question is what the `limit` cell says when
+    there is no cap, and the answer must not be a blank or `?`: a backend that
+    printed `0` told us no limit is enforced, which is KNOWLEDGE, and `?`
+    means nobody measured it. The package has never let those two converge.
     """
     from dirscape.render import atlas, resolve_style
 
     style = resolve_style(color="never", ascii_only=False, stream=None)
 
-    quota = _measured(_root("/a", "fa"), used=876_543_210, limit=32_212_254_720)
-    unlimited = _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=0)
-    capacity = _root("/c", "fc")
-    capacity.reach = Reach.LISTABLE
-    capacity.writable = confirmed()
-    capacity.policy = {"free_bytes": 951_000_000_000}
-    for root in (quota, unlimited, capacity):
+    capped = _measured(_root("/a", "fa"), used=876_543_210, limit=32_212_254_720)
+    uncapped = _measured(_root("/b", "fb"), used=11_000_000_000_000, limit=0)
+    unmeasured = _root("/c", "fc")
+    unmeasured.reach = Reach.LISTABLE
+    unmeasured.writable = confirmed()
+    for root in (capped, uncapped, unmeasured):
         root.role = "project"
 
-    text = atlas.render([quota, unlimited, capacity], style=style, group=True, size=100)
+    lines = _content(
+        atlas.render([capped, uncapped, unmeasured], style=style, group=True, size=100)
+    )
+    heading = next(ln for ln in lines if "limit" in ln)
+    at = heading.index("limit") + len("limit")
 
-    assert "space" in text, "one heading, true of all three shapes"
-    assert "no limit" not in text, "the words that prompted the question are gone"
-    row = next(ln for ln in text.splitlines() if "/b" in ln)
-    assert "used" in row and " / " not in row, "a no-limit row has one number: %r" % (row,)
-    free = next(ln for ln in text.splitlines() if "/c" in ln)
-    assert "free" in free and " / " not in free, "a capacity row has one number: %r" % (free,)
-    both = next(ln for ln in text.splitlines() if "/a" in ln)
-    assert " / " in both, "a real quota still pairs used with its limit: %r" % (both,)
+    def cell(path):
+        line = next(ln for ln in lines if path in ln)
+        return line[:at].split()[-1]
+
+    assert cell("/a") == "30G", "a real cap is the figure"
+    assert cell("/b") == "none", "an explicit zero means no limit is enforced"
+    assert cell("/c") == "?", "and nobody measuring it is a different fact"
+    assert "no limit" not in " ".join(lines), "the two-word form prompted the question"
 
 
 def test_the_detail_view_is_fields_and_not_paragraphs():
@@ -2042,7 +2076,13 @@ def test_an_unmeasured_figure_is_not_explained_as_a_measured_one():
     text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
     flat = " ".join(text.split())
 
-    assert "space     ?" in text, "an unmeasured figure is the unknown mark: %r" % (text,)
+    # All three figure fields, because the split gave the mark three places to
+    # soften into a blank instead of one.
+    for field in ("used", "limit", "free"):
+        assert "%-9s ?" % (field,) in text, "an unmeasured %s is the unknown mark: %r" % (
+            field,
+            text,
+        )
     assert "quota none measured" in flat
     assert "counted by the filesystem itself" not in flat
 

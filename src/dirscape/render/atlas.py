@@ -58,17 +58,29 @@ __all__ = ["render", "COLUMNS", "DROP_STAGES", "KEEP_COLUMNS"]
 #: figures are the content; `nodetop` sets its grids in lower case for the same
 #: reason and the owner named it as the reference. The `/` pairs stay, because
 #: `used / quota` is one statement and the heading has to say so.
+#: Column headings, in order. **One word each, and one figure per cell.**
+#:
+#: `space` and `files / limit` were the last two headings carrying more than
+#: one measurement, and the owner named both: "simply saying 11T used but no
+#: cap is very confusing. all the entries in space aren't consistent at all",
+#: then "space has no /? these column names are so ugly". A column of
+#: `866M / 30G (3%)`, `11T used`, `886G free` and `?` cannot be scanned,
+#: because the reader has to parse each cell's shape before comparing its
+#: number. Splitting them costs two columns of width and buys a table where
+#: every numeric cell is one token and every heading is one word.
 COLUMNS = (
     "role",
     "path",
     "where",
     "reach",
-    "space",
-    "files / limit",
+    "used",
+    "limit",
+    "free",
+    "files",
     "policy",
 )
 
-_ROLE, _PATH, _WHERE, _REACH, _USED, _FILES, _POLICY = range(7)
+_ROLE, _PATH, _WHERE, _REACH, _USED, _LIMIT, _FREE, _FILES, _POLICY = range(9)
 
 #: Never dropped. The path identifies the row and WHERE carries the answer this
 #: tool is for.
@@ -87,12 +99,16 @@ DROP_STAGES = (
     (_POLICY, _FILES),
     (_POLICY, _FILES, _ROLE),
     (_POLICY, _FILES, _ROLE, _REACH),
-    # WHERE goes before USED, and that ordering is the point. The last stage
-    # used to drop USED, so at 40 columns the table degraded to a bare list of
-    # paths with no number anywhere on it, which is not a smaller version of
-    # this tool's answer but the absence of one. WHERE is context and reads
-    # `here` on nearly every row anyway; USED is the answer.
+    # WHERE goes before any figure, and that ordering is the point. An earlier
+    # version's last stage dropped USED, so at 40 columns the table degraded to
+    # a bare list of paths with no number anywhere on it, which is not a
+    # smaller version of this tool's answer but the absence of one. WHERE is
+    # context and reads `here` on nearly every row anyway.
     (_POLICY, _FILES, _ROLE, _REACH, _WHERE),
+    # LIMIT before FREE, because FREE is the actionable half. "How much can I
+    # still put here" is the question that brought the reader, and a cap they
+    # cannot act on without subtracting is context.
+    (_POLICY, _FILES, _ROLE, _REACH, _WHERE, _LIMIT),
 )
 
 #: What the table is indented by, inside the frame, and the run of spaces
@@ -106,12 +122,15 @@ DROP_STAGES = (
 _INDENT = "   "
 _GUTTER = "    "
 
-_ALIGNS = ("left", "left", "left", "left", "left", "right", "left")
+#: Every figure column is right-aligned, which is what `_align_figures` used
+#: to fake inside one composed cell and what real columns do for free.
+_ALIGNS = ("left", "left", "left", "left", "right", "right", "right", "right", "left")
 
-#: Neither figure column may be squeezed. Six columns of `1744/2000G` is
-#: `1744/...`, a fraction with its denominator eaten, which is not a smaller
-#: version of the fact but a different and false one.
-_ATOMIC = (_PATH, _USED, _FILES)
+#: No figure column may be squeezed. `314G` truncated to `31...` is not a
+#: smaller version of the fact but a different and false one, and every cell
+#: in these columns is short enough that squeezing one would never be the
+#: difference between fitting and not.
+_ATOMIC = (_PATH, _USED, _LIMIT, _FREE, _FILES)
 
 _NOTE_LIMIT = 4
 
@@ -166,19 +185,19 @@ def _path_cell(root, style=None):
 
 def _row(root, style, site):
     # type: (Root, Style, object) -> Tuple[List[str], str]
-    used, caveat = fields.quota_cell(root, style)
-    files, inode_caveat = fields.inode_cell(root, style)
+    used, caveat = fields.used_cell(root, style)
     cells = [
         fields.role_cell(root, style),
         _path_cell(root, style),
         fields.where_cell(root, style),
         fields.reach_cell(root, style),
         used,
-        files,
+        fields.limit_cell(root, style),
+        fields.free_cell(root, style),
+        fields.file_count_cell(root, style),
         fields.policy_cell(root, site),
     ]
-    both = "; ".join(c for c in (caveat, inode_caveat) if c)
-    return cells, both
+    return cells, caveat
 
 
 _ANSI = re.compile("\033\\[[0-9;?]*[A-Za-z]")
@@ -190,88 +209,6 @@ def _strip(text):
     return _ANSI.sub("", text).strip()
 
 
-def _align_figures(blocks, index):
-    # type: (Sequence[List[str]], int) -> None
-    """Right-align the used and limit figures inside an already-built cell.
-
-    `used / quota` is composed per row as one string, so the numbers land
-    wherever their own width puts them and a reader cannot compare down the
-    column:
-
-        836M / 30G    3%
-        11T / no limit
-        928K / no limit
-        22G / 100G   22%
-
-    Aligning on the separator makes the same four rows read as a column of
-    magnitudes, which is the entire reason to put numbers in a table:
-
-         836M / 30G          3%
-          11T / no limit
-         928K / no limit
-          22G / 100G        22%
-
-    Done here rather than by splitting the cell into two real columns, because
-    the figure, its limit and its percentage are one statement and `_ATOMIC`
-    already treats them as one unit for fitting. Widths are measured with
-    `width`, not `len`, since the cells carry colour.
-    """
-    parts = []  # type: List[Optional[Tuple[str, str, str]]]
-    # The third element is the limit token for a quota figure and the trailing
-    # word for a capacity fallback; the middle element says which.
-    for block in blocks:
-        for row in block:
-            cell = row[index]
-            head, sep, tail = cell.partition(" / ")
-            if sep:
-                parts.append((head, sep, tail))
-                continue
-            # Two cells read as one number plus one word and have no
-            # separator, so the split above skips them and the number sits
-            # hard against the column edge while every quota figure is
-            # right-aligned: `886G free` (the filesystem's headroom) and
-            # `11T used` (usage with no quota set). Both are treated as a
-            # figure with an empty limit so they join the same column.
-            bare, space, word = cell.rpartition(" ")
-            # Compared with the escapes stripped. The cell is dimmed, so the
-            # last token is `free\x1b[0m` and an equality test against "free"
-            # silently failed, which is why the capacity rows were never
-            # aligned at all: `886G free` sat four columns in while every
-            # quota figure sat five.
-            if space and _strip(word) in ("free", "used"):
-                parts.append((bare, "", word))
-                continue
-            parts.append(None)
-
-    lead = max([measure(p[0]) for p in parts if p] or [0])
-    # The limit is padded to the widest limit TOKEN, not the widest tail: the
-    # tail includes the bar and the percentage, and padding to that would push
-    # short rows into a gulf of whitespace.
-    limits = []  # type: List[int]
-    for p in parts:
-        if p:
-            limits.append(measure(p[2].split("  ")[0]))
-    room = max(limits or [0])
-
-    cursor = 0
-    for block in blocks:
-        for row in block:
-            p = parts[cursor]
-            cursor += 1
-            if not p:
-                continue
-            head, sep, tail = p
-            pad = " " * max(0, lead - measure(head))
-            if not sep:
-                # The capacity fallback: aligned on the number, and the word
-                # follows it rather than a limit.
-                row[index] = "%s%s %s" % (pad, head, tail)
-                continue
-            token, gap, rest = tail.partition("  ")
-            padded = token + " " * max(0, room - measure(token))
-            row[index] = "%s%s / %s%s%s" % (pad, head, padded, gap, rest)
-
-
 def _constant_columns(rows):
     # type: (Sequence[Sequence[str]]) -> set
     """Column indexes whose value never varies, excluding the ones that must stay.
@@ -281,7 +218,7 @@ def _constant_columns(rows):
     """
     if len(rows) < 2:
         return set()
-    keep = {_PATH, _USED}
+    keep = set(KEEP_COLUMNS)
     out = set()
     for index in range(len(COLUMNS)):
         if index in keep:
@@ -358,12 +295,10 @@ def _header(roots, meta, style, size=None):
         # That is the tool's own vocabulary for an unanswered question, and on
         # screen the answer to an unanswered question is the mark.
         node = fields.UNKNOWN
-    host = fields.safe(meta.host, limit=64) or fields.UNKNOWN
     user = fields.safe(meta.user, limit=64) or fields.UNKNOWN
     items = [
         style.head(fields.safe(meta.tool, limit=32) or "dirscape"),
         style.accent(user),
-        style.accent(host.split(".")[0]),
     ]
     # The node class, the device count and the baseline age all came off.
     # The owner read the finished line and asked what it meant, which is the
@@ -378,6 +313,19 @@ def _header(roots, meta, style, size=None):
     #   `baseline 47m` is `dirscape new`'s business and that view prints it
     #                  properly. On a table of current usage it is a date
     #                  attached to nothing on screen.
+    #   `meadow3-0200` went the same way, one round later, to the same
+    #                  question: "this meadow node needs to be shown? for what
+    #                  reason?" The reason it was there is real but it is not
+    #                  the reader's: mounts are per node, so a snapshot has to
+    #                  record where it was taken or a diff would compare a
+    #                  login node's storage against a compute node's. That is
+    #                  the DIFF's problem, and `state.same_vantage` already
+    #                  solves it by refusing to compare across node classes.
+    #                  A reader looking at their own storage on the machine
+    #                  they are typing on already knows which machine that is.
+    #                  It is still in `--json`, in `why`, in `new`, and in
+    #                  every snapshot record, which are the places it is load
+    #                  bearing.
     #
     # What is left is the scope of every row underneath: which tool, whose
     # quota, which machine. `node` is still computed above because `--summary`
@@ -631,7 +579,11 @@ def render(
     constant = _constant_columns(rows)
 
     if group:
-        _align_figures((rows,), _USED)
+        # `_align_figures` used to run here, right-aligning the used figure,
+        # its limit and its percentage INSIDE one composed cell so the column
+        # read as a set of magnitudes. Those are three real columns now and
+        # `table` right-aligns each of them, so the whole mechanism is gone
+        # along with the cell that needed it.
         # The role is printed once per run of rows that share it. Nine rows
         # reading `project`, `project`, `project` is the table stuttering: the
         # word carries information the first time and is visual noise after
@@ -687,7 +639,15 @@ def render(
             # The path alone on its line, never cut. Everything else follows
             # indented, so the two read as one entry.
             out.append(style.head(row[_PATH]))
-            facts = [row[i] for i in (_WHERE, _REACH, _USED) if row[i]]
+            # Every figure column, because the stacked layout is what a
+            # reader gets when their paths are too long for a table and it
+            # must not answer less. It used to list WHERE, REACH and USED, and
+            # when the figures were split into three columns the free figure
+            # stopped appearing at all: a quotaless site rendered `?` for
+            # every root while `statvfs` had the answer.
+            facts = [
+                row[i] for i in (_WHERE, _REACH, _USED, _LIMIT, _FREE) if row[i] and row[i] != "?"
+            ] or [row[_USED]]
             out.append(_INDENT + "  ".join(facts))
         out.append("")
         out.extend(
@@ -708,6 +668,12 @@ def render(
         drop_empty=False,
         indent=_INDENT,
         gutter=_GUTTER,
+        # The view uses the whole window. Asked for three times, and it only
+        # became a good idea once the figures were split into real columns:
+        # there are seven of them to share the leftover room between now, so
+        # each gutter grows by a few characters instead of one opening into a
+        # 40 space gap.
+        spread=True,
         # Ruled ABOVE the headings instead, spanning the panel. A dashed
         # segment under each heading draws the eye across the table's own
         # width and then stops, which reads as a second, shorter frame inside

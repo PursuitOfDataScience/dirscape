@@ -383,7 +383,13 @@ def test_a_real_pty_paints_moves_and_exits():
             if not chunk:
                 break
             out += chunk
-            if not sent and b"space" in out:
+            # Waits for a HEADING that is still there. This trigger has been
+            # stale twice now, once as `used / quota` and once as `space`, and
+            # a stale trigger here does not fail: the keys are never sent and
+            # the loop spins to its 90 second deadline while the assertions
+            # below pass on the first paint alone. `limit` is asserted to be
+            # present at the end of the test for exactly that reason.
+            if not sent and b"limit" in out:
                 time.sleep(0.4)
                 os.write(fd, b"\x1b[B\x1b[B")  # down, down
                 time.sleep(0.4)
@@ -398,8 +404,13 @@ def test_a_real_pty_paints_moves_and_exits():
         with contextlib.suppress(OSError):
             os.waitpid(pid, os.WNOHANG)
 
-    if "space" not in text:
+    if "limit" not in text:
         pytest.skip("no storage discoverable here, so there is nothing to browse")
+
+    # **The trigger fired.** Without this the test is silently vacuous when
+    # the heading it waits for is renamed: it sends no keys, spins for 90
+    # seconds and then passes on the first paint. That happened twice.
+    assert sent, "the keypresses were never sent, so nothing below was exercised"
 
     assert "\033[7m" in text, "no row was highlighted"
     assert "\033[?25l" in text, "the cursor was never hidden"

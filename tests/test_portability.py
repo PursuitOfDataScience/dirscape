@@ -12,6 +12,7 @@ turns that into a test failure instead of a silent wrong answer.
 """
 
 import os
+import re
 
 import pytest
 
@@ -110,9 +111,14 @@ def test_the_whole_pipeline_renders_on_a_quotaless_site(tmp_path):
     text = render_atlas(shown, group=True, all_roots=run.roots)
 
     assert text.strip(), "a quotaless site still gets a table"
-    # `statvfs` answers where no quota exists, so the figure column is not all
-    # question marks.
-    assert "free" in text, "statvfs should supply free space: %r" % (text,)
+    # `statvfs` answers where no quota exists, so the figures are not all
+    # question marks. Asserted on a FIGURE rather than on the word "free",
+    # which used to be part of the cell (`886G free`) and is now a column
+    # heading: these fixture paths are long enough to fall back to the
+    # stacked layout, and that layout has no headings.
+    assert re.search(r"\d[\d.]*[KMGTP]?B?\b", text), "statvfs should supply free space: %r" % (
+        text,
+    )
 
 
 # --------------------------------------------------------------------------

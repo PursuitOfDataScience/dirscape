@@ -11,22 +11,22 @@ you that list, and `du` cannot find it because `du` needs the path you are missi
 ```
 $ ds
 
-╭───────────────────────────────────────────────────────────────────────────────────────╮
-│ dirscape  ·  jdoe42  ·  meadow3-0200                                                  │
-│                                                                                       │
-│ ───────────────────────────────────────────────────────────────────────────────────── │
-│    role        path                       reach    space                files / limit │
-│    home        /home/jdoe42               rwx      866M / 30G (3%)         37k / 300k │
-│    project     /project/hpc               rwx       11T used                3.1M used │
-│                /project2/hpc              rwx      928K used                  66 used │
-│    scratch     /scratch/collie3/jdoe42    rwx        0B / 400G (0%)          7 / 5.1M │
-│                /scratch/local/jdoe42      rwx      886G free                        ? │
-│                /scratch/meadow2/jdoe42    rwx       25T free                        ? │
-│                /scratch/meadow3/jdoe42    rwx       22G / 100G (22%)       3.7k / 10M │
-│    dataset     /project2/reference        r-x       23T used                 33k used │
-│    software    /software                  rwx      314G used                2.6M used │
-│    local       /tmp                       rwx      886G free                        ? │
-╰───────────────────────────────────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ dirscape  ·  jdoe42                                                                                                        │
+│                                                                                                                            │
+│ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│    role              path                              reach           used           limit           free           files │
+│    home              /home/jdoe42                      rwx             867M             30G            29G             37k │
+│    project           /project/hpc                      rwx              11T            none           126T            3.1M │
+│                      /project2/hpc                     rwx             928K            none           766T              66 │
+│    scratch           /scratch/collie3/jdoe42           rwx               0B            400G           400G               7 │
+│                      /scratch/local/jdoe42             rwx                ?               ?           886G               ? │
+│                      /scratch/meadow2/jdoe42           rwx                ?               ?            25T               ? │
+│                      /scratch/meadow3/jdoe42           rwx              22G            100G            78G            3.7k │
+│    dataset           /project2/reference               r-x              23T            none           766T             33k │
+│    software          /software                         rwx             314G            none           1.5P            2.6M │
+│    local             /tmp                              rwx                ?               ?           886G               ? │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 One box, one row per place you can put data, and nothing else. **In a terminal it is
@@ -65,7 +65,8 @@ ds                            # no flags, no config, no setup
 | :- | :- |
 | **Nothing is "new" on the first run.** | There is no baseline yet, and it says so rather than calling everything new. Run it twice. |
 | **Rows get folded.** | If the whole of a tree is yours, one row says so and the rest are held back. `--all` lists them. |
-| **The `space` column says which kind of number it is.** | `859M / 30G (3%)` is your usage against your quota. `11T used` is your usage where no quota is set. `886G free` is the whole filesystem's headroom, shared with everyone on the node, and not yours. |
+| **`free` is not always yours alone.** | Under a quota it is your remaining allowance. With no quota it is the whole filesystem's headroom, shared with everyone on the node. Where both are known it shows the smaller, because that is what you can actually write. |
+| **`limit: none` is not `limit: ?`.** | `none` means the filesystem told us no quota is enforced here. `?` means nobody could measure it. |
 | **`?` never means zero.** | It means the tool could not find out, and it never becomes a number, a blank or a `0%`. |
 | **Mounts depend on the node.** | `/cfs3` exists on login nodes and not on compute. The header states where it ran, and it refuses to diff across node classes. |
 | **Write access is not probed by default.** | `os.access` lies under root-squashed NFS. Pass `--probe-write` to find out for real. |

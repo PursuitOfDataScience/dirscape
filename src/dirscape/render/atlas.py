@@ -236,6 +236,44 @@ def _strip(text):
     return _ANSI.sub("", text).strip()
 
 
+def _heading(index, roots):
+    # type: (int, Sequence[Root]) -> str
+    """The column's heading, which for the two figures depends on the data.
+
+    Owner, of `limit`: "what does limit mean? does it mean there is no user
+    level limit or the dir has some ceiling but there is no restriction on the
+    user side?" A fair question with no answer on screen, and the ambiguity is
+    real rather than a wording slip: `QuotaRow.scope` is `user`, `group` or
+    `fileset`, so the same cell can be a personal allowance or the ceiling on
+    everything stored in a directory, and those are different numbers a reader
+    would act on differently.
+
+    Measured on the development cluster: every row of the default view is
+    user-scoped, because the site's backend is `mmlsquota -u`. So the honest
+    heading there is `your use` and `your limit`.
+
+    **The claim is checked against the rows rather than assumed.** If any row
+    on screen is group or fileset scoped, "your" would be false for it, and
+    one wrong heading is worse than a vague one; the columns fall back to
+    `used` and `limit` and `why` names the scope per row. Deciding it here,
+    from the data, is what keeps a site nobody has an account on from being
+    told a lie about its own quotas.
+    """
+    name = COLUMNS[index]
+    if index not in (_USED, _LIMIT):
+        return name
+    saw = False
+    for root in roots:
+        snap = getattr(root, "quota", None)
+        for row in getattr(snap, "rows", ()) or ():
+            saw = True
+            if (getattr(row, "scope", "") or "") != "user":
+                return name
+    if not saw:
+        return name
+    return "your use" if index == _USED else "your limit"
+
+
 def _constant_columns(rows):
     # type: (Sequence[Sequence[str]]) -> set
     """Column indexes whose value never varies, excluding the ones that must stay.
@@ -514,11 +552,24 @@ def _footer(roots, style, dropped, window, hidden=0, legend_on=False, counts=Fal
         lines.append(style.dim(_INDENT + ("  %s  " % (g.sep,)).join(bits)))
 
     if legend_on:
+        # **Rewritten to describe the table that exists.** It explained `r`,
+        # `w`, `x` and `-`, which the access column stopped using when it
+        # went over to words, and `%s`, which came off the figures two rounds
+        # before that. A legend for a view that has moved on is worse than no
+        # legend: a reader who cannot find the character it describes has to
+        # decide whether they are looking at the wrong column or reading stale
+        # documentation.
+        #
+        # What is left needs explaining because it cannot be said in a cell:
+        # the difference between `read` and `read only`, which is the whole
+        # point of the tri-state, and the two marks still drawn.
         for text in (
-            "reach: r list, w write, x traverse, - refused, %s not determined, "
-            "%s traverse only" % (fields.UNKNOWN, g.warn),
-            "marks: ~ figure attributed rather than published, %s space allocated "
-            "and not yet accounted for" % (g.doubt,),
+            "access: `read` means nobody checked whether you can write, which is not the "
+            "same as `read only`. Pass --probe-write to settle it.",
+            "%s means nobody could measure this. It never stands in for a zero, a blank "
+            "or a no." % (fields.UNKNOWN,),
+            "marks: ~ a figure dirscape attributed to this path rather than one the "
+            "filesystem published, %s you can enter this directory but not list it" % (g.warn,),
         ):
             for line in wrap(text, indent=_INDENT, size=window, style=style).splitlines():
                 lines.append(style.dim(line))
@@ -685,7 +736,7 @@ def render(
         return "\n".join(out)
 
     body, extra = table(
-        [COLUMNS[i] for i in columns],
+        [_heading(i, roots) for i in columns],
         [[row[i] for i in columns] for row in rows],
         aligns=[_ALIGNS[i] for i in columns],
         style=style,

@@ -223,10 +223,10 @@ def _add_global_args(parser, suppress=False):
         help=h("in `why`, add where each figure came from and how the path was found"),
     )
     parser.add_argument(
-        "--measure",
+        "--no-measure",
         action="store_true",
         default=_absent(suppress),
-        help=h("walk the roots no quota system can report, to replace their unknowns"),
+        help=h("skip the bounded walk of roots that have no quota, leaving them unknown"),
     )
 
 
@@ -553,18 +553,35 @@ def _attach_capacity(run):
         root.policy["size_bytes"] = int(stats.f_blocks) * int(stats.f_frsize)
 
 
-#: Per-root ceiling for `--measure`. A walk is the only way to a number on a
-#: filesystem with no quota accounting, and it is also the one operation in
-#: this package whose cost is the number of FILES rather than the number of
-#: roots, so it gets a deadline of its own and gives up rather than hanging.
-#: Measured on the two roots that need it here: `/scratch/local/jdoe42` is
+#: Per-root ceiling for the measuring walk, in seconds. A walk is the only way
+#: to a number on a filesystem with no quota accounting, and it is also the
+#: one operation in this package whose cost is the number of FILES rather than
+#: the number of roots, so it is bounded at both ends and gives up rather than
+#: hanging. Measured on the two roots that need it here: `/scratch/local` is
 #: empty and `/tmp` is 2,220 files, both in 0.01s.
-WALK_SECONDS = 3.0
+WALK_SECONDS = 1.5
+
+#: And a ceiling on ENTRIES, which is the bound that actually protects a login
+#: node. A deadline alone means a pathological tree costs its full
+#: `WALK_SECONDS` before being abandoned, once per root; a count lets the walk
+#: recognise within milliseconds that this is not the kind of directory it can
+#: add up, and stop. 100k entries is about two orders of magnitude above the
+#: largest root here and still finishes in well under the deadline.
+WALK_ENTRIES = 100_000
+
+#: And a ceiling on the WHOLE measuring pass, because the per-root one does
+#: not bound the run: four roots with no quota would be four times
+#: `WALK_SECONDS` added to a tool that otherwise finishes in under three.
+#: Measured against the worst tree on this node, `/software`, which is
+#: quota-bearing and so never walked: it burns a full `WALK_SECONDS` without
+#: finishing, so this is the difference between one slow root costing 1.5s and
+#: several costing 6.
+WALK_TOTAL_SECONDS = 2.5
 
 
 def _measure(run, budget=None):
     # type: (Run, Optional[Budget]) -> None
-    """Walk the roots no quota system can speak for. Opt in, never default.
+    """Walk the roots no quota system can speak for. On by default, bounded.
 
     The owner asked the right question about the `?` marks: "do you have a way
     to tell the exact number? having too many ? can impact user experience,
@@ -577,13 +594,24 @@ def _measure(run, budget=None):
     so there is no per-user accounting anywhere in the kernel to ask. The only
     remaining source of truth is adding the files up.
 
-    **So it is offered, and it is not the default.** The package's headline
-    claim is that its cost is the number of roots and not the number of files,
-    which is what makes it safe to run on a login node when something is
-    already wrong. A walk breaks that, so it happens when asked for, under a
-    deadline, and a walk that runs out of time leaves the `?` in place with a
-    reason rather than reporting a partial sum as a total. A number that is
-    quietly too small is worse than no number.
+    **It was opt-in and is now the default, because a flag is a bad answer to
+    "why are there still question marks".** The owner saw the two remaining
+    `?` rows and said "something is wrong", which is exactly the reaction the
+    marks were meant to avoid: a reader cannot tell "nobody could measure
+    this" from "this tool did not try".
+
+    The package's claim is that its cost is the number of roots and not the
+    number of files, and that still holds, because the walk is bounded at both
+    ends and applies only to roots no backend could answer for. Two bounds
+    rather than one: `WALK_SECONDS` per root, and `WALK_ENTRIES`, which is what
+    actually protects a login node. A deadline alone means a pathological tree
+    costs its full deadline before being abandoned; a count lets the walk see
+    within milliseconds that this is not a directory it can add up.
+
+    Either bound tripping leaves the `?` in place with a reason rather than
+    reporting a partial sum as a total. **A number that is quietly too small
+    is worse than no number**, and this is the one place in the package where
+    a wrong figure is cheap to produce. `--no-measure` turns it off.
 
     `st_blocks`, not `st_size`: this is space CHARGED, so a sparse file counts
     what it occupies and the figure is comparable with a quota reading.
@@ -602,8 +630,15 @@ def _measure(run, budget=None):
     # storage the reader is not looking at is pure cost.
     shown, _hidden = _visible(run, show_all=False)
     targets = [root for root in shown if root.quota is None and root.path]
+    overall = time.time() + WALK_TOTAL_SECONDS
 
     for root in targets:
+        if time.time() >= overall:
+            root.add_note(
+                "there was not enough time left to add this directory up, so its size "
+                "stays unknown: rdu or du will measure it"
+            )
+            continue
         if not root.present.confirmed or root.reach != Reach.LISTABLE:
             continue
         # **Its own clock, not the leftovers of the global budget.** The
@@ -613,13 +648,14 @@ def _measure(run, budget=None):
         # "timed out" without reading a directory. `--measure` is an explicit
         # request for work the tool otherwise refuses to do, so it is paid for
         # separately; the per-root ceiling is what stops it running away.
-        deadline = time.time() + WALK_SECONDS
-        used, files, complete = _walk(root.path, deadline)
+        deadline = min(time.time() + WALK_SECONDS, overall)
+        used, files, complete = _walk(root.path, deadline, WALK_ENTRIES)
         root.policy = dict(root.policy or {})
         if not complete:
             root.add_note(
-                "measuring this directory by walking it did not finish within %.0fs, so the "
-                "figures stay unknown rather than being reported short" % (WALK_SECONDS,)
+                "this directory is too large to add up quickly (over %s entries or %.1fs), "
+                "so its size stays unknown rather than being reported short: rdu or du "
+                "will measure it properly" % (render_fields.human_count(WALK_ENTRIES), WALK_SECONDS)
             )
             continue
         root.policy["walked"] = True
@@ -667,8 +703,8 @@ class _WalkSource(object):
     figure_note = ""
 
 
-def _walk(top, deadline):
-    # type: (str, float) -> Tuple[int, int, bool]
+def _walk(top, deadline, ceiling):
+    # type: (str, float, int) -> Tuple[int, int, bool]
     """Bytes charged and files counted under ``top``, or as far as time allowed.
 
     Iterative rather than recursive, so a pathological depth cannot blow the
@@ -680,9 +716,10 @@ def _walk(top, deadline):
     """
     total = 0
     files = 0
+    seen = 0
     stack = [top]
     while stack:
-        if time.time() > deadline:
+        if seen > ceiling or time.time() > deadline:
             return total, files, False
         current = stack.pop()
         try:
@@ -691,6 +728,16 @@ def _walk(top, deadline):
             # A directory inside a readable tree that we cannot enter is one
             # subtree missing from the sum, not a failure of the whole walk.
             continue
+        seen += len(entries)
+        if seen > ceiling:
+            # Checked AFTER the read as well as before it. Checking only at
+            # the top of the loop meant the bound could not see a single
+            # directory holding more entries than the ceiling: the first pass
+            # starts at zero, scans the whole thing, and finds an empty stack.
+            # One flat directory with millions of entries is the realistic
+            # shape for a scratch or `/tmp` tree, so it was the case the bound
+            # most needed to catch and the one case it missed.
+            return total, files, False
         for entry in entries:
             try:
                 if entry.is_dir(follow_symlinks=False):
@@ -955,7 +1002,7 @@ def sweep(opts, runner=None):
     _label_allocations(run)
     mark("attribute")
 
-    _attach_quota(run, budget, runner, measure=bool(_merge_flag(opts, "measure", False)))
+    _attach_quota(run, budget, runner, measure=not _merge_flag(opts, "no_measure", False))
     _mark_stranded(run)
     mark("quota-attach")
 
@@ -1412,36 +1459,30 @@ _REACH_WORDS = {
 
 def _access_phrase(root):
     # type: (object) -> str
-    """Read and write as words, and the write CONCLUSION only.
+    """What you can do here, in the SAME words the table's column prints.
 
-    **Words, not a sentence.** This read "you can see what is in this
-    directory, and you can write to it", which is fourteen words for two bits
-    of information in a field whose label already asks the question. The owner
-    ruled on the whole view at once: "i told you to avoid using verbose text
-    on anything." `read + write` is the same fact and a reader takes it in at
-    a glance, which is what a field list is for.
+    It used to have its own vocabulary, which is how the two views came to
+    disagree about the one thing both are for: the table said `rwx` and this
+    said "you can see what is in this directory, and you can write to it",
+    fourteen words for two bits of information in a field whose label already
+    asks the question. Both are now `render.fields.access_words`, so a reader
+    who opens a row sees the phrase they were just looking at.
 
-    The write verdict's reason is a paragraph of administration detail
-    ("os.access reports write; not owner-confirmed, and W_OK can be wrong
-    under a root-squashed export, so pass --probe-write to settle it by
-    writing"). At 157 characters it was also the line that broke the
-    interactive repaint. The caveat is still reachable, through the
-    `--probe-write` and `--json` pointers at the foot of the view.
+    The write verdict's REASON is still not printed here. It is a paragraph of
+    administration detail ("os.access reports write; not owner-confirmed, and
+    W_OK can be wrong under a root-squashed export, so pass --probe-write to
+    settle it by writing"), it was the line that broke the interactive repaint
+    at 157 characters, and it is reachable through the `--probe-write` and
+    `--json` pointers at the foot of the view.
     """
-    reach = getattr(root, "reach", Reach.UNKNOWN)
-    phrase = _REACH_WORDS.get(reach, Reach.label(reach))
+    text = render_fields.access_words(root)
+    if text != render_fields.UNKNOWN:
+        return text
     write = getattr(root, "writable", None)
-    if write is None:
-        return phrase
-    if write.confirmed:
-        return phrase + " + write"
-    if write.refuted:
-        return phrase + ", no write"
-    if write.category == VerdictCategory.NOT_PROBED:
-        # A question nobody asked gets no answer printed, which is the rule
-        # that keeps `? allocated not probed` off every mounted root.
-        return phrase
-    return phrase + ", write unanswered (%s)" % (write.label,)
+    if write is not None and not write.durable and write.category != VerdictCategory.NOT_PROBED:
+        # Nothing was settled, and the reason why is the useful part.
+        return "unknown (%s)" % (write.label,)
+    return text
 
 
 def _keeping_phrase(root, site):
@@ -1909,8 +1950,8 @@ def _why(run, path, style, size=None, verbose=False):
                 style,
                 room,
                 "note",
-                "no quota is enforced here, so nothing is counting your usage. "
-                "dirscape --measure walks this directory to find out.",
+                "no quota is enforced here, so nothing is counting your usage, and "
+                "this directory was too large to add up quickly.",
             )
         )
 

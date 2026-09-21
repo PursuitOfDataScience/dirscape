@@ -845,57 +845,82 @@ def where_cell(root, style=None):
     return UNKNOWN
 
 
+#: What you can do here, in words, and the SAME words `why` prints.
+#:
+#: This replaced `rwx` / `r-x` / `r?x` / `-?x` / `---`, a POSIX-shaped triple
+#: with one slot per question. That encoding was compact, exact and correct,
+#: and it was addressed to somebody who already reads `ls -l` output. Owner:
+#: "since we have a lot of horizontal spacing, don't use rwx, just use regular
+#: words so that it's new user friendly. utilize the space optimally." There
+#: is room for twelve characters, and a new user should not have to decode a
+#: cell to learn they can write to their own home directory.
+#:
+#: Keyed on the pair, because the two questions are independent and either can
+#: be unanswered. The distinction the triple existed to preserve is preserved:
+#: `read` means nobody checked whether you can write, which is a different
+#: answer from `read only`, and `?` is still never a blank and never a "no".
+ACCESS_WORDS = {
+    (Reach.LISTABLE, "yes"): "read + write",
+    (Reach.LISTABLE, "no"): "read only",
+    (Reach.LISTABLE, ""): "read",
+    (Reach.TRAVERSE, "yes"): "enter + write",
+    (Reach.TRAVERSE, "no"): "enter only",
+    (Reach.TRAVERSE, ""): "enter only",
+    (Reach.CLOSED, "yes"): "write only",
+    (Reach.CLOSED, "no"): "no access",
+    (Reach.CLOSED, ""): "no access",
+}
+
+
+def _write_state(root):
+    # type: (Root) -> str
+    """``yes``, ``no``, or the empty string for unanswered."""
+    write = getattr(root, "writable", None)
+    if write is None:
+        return ""
+    if write.confirmed:
+        return "yes"
+    if write.refuted:
+        return "no"
+    return ""
+
+
+def access_words(root):
+    # type: (Root) -> str
+    """The access phrase, or the unknown mark. Shared with `why`."""
+    reach = getattr(root, "reach", Reach.UNKNOWN)
+    write = getattr(root, "writable", None)
+    if reach == Reach.UNKNOWN and not (write is not None and write.durable):
+        return UNKNOWN
+    if reach == Reach.UNKNOWN:
+        return UNKNOWN
+    return ACCESS_WORDS.get((reach, _write_state(root)), UNKNOWN)
+
+
 def reach_cell(root, style=None):
     # type: (Root, Optional[Style]) -> str
-    """POSIX-shaped reach: ``rwx``, ``r-x``, ``r?x``, ``-?x!``, ``---``, ``?``.
+    """What you can do here, in words.
 
-    Three independent slots, each of which can say "I do not know". So a
-    listable directory whose write bit was never probed is ``r?x`` and not
-    ``r-x``: the difference between "you cannot write here" and "nobody
-    checked" is the difference this tool is for.
+    Every ANSWERED state reads the same weight, `read + write` and `read only`
+    alike. Muting only the commonest one was well meant and misfired: with
+    eight of ten rows reading the same thing, the one read-only dataset was
+    the only bright cell in the column and looked flagged. The owner asked
+    "why is r-x a different color?", which is the question a reader should
+    never have to ask about a cell that is merely normal.
 
-    Traverse-only additionally carries the warning glyph, because ``-?x``
-    differs from ``r-x`` in one character and this state is worth noticing: you
-    can `cd` through the directory using a path you already know and you cannot
-    list it. Colour is not used to make that distinction, since colour is never
-    load bearing here.
+    Colour is reserved for the two states genuinely worth stopping on:
+    `no access` in `bad`, and traverse-only in `warn` with its own glyph,
+    because being able to `cd` through a directory you cannot list is worth
+    noticing. Not being able to write somewhere is ordinary.
     """
     style = style or Style()
-    g = style.g
-    if root.reach == Reach.UNKNOWN and not root.writable.durable:
-        # Nothing at all was determined, so the cell is the one-character mark
-        # rather than three of them.
+    text = access_words(root)
+    if text == UNKNOWN:
         return UNKNOWN
-    if root.reach == Reach.LISTABLE:
-        r, x = "r", "x"
-    elif root.reach == Reach.TRAVERSE:
-        r, x = "-", "x"
-    elif root.reach == Reach.CLOSED:
-        r, x = "-", "-"
-    else:
-        r, x = UNKNOWN, UNKNOWN
-    if root.writable.confirmed:
-        w = "w"
-    elif root.writable.refuted:
-        w = "-"
-    else:
-        w = UNKNOWN
-    text = r + w + x
     if root.reach == Reach.TRAVERSE:
-        return style.warn(text + g.warn)
+        return style.warn(text + style.g.warn)
     if root.reach == Reach.CLOSED:
         return style.bad(text)
-    # Every ANSWERED reach reads the same weight, `rwx` and `r-x` alike.
-    #
-    # Muting only `rwx` was well meant and misfired: with eight of ten rows
-    # reading `rwx`, the one row reading `r-x` was the only bright cell in the
-    # column, so a read-only dataset directory looked flagged. The owner asked
-    # "why is r-x a different color?", which is the question a reader should
-    # never have to ask about a cell that is merely normal.
-    #
-    # Colour is reserved for the two states that are genuinely worth stopping
-    # on, and both are handled above: CLOSED in `bad`, traverse-only in `warn`
-    # with its own glyph. Not being able to write somewhere is ordinary.
     return style.muted(text)
 
 

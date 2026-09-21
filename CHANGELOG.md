@@ -966,6 +966,64 @@ explanation in `why` naming `--measure`; with `--measure` there are none.
   administrator is meant to be able to publish a key this package has never
   heard of.
 
+### Fourteenth pass: words instead of mode bits, and no question marks left
+
+- **The measuring walk is on by default, bounded at three ends.** It was
+  opt-in behind `--measure`, and the owner's reaction to the two `?` rows that
+  remained was "why are there still '?'. something is wrong." That is the
+  right reaction and a flag is a bad answer to it: a reader cannot tell
+  "nobody could measure this" from "this tool did not try". The default view
+  now has no `?` on this cluster.
+
+  The package's claim that its cost is the number of roots and not the number
+  of files still holds, because the walk only touches roots no backend could
+  answer for and gives up rather than running: `WALK_SECONDS` per root,
+  `WALK_TOTAL_SECONDS` for the whole pass so four slow roots cannot cost four
+  times one, and `WALK_ENTRIES`, which is the bound that actually protects a
+  login node. Measured against `/software`, the worst tree here: it abandons
+  in 2ms at a ceiling of 50 and burns the full 1.5s deadline at 100k without
+  finishing. Any bound tripping leaves the `?` in place with a reason, because
+  a partial sum reported as a total is worse than no number. `--no-measure`
+  turns it off.
+
+  **A bug in that bound, found by a test with teeth.** The entry count was
+  checked only at the top of the loop, so a single directory holding more
+  entries than the ceiling was never caught: the first pass starts at zero,
+  scans the whole thing, and finds an empty stack. One flat directory with
+  millions of entries is the realistic shape for a scratch or `/tmp` tree, so
+  it was the case the bound most needed to catch and the one case it missed.
+
+- **`rwx` became `read + write`.** Owner: "since we have a lot of horizontal
+  spacing, don't use rwx, just use regular words so that it's new user
+  friendly. utilize the space optimally." The POSIX triple was compact, exact
+  and addressed to somebody who already reads `ls -l`. The distinction it
+  existed for is preserved and is the one a word form could quietly lose:
+  `read` means nobody checked whether you can write, which is not `read only`.
+  Both views draw from `fields.access_words` now, because they had drifted
+  into two vocabularies for the one thing both are for: the table said `rwx`
+  and `why` said "you can see what is in this directory, and you can write to
+  it".
+
+- **`used` and `limit` say whose they are.** Owner: "what does limit mean?
+  does it mean there is no user level limit or the dir has some ceiling but
+  there is no restriction on the user side?" A fair question with no answer on
+  screen, and the ambiguity was real rather than a wording slip:
+  `QuotaRow.scope` is `user`, `group` or `fileset`, so the same cell can be a
+  personal allowance or the ceiling on everything in a directory. Every row of
+  this cluster's default view is user-scoped, so the headings read `your use`
+  and `your limit`. **The claim is checked against the rows rather than
+  assumed**: if any row on screen is group or fileset scoped they fall back to
+  `used` and `limit` and `why` names the scope, because one wrong heading is
+  worse than a vague one and this package must not tell a site nobody has an
+  account on a lie about its own quotas.
+
+- **`--legend` describes the table that exists.** It explained `r`, `w`, `x`
+  and `-`, which the access column stopped using, and the in-doubt block,
+  which came off the figures two rounds earlier. A legend for a view that has
+  moved on is worse than none: a reader who cannot find the character it
+  describes has to work out whether they are in the wrong column or reading
+  stale documentation.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

@@ -716,11 +716,14 @@ def test_every_figure_column_is_right_aligned_and_one_token_per_cell():
         root.role = "project"
 
     lines = _content(atlas.render(roots, style=style, group=True, size=100))
-    heading = next(ln for ln in lines if "used" in ln and "limit" in ln)
+    # The headings for these two are data-dependent (`your use` / `your limit`
+    # when every row on screen is user-scoped), so the column is located by
+    # the word both forms share.
+    heading = next(ln for ln in lines if "use" in ln and "limit" in ln)
     body = [ln for ln in lines if re.search(r"/[abcd]\b", ln)]
     assert len(body) == 4
 
-    for column in ("used", "limit"):
+    for column in ("use", "limit"):
         at = heading.index(column) + len(column)
         for line in body:
             cell = line[:at]
@@ -730,7 +733,7 @@ def test_every_figure_column_is_right_aligned_and_one_token_per_cell():
 
     # One token per cell: no figure cell pairs two numbers, which is what
     # `11T used`, `886G free` and `866M / 30G (3%)` each did.
-    figures_at = heading.index("used")
+    figures_at = heading.index("use")
     for line in body:
         assert " / " not in line[figures_at:], "a figure cell is pairing two numbers again"
         assert "%" not in line, "the percentage was folded into free"
@@ -770,8 +773,11 @@ def test_the_legend_is_off_unless_asked_for():
     """A legend reprinted on every run is read once and skipped forever."""
     roots = [_measured(_root("/a", "fa"))]
     roots[0].role = "home"
-    assert "reach:" not in _render_default(roots)
-    assert "reach:" in _render_default(roots, legend_on=True)
+    # Anchored on `access:`, because the legend stopped describing `reach`
+    # when the column did. Kept as one word the legend opens with rather than
+    # a phrase, so a rewording of the sentence after it does not break this.
+    assert "access:" not in _render_default(roots)
+    assert "access:" in _render_default(roots, legend_on=True)
 
 
 def test_the_summary_lines_count_the_unfiltered_roots():
@@ -1511,7 +1517,47 @@ def test_a_walk_that_runs_out_of_time_leaves_the_unknown_alone(tmp_path):
         cli.WALK_SECONDS = saved
 
     assert root.quota is None, "an unfinished walk must not publish a figure"
-    assert any("did not finish" in note for note in root.notes), root.notes
+    assert any("too large to add up quickly" in note for note in root.notes), root.notes
+
+
+def test_a_tree_too_large_to_count_is_abandoned_on_the_ENTRY_bound(tmp_path):
+    """Two bounds, and this is the one that protects a login node.
+
+    A deadline alone means a pathological tree costs its full `WALK_SECONDS`
+    before being abandoned, once per root. The entry count lets the walk
+    recognise within milliseconds that this is not a directory it can add up.
+    Measured against `/software`: it gives up in 2ms at a ceiling of 50 and
+    burns the whole 1.5s deadline at 100k without finishing.
+
+    Tested with the DEADLINE left generous on purpose. The sibling test sets a
+    deadline in the past, so it exercises the clock and would pass whether or
+    not this bound existed at all.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    for index in range(30):
+        (home / ("f%d" % index)).write_bytes(b"z" * 512)
+
+    run = cli.Run()
+    root = _root(str(home))
+    root.role = "home"
+    root.quota = None
+    run.roots = [root]
+
+    saved = cli.WALK_ENTRIES
+    cli.WALK_ENTRIES = 1
+    try:
+        cli._measure(run)
+    finally:
+        cli.WALK_ENTRIES = saved
+
+    assert root.quota is None, "a walk stopped by the entry bound publishes nothing"
+    assert any("too large to add up quickly" in note for note in root.notes), root.notes
+
+    # And with the bound restored the same tree is counted.
+    cli._measure(run)
+    assert root.quota is not None
+    assert "?" not in render_fields.used_cell(root, Style())[0]
 
 
 def test_noquota_in_the_mount_options_is_knowledge_not_a_shrug(tmp_path):
@@ -1529,6 +1575,96 @@ def test_noquota_in_the_mount_options_is_knowledge_not_a_shrug(tmp_path):
     known = _root("/tmp/whatever")
     known.policy = {"no_quota_enforced": True}
     assert render_fields.plain(render_fields.limit_cell(known, Style())) == "none"
+
+
+def test_access_reads_as_words_and_the_two_views_agree():
+    """`rwx` was correct, exact, and addressed to somebody who reads `ls -l`.
+
+    Owner: "since we have a lot of horizontal spacing, don't use rwx, just use
+    regular words so that it's new user friendly." There is room for twelve
+    characters and a new user should not have to decode a cell to learn they
+    can write to their own home directory.
+
+    The distinction the POSIX triple existed to preserve is preserved: `read`
+    means nobody checked whether you can write, which is a different answer
+    from `read only`. That was the whole reason for `r?x` and it is the one
+    thing a word form could quietly lose.
+
+    Both views take the phrase from one place, because they used to disagree
+    about the single thing both are for: the table said `rwx` and `why` said
+    "you can see what is in this directory, and you can write to it".
+    """
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+
+    writable = _measured(_root("/a", "fa"), used=1000, limit=2000)
+    writable.writable = confirmed()
+    readonly = _measured(_root("/b", "fb"), used=1000, limit=2000)
+    readonly.writable = refuted(VerdictCategory.ACCESS_DENIED)
+    unchecked = _measured(_root("/c", "fc"), used=1000, limit=2000)
+    for root in (writable, readonly, unchecked):
+        root.role = "project"
+
+    assert render_fields.access_words(writable) == "read + write"
+    assert render_fields.access_words(readonly) == "read only"
+    assert render_fields.access_words(unchecked) == "read", (
+        "an unprobed write must not read as a refused one"
+    )
+
+    traverse = _root("/d", reach=Reach.TRAVERSE)
+    assert render_fields.access_words(traverse) == "enter only"
+    shut = _root("/e", reach=Reach.CLOSED)
+    assert render_fields.access_words(shut) == "no access"
+    nothing = _root("/f", reach=Reach.UNKNOWN)
+    assert render_fields.access_words(nothing) == "?"
+
+    text = atlas.render([writable, readonly, unchecked], style=style, group=True, size=110)
+    assert "rwx" not in text and "r-x" not in text, "no POSIX triple survives on the table"
+    assert "read + write" in text and "read only" in text
+
+    # And `why` prints the same phrase the table just showed.
+    run = cli.Run()
+    run.roots = [writable]
+    detail, _ = cli._why(run, "/a", style)
+    assert "access    read + write" in detail
+
+
+def test_the_figure_headings_only_claim_your_when_that_is_true():
+    """Owner, of `limit`: "what does limit mean? does it mean there is no user
+    level limit or the dir has some ceiling but there is no restriction on the
+    user side?"
+
+    A fair question with no answer on screen, and the ambiguity is real rather
+    than a wording slip: `QuotaRow.scope` is `user`, `group` or `fileset`, so
+    the same cell can be a personal allowance or the ceiling on everything
+    stored in a directory. Those are different numbers a reader would act on
+    differently.
+
+    Every row of the development cluster's default view is user-scoped, so the
+    honest heading there is `your use` and `your limit`. **The claim is
+    checked against the rows rather than assumed**, because one wrong heading
+    is worse than a vague one, and this package's whole portability story is
+    that it must not tell a site nobody has an account on a lie about its own
+    quotas.
+    """
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+
+    def rendered(scope):
+        row = QuotaRow("fs", "blocks", scope, 1000, hard=2000, mount="/a")
+        root = _root("/a", fileset="fs")
+        root.role = "project"
+        root.quota = QuotaSnapshot("mmlsquota", [row])
+        return atlas.render([root], style=style, group=True, size=110)
+
+    mine = rendered("user")
+    assert "your use" in mine and "your limit" in mine
+
+    shared = rendered("fileset")
+    assert "your" not in shared, "a fileset quota is not yours alone"
+    assert "used" in shared and "limit" in shared, "so the heading falls back to the vague form"
 
 
 def test_the_detail_view_is_fields_and_not_paragraphs():

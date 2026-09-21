@@ -903,6 +903,69 @@ The default view is now `kind`, `path`, `access`, `used`, `limit`, `files`:
 six columns, every heading one word, every figure cell one token, and nothing
 on it computed from anything else on it.
 
+### Thirteenth pass: answering the question marks instead of explaining them
+
+Owner: "regarding ?, do you have a way to tell the exact number? having too
+many ? can impact user experience, and they will think you don't know things."
+
+Eight `?` cells on the live table, and they were not all the same problem.
+Taken one at a time, three of the four rows are now answered.
+
+- **One was an attribution BUG, not a limit of what the filesystem knows.**
+  `/scratch/meadow2/jdoe42` read `?` for both figures while
+  `mmlsquota -u jdoe42 meadow2_perf` reports 0 used against a 100G quota and a
+  5T hard limit. `mmlsattr -L` calls the path's fileset `root`, which is
+  GPFS's name for a filesystem's own top level, and the backend labels a
+  device-wide USR row with the DEVICE, so `_rows_governing` compared `root`
+  against `meadow2_perf` and matched nothing. `_device_wide` joins them, under
+  four conditions that keep it from becoming the quota leak it sits beside:
+  the root must have no fileset of its own, and the row must be user-scoped,
+  device-wide and on the same device. A user quota on a device covers that
+  user everywhere on it, so this is correct rather than convenient, and a
+  caveat records that the figure spans the whole device.
+- **Two were `noquota` mounts, where nothing in the kernel is counting.**
+  `/tmp` and `/scratch/local` are XFS mounted `noquota`, so there is no
+  per-user accounting to ask for and the only source of truth is adding the
+  files up. **`--measure` does that**, and it is opt-in rather than default,
+  because the package's headline claim is that its cost is the number of
+  roots and not the number of files. Each root gets a 3 second ceiling, and a
+  walk that runs out leaves the `?` in place with a reason: a partial sum
+  reported as a total is worse than no number. `st_blocks`, so the figure is
+  space charged and comparable with a quota reading, and symlinks are never
+  followed, so a home directory whose dotfiles live in `/project` is not
+  double counted.
+- **And the `limit` cell on those rows now reads `none`, with no flag at
+  all.** `noquota` in the mount options is positive evidence that no limit is
+  enforced, which is a different fact from nobody having measured one, and
+  the renderer has always kept those apart. `attribute_xfs` already detected
+  it and recorded it only as a note, so the table was withholding something
+  the mount table had settled. One direction only: the absence of `noquota`
+  implies nothing.
+
+The default view is down to four `?` cells from eight, each with a one-line
+explanation in `why` naming `--measure`; with `--measure` there are none.
+
+**Two bugs found while building it.**
+
+- **`--measure` walked everything and produced nothing.** The first version
+  iterated every discovered root, so the candidates included
+  `/scratch/meadow3`, `/project2/reference/pdb` and `/project2/biokit`: whole
+  shared dataset trees that the default view does not show, each burning its
+  full deadline on a partial that was then correctly discarded. It took 8.7
+  seconds and filled in zero cells. It walks the shown rows only, and takes
+  its own clock rather than the global budget's leftovers, which by that point
+  in the run is near zero and set every deadline to the current instant.
+- **The POLICY column's leak guard was a blacklist, and it rotted again.** It
+  names the keys discovery stores on `root.policy` as bookkeeping; it started
+  at `rank`, was found short by six, and went short by two more the moment
+  `_device_wide` and `_measure` each set a flag, which put
+  `device_wide_quota=True` in the POLICY cell of a live run. A blacklist has
+  to be updated by whoever adds a key, which is the wrong person to rely on,
+  so the root's side of `merged_policy` is now an ALLOWLIST of the vocabulary
+  `sitecfg` documents. The site's own side stays unfiltered, because an
+  administrator is meant to be able to publish a key this package has never
+  heard of.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

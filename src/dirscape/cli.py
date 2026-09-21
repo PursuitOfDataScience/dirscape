@@ -222,6 +222,12 @@ def _add_global_args(parser, suppress=False):
         default=_absent(suppress),
         help=h("in `why`, add where each figure came from and how the path was found"),
     )
+    parser.add_argument(
+        "--measure",
+        action="store_true",
+        default=_absent(suppress),
+        help=h("walk the roots no quota system can report, to replace their unknowns"),
+    )
 
 
 def build_parser():
@@ -373,8 +379,8 @@ def _owned_by_caller(path):
         return False
 
 
-def _attach_quota(run, budget, runner):
-    # type: (Run, Budget, object) -> None
+def _attach_quota(run, budget, runner, measure=False):
+    # type: (Run, Budget, object, bool) -> None
     """Give every root the quota reading that actually governs it.
 
     One `read_all` sweep for the whole run, then per-root selection, rather
@@ -501,6 +507,10 @@ def _attach_quota(run, budget, runner):
             root.inode_quota = _single_row_snapshot(snap, files[0])
 
     _attach_capacity(run)
+    if measure:
+        # After the backends and the capacity fallback, so it only ever walks
+        # what nothing else could answer for.
+        _measure(run, budget)
 
 
 def _attach_capacity(run):
@@ -543,6 +553,157 @@ def _attach_capacity(run):
         root.policy["size_bytes"] = int(stats.f_blocks) * int(stats.f_frsize)
 
 
+#: Per-root ceiling for `--measure`. A walk is the only way to a number on a
+#: filesystem with no quota accounting, and it is also the one operation in
+#: this package whose cost is the number of FILES rather than the number of
+#: roots, so it gets a deadline of its own and gives up rather than hanging.
+#: Measured on the two roots that need it here: `/scratch/local/jdoe42` is
+#: empty and `/tmp` is 2,220 files, both in 0.01s.
+WALK_SECONDS = 3.0
+
+
+def _measure(run, budget=None):
+    # type: (Run, Optional[Budget]) -> None
+    """Walk the roots no quota system can speak for. Opt in, never default.
+
+    The owner asked the right question about the `?` marks: "do you have a way
+    to tell the exact number? having too many ? can impact user experience,
+    and they will think you don't know things."
+
+    Three of the four were answerable and are answered elsewhere: one was an
+    attribution bug (`_device_wide`), and the figures for every quota-bearing
+    root come from the backends. The rest are `noquota` mounts, measured:
+    `/tmp` and `/scratch/local` on this node are XFS mounted with `noquota`,
+    so there is no per-user accounting anywhere in the kernel to ask. The only
+    remaining source of truth is adding the files up.
+
+    **So it is offered, and it is not the default.** The package's headline
+    claim is that its cost is the number of roots and not the number of files,
+    which is what makes it safe to run on a login node when something is
+    already wrong. A walk breaks that, so it happens when asked for, under a
+    deadline, and a walk that runs out of time leaves the `?` in place with a
+    reason rather than reporting a partial sum as a total. A number that is
+    quietly too small is worse than no number.
+
+    `st_blocks`, not `st_size`: this is space CHARGED, so a sparse file counts
+    what it occupies and the figure is comparable with a quota reading.
+    """
+    from .model import QuotaRow
+
+    # **Only the rows the default view will actually show**, which is the
+    # difference between walking two directories and walking forty.
+    #
+    # The first version iterated every discovered root and took 8.7 seconds
+    # while producing no figures at all. The candidate list included
+    # `/scratch/meadow3`, `/project2/reference/pdb` and `/project2/biokit`:
+    # whole shared dataset trees, none of which appear in the default view,
+    # every one of them enormous, and each burning its full deadline to
+    # produce a timed-out partial that was then correctly discarded. Walking
+    # storage the reader is not looking at is pure cost.
+    shown, _hidden = _visible(run, show_all=False)
+    targets = [root for root in shown if root.quota is None and root.path]
+
+    for root in targets:
+        if not root.present.confirmed or root.reach != Reach.LISTABLE:
+            continue
+        # **Its own clock, not the leftovers of the global budget.** The
+        # global budget is nearly spent by the time the backends have all
+        # answered, so taking `min(WALK_SECONDS, budget.remaining)` set the
+        # deadline to the current instant and every single walk reported
+        # "timed out" without reading a directory. `--measure` is an explicit
+        # request for work the tool otherwise refuses to do, so it is paid for
+        # separately; the per-root ceiling is what stops it running away.
+        deadline = time.time() + WALK_SECONDS
+        used, files, complete = _walk(root.path, deadline)
+        root.policy = dict(root.policy or {})
+        if not complete:
+            root.add_note(
+                "measuring this directory by walking it did not finish within %.0fs, so the "
+                "figures stay unknown rather than being reported short" % (WALK_SECONDS,)
+            )
+            continue
+        root.policy["walked"] = True
+        # `soft=0, hard=0` is the model's way of saying no limit is enforced,
+        # as opposed to a limit nobody measured. Walking answers how much is
+        # THERE and says nothing about a ceiling, and on these mounts there is
+        # no ceiling to find: they are the ones with no quota system, which is
+        # why they are being walked. Leaving the limits unset made the cell
+        # fall back to `?` and undid the answer the mount table had already
+        # given two lines earlier.
+        root.quota = _single_row_snapshot(
+            _WalkSource,
+            QuotaRow(
+                root.fileset or root.path, "blocks", "user", used, soft=0, hard=0, mount=root.path
+            ),
+        )
+        root.inode_quota = _single_row_snapshot(
+            _WalkSource,
+            QuotaRow(
+                root.fileset or root.path, "files", "user", files, soft=0, hard=0, mount=root.path
+            ),
+        )
+        root.add_note(
+            "no quota system exists here, so these figures were measured by walking the "
+            "directory (%s files), which is what du does" % (render_fields.human_count(files),)
+        )
+
+
+class _WalkSource(object):
+    """The `source` a walked figure reports, so `why` can name where it came
+    from without pretending a quota backend answered.
+
+    Shaped to satisfy `_single_row_snapshot`, which reads every doubt channel
+    off whatever it is handed. A walk has no staleness (it happened just now)
+    and no figure doubt of the GPFS kind, but it does carry one real caveat
+    and the right place for it is a note on the root, not this object.
+    """
+
+    source = "walk"
+    category = VerdictCategory.OK
+    reason = "measured by walking the directory, because no quota exists here"
+    taken_at = None
+    read_at = None
+    time_note = ""
+    figure_note = ""
+
+
+def _walk(top, deadline):
+    # type: (str, float) -> Tuple[int, int, bool]
+    """Bytes charged and files counted under ``top``, or as far as time allowed.
+
+    Iterative rather than recursive, so a pathological depth cannot blow the
+    stack, and `scandir` rather than `walk` so each entry's type comes from
+    the directory read instead of a second `stat`. Symlinks are never
+    followed: they are counted where they point, by whichever root owns that
+    storage, and following them here would double-count a home directory whose
+    dotfiles live in `/project`.
+    """
+    total = 0
+    files = 0
+    stack = [top]
+    while stack:
+        if time.time() > deadline:
+            return total, files, False
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            # A directory inside a readable tree that we cannot enter is one
+            # subtree missing from the sum, not a failure of the whole walk.
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            total += int(getattr(stat, "st_blocks", 0)) * 512
+            files += 1
+    return total, files, True
+
+
 def _rows_governing(snap, root):
     # type: (object, object) -> List[object]
     """The rows that govern THIS root, matched on fileset and not on prefix.
@@ -578,10 +739,68 @@ def _rows_governing(snap, root):
 
     fileset = getattr(root, "fileset", "") or ""
     if fileset:
-        return [row for row in rows if row.fileset and row.fileset == fileset]
+        named = [row for row in rows if row.fileset and row.fileset == fileset]
+        if named:
+            return named
+        return _device_wide(rows, root)
 
     target = root.path.rstrip("/") or "/"
     return [row for row in rows if (row.mount or "").rstrip("/") == target]
+
+
+def _device_wide(rows, root):
+    # type: (Sequence[object], object) -> List[object]
+    """A user quota on the whole DEVICE, for a path with no fileset of its own.
+
+    The fourth `?` the owner asked about, and it was a bug rather than a limit
+    of what the filesystem knows. `/scratch/meadow2/jdoe42` read `?` for both
+    figures while `mmlsquota -u jdoe42 meadow2_perf` reports 0 used against a
+    100G quota and a 5T hard limit. Nobody was withholding it: the two sides
+    could not be joined.
+
+    `mmlsattr -L` says this path is in the `root` fileset, which GPFS uses for
+    a filesystem's own top level and which `attribute.py` already flags as not
+    a real scope. The backend, reading a device-wide USR row that names no
+    fileset, labels it with the DEVICE (`meadow2_perf`). So the equality test
+    in the caller compared `root` against `meadow2_perf` and returned nothing.
+
+    Attributing it is CORRECT rather than a convenient guess, and the
+    distinction matters because the caller's whole purpose is refusing to
+    report somebody else's bytes. A user-scope quota on a device applies to
+    that user everywhere on the device, so it necessarily covers this path.
+    Four conditions, all required:
+
+    * the root has no fileset of its own (`fileset_is_filesystem_root`), so
+      there is no narrower scope this could be shadowing;
+    * the row is user-scoped, not fileset or group scoped;
+    * the row is device-wide, which the backend marks by naming the device as
+      the fileset;
+    * and it is the SAME device.
+
+    The figure is the user's usage across the whole device, which may be more
+    than this one directory holds, so a caveat says so and `why` prints it.
+    """
+    if not (root.policy or {}).get("fileset_is_filesystem_root"):
+        return []
+    device = getattr(root, "device", "") or ""
+    if not device:
+        return []
+    out = []  # type: List[object]
+    for row in rows:
+        if getattr(row, "scope", "") != "user":
+            continue
+        if (getattr(row, "device", "") or "") != device:
+            continue
+        if (getattr(row, "fileset", "") or "") != device:
+            continue
+        out.append(row)
+    if out and not root.policy.get("device_wide_quota"):
+        root.policy["device_wide_quota"] = True
+        root.add_note(
+            "this quota covers your usage across the whole of %s, not only this "
+            "directory, because the filesystem has no per-directory scope here" % (device,)
+        )
+    return out
 
 
 def _single_row_snapshot(source, row):
@@ -736,7 +955,7 @@ def sweep(opts, runner=None):
     _label_allocations(run)
     mark("attribute")
 
-    _attach_quota(run, budget, runner)
+    _attach_quota(run, budget, runner, measure=bool(_merge_flag(opts, "measure", False)))
     _mark_stranded(run)
     mark("quota-attach")
 
@@ -1412,6 +1631,13 @@ def _quota_source(root):
     it is stated once in the README where a reader meets the tool, and it was
     costing two lines on every single path.
     """
+    if (root.policy or {}).get("walked"):
+        # A walked figure names the walk. Without this it read `source /tmp`,
+        # because `_measure` keys its synthetic row on the path and this
+        # function's job is to name a fileset and a device: it would have
+        # presented a `du`-style sum as though a quota backend had published
+        # it, which is the one thing this field exists to prevent.
+        return "counted by walking this directory, because no quota exists here"
     row, how, _why = render_fields.pick_row(getattr(root, "quota", None), root.path, "blocks")
     if row is None:
         free = (root.policy or {}).get("free_bytes")
@@ -1683,8 +1909,8 @@ def _why(run, path, style, size=None, verbose=False):
                 style,
                 room,
                 "note",
-                "no quota is enforced here, so nobody is counting your usage: "
-                "use du or rdu for that. free is the whole filesystem, shared.",
+                "no quota is enforced here, so nothing is counting your usage. "
+                "dirscape --measure walks this directory to find out.",
             )
         )
 

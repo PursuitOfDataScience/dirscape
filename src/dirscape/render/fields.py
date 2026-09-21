@@ -624,6 +624,10 @@ def limit_cell(root, style=None):
     style = style or Style()
     row, _how = _governing(root)
     if row is None:
+        # No quota row, but the mount table may have settled it: a filesystem
+        # mounted `noquota` enforces no limit, and saying so is not a guess.
+        if (root.policy or {}).get("no_quota_enforced"):
+            return style.dim(NO_LIMIT)
         return UNKNOWN
     if row.limit is not None:
         return style.muted(human_bytes(row.limit))
@@ -961,39 +965,42 @@ def merged_policy(root, site=None):
     """
     merged = {}  # type: Dict[str, object]
     lookup = getattr(site, "policy_for", None)
-    # Keys the discovery layer stores on `root.policy` as its own bookkeeping.
-    # They are not policy and they must never reach a user-facing column: an
-    # integration run printed `rank=primary` in the POLICY cell of every row,
-    # which tells a reader nothing and looks like a leaked internal, because
-    # it is one.
+    # **An ALLOWLIST on the root's side, and it replaced a blacklist.** The
+    # POLICY column shows published policy, and `root.policy` is also where
+    # the discovery layer keeps its bookkeeping, so the two have to be told
+    # apart. Naming the bookkeeping was tried first and rotted twice: it
+    # started at `rank`, was found short by six when a 200 column run printed
+    # `crosses_to=[...]`, `contains=2`, `free_bytes=...` and `size_bytes=...`
+    # in the POLICY cell of every row, and then short by two more the moment
+    # `_device_wide` and `_measure` each set a flag. Every one of those leaks
+    # was a raw internal sitting beside its own formatted self somewhere else
+    # in the same view.
     #
-    # The list started at `rank` and was short by six. A 200 column run put
-    # `crosses_to=['/project/hpc/jdoe42']`, `contains=2`, `free_bytes=...` and
-    # `size_bytes=...` in the POLICY column, and every one of those is already
-    # rendered properly somewhere else in the same view: the fold count is the
-    # `+2` on the path, the free figure is the `886G free` in the quota
-    # column, and the crossing is the symlink note. So the column was showing
-    # raw internals beside their own formatted selves.
-    internal = (
-        "rank",
-        "rank_reason",
-        "allocation_location",
-        "allocation_accounts",
-        "allocation_gb",
-        "free_bytes",
-        "size_bytes",
-        "contains",
-        "crosses_to",
-        "fileset_is_filesystem_root",
+    # A blacklist has to be updated by whoever adds a key, which is the wrong
+    # person to rely on, so the root's side is now limited to the vocabulary
+    # `sitecfg` documents for a `[policy]` entry. Bookkeeping cannot leak by
+    # being forgotten, only by deliberately using a policy name.
+    #
+    # The SITE's side is not filtered. `sitecfg` accepts arbitrary keys there
+    # on purpose, so an administrator can publish something this package has
+    # never heard of and have it shown.
+    published_vocabulary = (
+        "purge_days",
+        "purge",
+        "backup",
+        "readonly",
+        "speed",
+        "archive",
+        "snapshots",
+        "note",
+        "label",
     )
     if callable(lookup):
         published = lookup(root.path)
         if isinstance(published, dict):
             merged.update(published)
     if root.policy:
-        merged.update(root.policy)
-    for key in internal:
-        merged.pop(key, None)
+        merged.update({k: v for k, v in root.policy.items() if k in published_vocabulary})
     return merged
 
 

@@ -301,6 +301,17 @@ def attribute_xfs(root, runner, mounts, budget=None, site=None):
         if mount.has_option("noquota") and not has_project_quota:
             note = "mounted noquota, so no project scope exists here"
             root.add_note(note)
+            # **Recorded as KNOWLEDGE, not only as a note.** `noquota` in the
+            # mount options is positive evidence that no limit is enforced
+            # here, which is a different fact from nobody having measured one,
+            # and the renderer has always kept those apart (`none` against
+            # `?`). Without the flag the limit cell read `?` on two rows where
+            # the mount table had already settled the question, which is the
+            # tool withholding something it knows.
+            #
+            # One direction only: the ABSENCE of `noquota` says nothing, so
+            # nothing is inferred from it.
+            root.policy["no_quota_enforced"] = True
             return unknown(VerdictCategory.NOT_SUPPORTED, note, source="/proc/self/mounts")
 
     tool = runner.available("xfs_io", extra_dirs=_extra_dirs(site, XFS_TOOL_DIRS))

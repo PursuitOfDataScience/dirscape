@@ -28,6 +28,8 @@ from dirscape.model import (
     refuted,
     unknown,
 )
+from dirscape.render import fields as render_fields
+from dirscape.render.style import Style
 
 
 def _root(path, fileset="", device="meadow3_cap", writable=False, reach=Reach.LISTABLE):
@@ -1376,6 +1378,157 @@ def test_every_interactive_frame_is_the_same_width():
                 sorted(widths),
                 window,
             )
+
+
+def test_a_device_wide_user_quota_reaches_a_path_with_no_fileset():
+    """One of the question marks was a bug, not a limit of the filesystem.
+
+    `/scratch/meadow2/jdoe42` read `?` for both figures while
+    `mmlsquota -u jdoe42 meadow2_perf` reported 0 used against a 100G quota.
+    Nobody was withholding it: `mmlsattr -L` calls the path's fileset `root`
+    (GPFS's name for a filesystem's own top level) and the backend labels a
+    device-wide USR row with the DEVICE, so the caller compared `root`
+    against `meadow2_perf` and matched nothing.
+
+    Attributing it is correct rather than convenient: a user-scope quota on a
+    device covers that user everywhere on the device, so it necessarily covers
+    this path.
+    """
+    row = QuotaRow(
+        "meadow2_perf", "blocks", "user", 0, soft=107_374_182_400, mount="/scratch/meadow2"
+    )
+    row.device = "meadow2_perf"
+    snap = QuotaSnapshot("mmlsquota", [row])
+
+    root = _root("/scratch/meadow2/me", fileset="root", device="meadow2_perf")
+    root.policy = {"fileset_is_filesystem_root": True}
+    assert cli._rows_governing(snap, root) == [row], "the device-wide row governs this path"
+
+    # And the caveat travels with it, because the figure is the user's usage
+    # across the whole device rather than this directory's.
+    assert any("whole of meadow2_perf" in note for note in root.notes), root.notes
+
+
+def test_a_device_wide_quota_does_not_reach_a_path_that_has_its_own_fileset():
+    """The guard that keeps the fix from becoming the leak it sits next to.
+
+    `_rows_governing` exists because a `project-hpc` row once reported its
+    11T against five other PIs' directories. A root WITH a fileset of its own
+    must never fall back to a device-wide row: the narrower scope is the
+    answer, and its absence means nothing was measured for it.
+    """
+    row = QuotaRow("meadow3_cap", "blocks", "user", 500, soft=1000, mount="/project")
+    row.device = "meadow3_cap"
+    snap = QuotaSnapshot("mmlsquota", [row])
+
+    mine = _root("/project/hpc", fileset="project-hpc", device="meadow3_cap")
+    assert cli._rows_governing(snap, mine) == [], "a real fileset is never shadowed"
+
+    # Nor does a GROUP-scoped device row qualify for a fileset-less path.
+    grouped = QuotaRow("meadow3_cap", "blocks", "group", 500, soft=1000, mount="/project")
+    grouped.device = "meadow3_cap"
+    top = _root("/gpfs/meadow3/cap", fileset="root", device="meadow3_cap")
+    top.policy = {"fileset_is_filesystem_root": True}
+    assert cli._rows_governing(QuotaSnapshot("mmlsquota", [grouped]), top) == [], (
+        "only a user-scope row can be attributed this way"
+    )
+
+
+def test_measure_walks_only_the_rows_the_view_shows(tmp_path):
+    """`--measure` answers the unknowns that no quota system can.
+
+    Owner: "do you have a way to tell the exact number? having too many ? can
+    impact user experience, and they will think you don't know things." On a
+    mount with `noquota` there is genuinely nothing to ask, so the only source
+    of truth is adding the files up, and that is offered rather than assumed.
+
+    The first version walked every discovered root and took 8.7 seconds while
+    producing no figures at all: the candidates included whole shared dataset
+    trees nobody was looking at, each burning its deadline on a partial sum
+    that was then correctly discarded. It walks the shown rows only.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "a").write_bytes(b"x" * 4096)
+    (home / "sub").mkdir()
+    (home / "sub" / "b").write_bytes(b"y" * 4096)
+
+    # A second root that the default view HOLDS BACK, standing in for the
+    # shared dataset trees the first version walked. Without it this test
+    # passes whether the scope is `shown` or `run.roots`, because they are the
+    # same list, and the defect it guards is precisely that they are not.
+    other = tmp_path / "shared"
+    other.mkdir()
+    (other / "big").write_bytes(b"q" * 8192)
+
+    run = cli.Run()
+    root = _root(str(home))
+    root.role = "home"
+    root.quota = None
+    root.writable = confirmed()
+    secondary = _root(str(other))
+    secondary.role = "dataset"
+    secondary.quota = None
+    secondary.policy = {"rank": "secondary"}
+    run.roots = [root, secondary]
+
+    cli._measure(run)
+
+    assert secondary.quota is None, (
+        "a root the default view holds back must not be walked: that is what made "
+        "the first version take 8.7 seconds on shared dataset trees"
+    )
+    assert root.quota is not None, "a walk must produce a figure"
+    used, _caveat = render_fields.used_cell(root, Style())
+    assert "?" not in used, "the unknown must be gone: %r" % (used,)
+    assert root.inode_quota is not None
+    assert "2" in render_fields.file_count_cell(root, Style()), "two files were counted"
+    # Uncapped, not unmeasured: walking says how much is there and there is no
+    # ceiling on a filesystem with no quota system.
+    assert render_fields.plain(render_fields.limit_cell(root, Style())) == "none"
+
+
+def test_a_walk_that_runs_out_of_time_leaves_the_unknown_alone(tmp_path):
+    """A partial sum reported as a total is worse than no number at all."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for index in range(40):
+        part = home / ("d%d" % index)
+        part.mkdir()
+        (part / "f").write_bytes(b"z" * 512)
+
+    run = cli.Run()
+    root = _root(str(home))
+    root.role = "home"
+    root.quota = None
+    run.roots = [root]
+
+    saved = cli.WALK_SECONDS
+    cli.WALK_SECONDS = -1.0  # already past the deadline on the first check
+    try:
+        cli._measure(run)
+    finally:
+        cli.WALK_SECONDS = saved
+
+    assert root.quota is None, "an unfinished walk must not publish a figure"
+    assert any("did not finish" in note for note in root.notes), root.notes
+
+
+def test_noquota_in_the_mount_options_is_knowledge_not_a_shrug(tmp_path):
+    """`none` and `?` are different facts, and the mount table settles one.
+
+    A filesystem mounted `noquota` enforces no limit. That is knowledge, so
+    the limit cell says `none`; without the flag it read `?` on two rows where
+    the mount table had already answered, which is the tool withholding what
+    it knows. The absence of `noquota` implies nothing and nothing is inferred
+    from it.
+    """
+    bare = _root("/tmp/whatever")
+    assert render_fields.plain(render_fields.limit_cell(bare, Style())) == "?"
+
+    known = _root("/tmp/whatever")
+    known.policy = {"no_quota_enforced": True}
+    assert render_fields.plain(render_fields.limit_cell(known, Style())) == "none"
 
 
 def test_the_detail_view_is_fields_and_not_paragraphs():

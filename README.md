@@ -35,6 +35,10 @@ dataset  /project2/reference      r-x      23T / no limit
 
 Nine lines of table. Everything else is one line with a command to see more.
 
+**In a terminal it is interactive**, like `nodetop`: arrows or `jkl` move a highlight down
+the rows you are already looking at, Enter opens the one you want, `q` leaves. Piped,
+redirected or under `--json` it prints the table above and nothing else.
+
 ## 🚀 Install
 
 ```bash
@@ -54,6 +58,7 @@ dirscape                      # no flags, no config, no setup
 | `dirscape matrix` | Yes / no / **could not determine**, per capability |
 | `dirscape tree` | Which filesets share a device, and symlinks that cross a quota |
 | `dirscape --json` | The same facts, with a reason code on every unknown |
+| `dirscape --legend` | Explain the reach letters and the bar marks |
 
 ## ⚠️ What will bite you
 

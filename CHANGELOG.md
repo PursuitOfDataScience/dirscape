@@ -160,6 +160,43 @@ could itself be folded away; the outermost surviving ancestor takes the count,
 measured on a four-level tree that reported 4 folded rows against a surviving
 count of 3.
 
+### Interactive, and it degrades to the printout
+
+In a terminal the table is now browsable: arrows or `jkl` move a highlight down
+the rows already on screen, Enter opens `why` for the selected row, `q` leaves.
+Piped, redirected, under `--json`, replaying a transcript, in a dumb terminal,
+in a window under ten lines, or on a platform without `termios`, it prints the
+static report. `supported()` is the single gate and `DIRSCAPE_NO_INTERACTIVE=1`
+pins the print for a script or a recording.
+
+Built the way `nodetop` built its own, and for its reasons: no dependencies,
+because this runs on a login node where a full-screen library is not
+installable at the moment it is needed; and **no second renderer**, because
+nothing in the interactive path renders anything. It takes the finished lines
+and paints one in inverse video, so the browsable view cannot drift from the
+printed one.
+
+The key semantics deliberately match `nodetop`'s so a user with both tools does
+not learn two sets of arrows, including the two lessons that package learned
+from being used: **Left at the root does nothing** (it used to return, and
+returning at the root exits, so one stray press took the whole program down)
+and **Right at a leaf does nothing** (it used to return the index, which a
+caller with nothing to open read as "step back", bouncing the reader into the
+view they were already in). Both have a test.
+
+Inverse video rather than a colour, because it survives `NO_COLOR`, a
+16-colour console and a light background alike, and does not collide with the
+colours the table already uses to mean something. The cursor is hidden for the
+duration, since a block cursor parked mid-table reads as a second, wrong
+highlight, and the terminal mode is restored on every exit path including
+`Ctrl-C`: a tool that leaves a login node without echo has done more damage
+than the report was worth.
+
+46 tests, including a **real pty** that proves the escape sequences land, a row
+gets highlighted, a frame gets erased, the drill-down opens and the cursor is
+restored. Scripted readers verify the logic and can say nothing about any of
+that.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

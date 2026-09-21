@@ -32,7 +32,7 @@ import sys
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import __version__
+from . import __version__, interactive
 from .discover import (
     RANK_PRIMARY,
     attribute_all,
@@ -1289,6 +1289,97 @@ def _write(text):
         raise
 
 
+def _browse(run, opts, style, width):
+    # type: (Run, argparse.Namespace, object, Optional[int]) -> int
+    """The atlas, with a highlight you can move and open.
+
+    Two levels: the table, and `why` for the row you open. The block is
+    rendered once per keypress by the SAME renderer the static print uses, so
+    the interactive view cannot drift from the printed one; the only thing
+    this adds is inverse video on one line.
+
+    Falls back to printing on anything unexpected. A browse that fails should
+    leave the user with the report, not with a traceback where the report was.
+    """
+    show_all = bool(_merge_flag(opts, "all", False))
+    roots, hidden = _visible(run, show_all)
+    changes = list(run.changes or [])
+    legend_on = bool(_merge_flag(opts, "legend", False))
+
+    def frame(cursor):
+        # type: (int) -> List[str]
+        text = render_atlas(
+            roots,
+            meta=run.meta,
+            changes=changes,
+            site=run.site,
+            style=style,
+            size=width,
+            hidden=hidden,
+            legend_on=legend_on,
+            all_roots=run.roots,
+            group=not show_all,
+        )
+        lines = text.splitlines()
+        # The cursor indexes ROOTS, and the block has a header, a blank line,
+        # a column header and a rule above the first row. Located by matching
+        # the row's own path rather than by counting chrome, because the
+        # chrome changes with the window and a counted offset would put the
+        # highlight on the wrong line at the one width nobody tested.
+        target = roots[cursor].path or (roots[cursor].policy or {}).get("allocation_location", "")
+        for position, line in enumerate(lines):
+            if target and target in line:
+                return interactive.highlight(lines, position)
+        return lines
+
+    footer = [
+        "",
+        style.dim(
+            "  %s move   %s open   %s quit"
+            % (
+                style.accent("up/down"),
+                style.accent("enter"),
+                style.accent("q"),
+            )
+        ),
+    ]
+
+    cursor = 0
+    while True:
+        chosen = interactive.select(
+            lambda i: frame(i) + footer,
+            len(roots),
+            initial=cursor,
+            escapable=False,
+        )
+        if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
+            return EXIT_OK
+        cursor = int(chosen)  # type: ignore[arg-type]
+        root = roots[cursor]
+        detail, _ = _why(run, root.path or "/", style)
+        lines = detail.splitlines() + [
+            "",
+            style.dim("  %s back   %s quit" % (style.accent("left"), style.accent("q"))),
+        ]
+        # openable=False: this is the bottom, and Right here would otherwise
+        # read as "step back" and bounce the reader into the same view again.
+        # `block` is bound as a default rather than captured: `lines` is
+        # reassigned on every pass of this loop, and a closure over it would
+        # show whichever frame the loop last reached. It happens to work today
+        # only because `select` is called immediately, which is exactly the
+        # kind of accident that survives until somebody adds a line between
+        # the two.
+        outcome = interactive.select(
+            lambda i, block=lines: block,
+            1,
+            initial=0,
+            escapable=True,
+            openable=False,
+        )
+        if outcome == interactive.Key.QUIT:
+            return EXIT_OK
+
+
 def main(argv=None):
     # type: (Optional[Sequence[str]]) -> int
     parser = build_parser()
@@ -1329,6 +1420,23 @@ def main(argv=None):
         return EXIT_NOTHING
 
     width = None
+
+    # Interactive when there is somebody to type at it and nothing that would
+    # be broken by a repaint: never under `--json`, never when replaying a
+    # transcript, and never for a view whose whole output is one paragraph.
+    if (
+        command == "atlas"
+        and not _merge_flag(opts, "json", False)
+        and not _merge_flag(opts, "replay", None)
+        and interactive.supported()
+    ):
+        try:
+            return _browse(run, opts, style, width)
+        except Exception:
+            # Fall through to the static print. A failed browse must leave the
+            # user holding the report.
+            pass
+
     text, code = _render(run, opts, command, style, width)
     _write(text)
 

@@ -324,6 +324,19 @@ def _apply_plugin_defaults(site, plugins):
                         current.append(item)
 
 
+def _owned_by_caller(path):
+    # type: (str) -> bool
+    """Whether this process's uid owns the directory.
+
+    A measurement, not a name match. `/project/hpc/jdoe42` being named after
+    the user is a convention of one site; owning it is a fact everywhere.
+    """
+    try:
+        return os.stat(path).st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def _attach_quota(run, budget, runner):
     # type: (Run, Budget, object) -> None
     """Give every root the quota reading that actually governs it.
@@ -370,7 +383,9 @@ def _attach_quota(run, budget, runner):
     # exact collision `QuotaRow.label` qualifies against, made in the consumer
     # after the model had already warned about it.
     junction = {}  # type: Dict[Tuple[str, str], str]
+    accessible = {}  # type: Dict[Tuple[str, str], str]
     owned = {}  # type: Dict[Tuple[str, str], str]
+    writable_only = {}  # type: Dict[Tuple[str, str], str]
     for root in run.roots:
         name = getattr(root, "fileset", "") or ""
         path = getattr(root, "path", "") or ""
@@ -380,19 +395,42 @@ def _attach_quota(run, budget, runner):
         current = junction.get(key)
         if current is None or len(path) < len(current):
             junction[key] = path
-        # "Yours" is decided by measured write access, never by a name match
-        # against the username, which would be wrong for a shared group
-        # directory and for anyone whose directory is not named after them.
+        # "Yours" is decided by measured OWNERSHIP first and write access
+        # second, never by a name match against the username, which would be
+        # wrong for a shared group directory and for anyone whose directory is
+        # not named after them.
         #
-        # The HIGHEST writable point, not the deepest. Deepest was tried and
-        # is absurd: in fileset `project-hpc` the deepest writable path is
-        # `/project/hpc/jdoe42/.cache/tmp`, so an 11T figure landed on a cache
-        # directory. The highest writable point is the top of the subtree the
-        # figure actually describes.
-        if getattr(root, "writable", None) is not None and root.writable.confirmed:
-            highest = owned.get(key)
-            if highest is None or len(path) < len(highest):
-                owned[key] = path
+        # Ownership matters because the figure is user-scoped: it is YOUR
+        # usage. `/project/hpc` is owned by uid 0 and `/project/hpc/jdoe42` by
+        # the caller, so putting the 11T on the former says the group holds
+        # 11T, which is a different and wrong claim. An earlier version keyed
+        # on write access alone, and the moment the write probe started
+        # answering for group directories the figure jumped up a level.
+        #
+        # Shallowest of the owned candidates, because the figure describes a
+        # whole subtree. Deepest was tried and is absurd: it put the 11T on
+        # `/project/hpc/jdoe42/.cache/tmp`.
+        # The figure must land on the SAME root the table decides to show,
+        # which is the highest fully-accessible directory in the subtree. When
+        # these two rules disagreed the number vanished: the quota attached to
+        # `/project/hpc/jdoe42` on an ownership preference while the table
+        # kept `/project/hpc`, so the 11T was folded out of sight and the row
+        # fell back to the filesystem's free space.
+        #
+        # Ownership is kept as the tie-break below it, for the case where no
+        # root in the fileset is fully accessible and the choice is between
+        # somebody else's directory and your own.
+        if _full_access(root):
+            best = accessible.get(key)
+            if best is None or len(path) < len(best):
+                accessible[key] = path
+        writable = getattr(root, "writable", None)
+        if writable is not None and writable.confirmed:
+            mine = _owned_by_caller(path)
+            bucket = owned if mine else writable_only
+            best = bucket.get(key)
+            if best is None or len(path) < len(best):
+                bucket[key] = path
 
     for root in run.roots:
         if not getattr(root, "path", ""):
@@ -408,7 +446,9 @@ def _attach_quota(run, budget, runner):
         key = (getattr(root, "device", "") or "", name)
         scopes = {row.scope for row in rows}
         if name and scopes and scopes <= {"user"}:
-            owner = owned.get(key) or junction.get(key)
+            owner = (
+                accessible.get(key) or owned.get(key) or writable_only.get(key) or junction.get(key)
+            )
         else:
             owner = junction.get(key)
         if name and owner and owner != root.path:
@@ -423,6 +463,40 @@ def _attach_quota(run, budget, runner):
             root.quota = _single_row_snapshot(snap, blocks[0])
         if files:
             root.inode_quota = _single_row_snapshot(snap, files[0])
+
+    _attach_capacity(run)
+
+
+def _attach_capacity(run):
+    # type: (Run) -> None
+    """Last resort for a root no quota backend could speak for: `statvfs`.
+
+    Four rows of the default view were a bare `?`: `/tmp`, `/.nodelog/log`,
+    `/scratch/local/jdoe42` and one GPFS scratch the wrapper could not
+    attribute. Two of those are XFS mounted `noquota`, so no quota exists to
+    read and `?` was the literal truth and useless anyway: the filesystem
+    knows exactly how much room is left and `df` prints it.
+
+    Stored as free BYTES rather than as a quota row, and rendered as
+    "<n> free" rather than as `used / limit`, because it is not your usage.
+    It is the whole filesystem's headroom, shared with everyone else on the
+    node. Labelling it as a quota would be the fabrication this tool exists to
+    avoid; withholding it when `df` would answer is just unhelpful.
+    """
+    for root in run.roots:
+        if root.quota is not None or not root.path:
+            continue
+        if not root.present.confirmed:
+            continue
+        try:
+            stats = os.statvfs(root.path)
+        except OSError:
+            continue
+        if not stats.f_frsize or stats.f_blocks <= 0:
+            continue
+        root.policy = dict(root.policy or {})
+        root.policy["free_bytes"] = int(stats.f_bavail) * int(stats.f_frsize)
+        root.policy["size_bytes"] = int(stats.f_blocks) * int(stats.f_frsize)
 
 
 def _rows_governing(snap, root):
@@ -787,38 +861,119 @@ def _says_something(root):
     return False
 
 
+def _nearest_ancestor(path, paths):
+    # type: (str, set) -> str
+    """The closest strict ancestor of ``path`` that is itself a root, or "".
+
+    Walks up rather than testing `dirname` once, because the intermediate
+    directories of a deep path are usually not roots themselves: nothing
+    discovered `/project/hpc/jdoe42/.cache`, so its child could never find
+    `/project/hpc`.
+    """
+    if not path or path == "/":
+        return ""
+    current = path.rstrip("/")
+    while True:
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            return ""
+        if parent in paths:
+            return parent
+        current = parent
+
+
+def _full_access(root):
+    # type: (object) -> bool
+    """Whether this root is yours outright: listable and writable."""
+    writable = getattr(root, "writable", None)
+    return (
+        getattr(root, "reach", None) == Reach.LISTABLE
+        and writable is not None
+        and writable.confirmed
+    )
+
+
 def _collapse_families(roots):
     # type: (List[object]) -> Tuple[List[object], int]
-    """Fold a run of child roots into the parent that already carries them.
+    """Keep the HIGHEST directory you have full access to, and stop there.
 
-    `/project2/reference` has twenty collection directories under it, all in
-    one fileset, so the parent holds the only quota figure and each child is a
-    `?`. Twenty rows for one fact is the single worst case in the default view.
+    The rule a reader actually wants, and the one that scales. If you have
+    full access to `/project/xyz` then `/project/xyz` is the answer and its
+    subdirectories are an implementation detail of your own filing. The table
+    should say "this whole tree is yours" in one row rather than enumerate it.
 
-    The parent keeps a count so the information is not lost, and `--all` still
-    lists them.
+    A descendant survives only when it says something its ancestor does not:
+
+    * the ancestor is NOT fully accessible, so the subtree is not uniformly
+      yours and the reachable parts are the real answer (a PI directory you
+      can read but not write, with one writable subdirectory in it);
+    * the descendant carries a delta or a stranded flag;
+    * the descendant is on a different device or fileset, so it is a different
+      piece of storage that merely happens to be mounted underneath.
+
+    That last exception matters more than it looks: `/scratch` is a plain
+    directory holding three clusters' filesystems, so a rule that folded on
+    path alone would hide two of them behind the first.
+
+    Three earlier rules each left `?` rows behind and are recorded so they are
+    not retried: immediate-parent folding missed
+    `/project/hpc/jdoe42/.cache/tmp`, whose intervening directory nothing
+    discovered; ancestor folding missed `/project/hpc`, whose figure sits on a
+    descendant; and keying on "who holds the fileset's figure" hid a
+    perfectly good directory whenever the figure landed on a sibling.
     """
-    paths = {r.path for r in roots if getattr(r, "path", "")}
-    kept = []  # type: List[object]
-    folded = {}  # type: Dict[str, int]
-
+    covered = {}  # type: Dict[str, object]
     for root in roots:
         path = getattr(root, "path", "")
-        parent = os.path.dirname(path.rstrip("/")) if path else ""
-        # Folded only when the PARENT is itself a discovered root and this
-        # child has nothing of its own to say. A child with its own quota or
-        # its own delta is never hidden behind a count.
-        if parent and parent in paths and parent != path and not _says_something(root):
-            folded[parent] = folded.get(parent, 0) + 1
+        if path and _full_access(root):
+            covered[path.rstrip("/") or "/"] = root
+
+    kept = []  # type: List[object]
+    folded = {}  # type: Dict[str, int]
+    for root in roots:
+        path = getattr(root, "path", "")
+        host = ""
+        if path:
+            # The OUTERMOST accessible ancestor, not the nearest. `_ancestors`
+            # returns nearest first, so the loop keeps going rather than
+            # breaking: a nearer ancestor may itself be folded away, and its
+            # count would vanish with it. Measured on a four-level tree, the
+            # nearest-match version reported 4 folded rows while the surviving
+            # row's own count read 3.
+            for ancestor in _ancestors(path):
+                owner = covered.get(ancestor)
+                if owner is None or owner is root:
+                    continue
+                same_storage = getattr(owner, "device", "") == getattr(
+                    root, "device", ""
+                ) and getattr(owner, "fileset", "") == getattr(root, "fileset", "")
+                if same_storage:
+                    host = ancestor
+        speaks = getattr(root, "labels", None) or getattr(root, "stranded", False)
+        if host and not speaks:
+            folded[host] = folded.get(host, 0) + 1
             continue
         kept.append(root)
 
     for root in kept:
-        count = folded.get(getattr(root, "path", ""))
+        count = folded.get(getattr(root, "path", "").rstrip("/") or "/")
         if count:
             root.policy = dict(root.policy or {})
             root.policy["contains"] = count
     return kept, sum(folded.values())
+
+
+def _ancestors(path):
+    # type: (str) -> List[str]
+    """Every strict ancestor of a path, nearest first."""
+    out = []  # type: List[str]
+    current = path.rstrip("/")
+    while True:
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            return out
+        out.append(parent)
+        current = parent
 
 
 def _visible(run, show_all):

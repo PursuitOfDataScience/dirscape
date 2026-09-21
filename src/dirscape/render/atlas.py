@@ -144,11 +144,24 @@ def _align_figures(blocks, index):
     `len`, since the cells carry colour and block characters.
     """
     parts = []  # type: List[Optional[Tuple[str, str, str]]]
+    # The third element is the limit token for a quota figure and the trailing
+    # word for a capacity fallback; the middle element says which.
     for block in blocks:
         for row in block:
             cell = row[index]
             head, sep, tail = cell.partition(" / ")
-            parts.append((head, sep, tail) if sep else None)
+            if sep:
+                parts.append((head, sep, tail))
+                continue
+            # A capacity fallback reads "886G free" and has no separator, so
+            # the split above skips it and the number sits hard against the
+            # column edge while every quota figure is right-aligned. Treated
+            # as a figure with an empty limit so it joins the same column.
+            bare, space, word = cell.rpartition(" ")
+            if space and word == "free":
+                parts.append((bare, "", word))
+                continue
+            parts.append(None)
 
     lead = max([measure(p[0]) for p in parts if p] or [0])
     # The limit is padded to the widest limit TOKEN, not the widest tail: the
@@ -167,16 +180,16 @@ def _align_figures(blocks, index):
             cursor += 1
             if not p:
                 continue
-            head, _, tail = p
+            head, sep, tail = p
+            pad = " " * max(0, lead - measure(head))
+            if not sep:
+                # The capacity fallback: aligned on the number, and the word
+                # follows it rather than a limit.
+                row[index] = "%s%s %s" % (pad, head, tail)
+                continue
             token, gap, rest = tail.partition("  ")
             padded = token + " " * max(0, room - measure(token))
-            row[index] = "%s%s / %s%s%s" % (
-                " " * max(0, lead - measure(head)),
-                head,
-                padded,
-                gap,
-                rest,
-            )
+            row[index] = "%s%s / %s%s%s" % (pad, head, padded, gap, rest)
 
 
 def _constant_columns(rows):
@@ -361,7 +374,7 @@ def _notes(roots, caveats, style):
     return lines
 
 
-def _footer(roots, style, dropped, window, hidden=0, legend_on=False):
+def _footer(roots, style, dropped, window, hidden=0, legend_on=False, notes=0):
     # type: (Sequence[Root], Style, Sequence[str], int, int, bool) -> List[str]
     """At most two lines, and often none.
 
@@ -576,23 +589,11 @@ def render(
             pad = " " * max(1, room - measure(text) + 3)
             out.append("  %s%s%s" % (text, pad, style.accent(command)))
 
-    notes = _notes(roots, caveats, style)
-    if notes:
-        # A count and a pointer. The notes themselves are per-root detail and
-        # `why` is where per-root detail belongs.
-        out.append("")
-        out.append(
-            style.dim(
-                "  %d note%s (%s)"
-                % (
-                    len(notes),
-                    "" if len(notes) == 1 else "s",
-                    style.accent("dirscape why <path>"),
-                )
-            )
-        )
-
-    tail = _footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on)
+    # The note count joins the footer rather than claiming a line of its own.
+    # Two separate one-line advisories both ending in `dirscape why <path>` is
+    # the same sentence twice.
+    notes = len(_notes(roots, caveats, style))
+    tail = _footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on, notes=notes)
     if tail:
         out.extend(tail)
     return "\n".join(out)

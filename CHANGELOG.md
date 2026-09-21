@@ -111,6 +111,55 @@ purpose-built rather than a table, because with no path there is nothing to
 stat and every column the table would draw is the unknown mark; it lists the
 account, the location and the size the allocation database published.
 
+### Default view, second pass: no question marks, and one row per tree
+
+The 20-line view still had two problems a reader named immediately: things did
+not line up, and a column of `?` was confusing. Both are fixed, and the row
+selection was rebuilt on a rule that scales.
+
+- **Show the highest directory you have full access to, and stop.** If the
+  whole of `/project/xyz` is yours, that is the answer; enumerating your own
+  filing is not information. A descendant survives only when it says something
+  its ancestor cannot: the ancestor is not fully accessible (a PI directory you
+  can read but not write, with one writable subdirectory in it), or the
+  descendant carries a delta, or it sits on a different device or fileset and
+  is therefore different storage that merely happens to be mounted underneath.
+  Three earlier rules are recorded in the code so they are not retried.
+- **`os.access(W_OK)` now answers instead of shrugging.** Returning
+  `NOT_PROBED` for a directory somebody else owns printed `r?x` against every
+  group directory on the cluster, trading an answer the tool has for a question
+  mark about a root-squashed export this site does not have. The caveat moved
+  into the reason and `--probe-write` still settles it by writing. uid 0 stays
+  unknown, because uid 0 is the identity that hazard is actually about.
+- **`statvfs` answers where no quota exists.** `/tmp`, `/.nodelog/log` and the
+  node-local scratch are XFS mounted `noquota`, so `?` was the literal truth
+  and useless: `df` knows the headroom. Shown as "886G free", never as
+  `used / limit`, because it is the whole filesystem's room and not your usage.
+- **The footer stopped contradicting the table**, which claimed "4 unmeasured"
+  while every row showed a figure.
+
+Alignment, all of it measured against the rendered output:
+
+- Percentages are width 3, so 3%, 22% and 100% share a right edge instead of
+  forming a ragged fringe.
+- The capacity fallback joins the figure column instead of sitting hard against
+  the column edge while every quota figure was right-aligned.
+- The in-doubt mark is drawn ONCE, on the used figure. It was appended after
+  the limit as well, so `11T / no limit▒` read as a mark against the limit or
+  as a typo, and `836M / 30G ▎▒░░░░░░ 3%▒` marked one fact twice.
+- The note count joined the footer rather than claiming its own line, since
+  two one-line advisories both ending in `dirscape why <path>` is the same
+  sentence twice.
+
+Two bugs found while doing it. The quota owner and the row selection have to
+agree or the figure disappears: the quota attached to `/project/hpc/jdoe42` on
+an ownership preference while the table kept `/project/hpc`, so the 11T was
+folded out of sight and the row fell back to free space. And nested folding
+lost counts, because a child folded into its NEAREST accessible ancestor, which
+could itself be folded away; the outermost surviving ancestor takes the count,
+measured on a four-level tree that reported 4 folded rows against a surviving
+count of 3.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

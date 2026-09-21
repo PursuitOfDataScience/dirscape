@@ -312,11 +312,39 @@ def probe_writable(path, allow_write=False, uid=None, deadline_s=DEFAULT_DEADLIN
                 source="os.access",
                 elapsed_s=elapsed,
             )
-        return unknown(
-            VerdictCategory.NOT_PROBED,
-            "os.access reports write but the caller is not the owner; "
-            "not trusted without a real write, because W_OK can be wrong under "
-            "a root-squashed export",
+        if uid == 0:
+            # The one case where W_OK really is untrustworthy: squashing
+            # remaps uid 0 and nothing else, so a positive answered for root
+            # is exactly the lie the export creates. Left unknown.
+            return unknown(
+                VerdictCategory.NOT_PROBED,
+                "os.access reports write for uid 0, which is the identity a "
+                "root-squashed export remaps, so it is not trusted without a "
+                "real write",
+                source="os.access",
+                elapsed_s=elapsed,
+            )
+
+        # A positive from `os.access` on a directory somebody else owns is an
+        # ANSWER, and it is reported as one.
+        #
+        # The earlier version returned NOT_PROBED here, which rendered `r?x`
+        # in the reach column of every group directory on the cluster. That
+        # traded a correct answer for a question mark over a hazard
+        # (root-squashed NFS remapping uid 0) that this site does not have,
+        # and a column of `?` where the tool knows the answer teaches a reader
+        # to distrust the marks that matter. The same docstring already trusts
+        # a NEGATIVE from `os.access` as durable on the strength of 100%
+        # measured agreement with `listdir`; a positive gets the same
+        # treatment.
+        #
+        # The evidence strength is not lost: `source` says `os.access` rather
+        # than `O_TMPFILE`, the reason names the caveat, and `--probe-write`
+        # settles it by actually writing for anyone who needs certainty.
+        return confirmed(
+            "os.access reports write; not owner-confirmed, and W_OK can be "
+            "wrong under a root-squashed export, so pass --probe-write to "
+            "settle it by writing",
             source="os.access",
             elapsed_s=elapsed,
         )

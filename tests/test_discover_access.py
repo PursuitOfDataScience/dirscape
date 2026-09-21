@@ -231,26 +231,37 @@ def test_the_default_answers_only_for_a_directory_you_own(tmp_path):
     assert "owns" in verdict.reason
 
 
-def test_the_default_refuses_to_trust_w_ok_for_a_directory_you_do_not_own(tmp_path):
-    """Because ``os.access(W_OK)`` lies under a root-squashed export.
+def test_w_ok_answers_for_a_directory_you_do_not_own(tmp_path):
+    """It ANSWERS, and carries the caveat in the reason rather than in the value.
 
-    The client evaluates the mode bits locally and the server then refuses the
-    write, so the answer is yes and the write fails. Ownership is what removes
-    the ambiguity, since squashing remaps uid 0 and nothing else. That
-    configuration is not present on this cluster and is present at other sites,
-    which is exactly when to be careful rather than to wait for the bug report.
+    This deliberately reverses an earlier decision. Returning NOT_PROBED here
+    rendered `r?x` in the reach column of every group directory on the
+    cluster, trading an answer the tool has for a question mark about a hazard
+    (a root-squashed export remapping uid 0) that this site does not have. A
+    column of `?` where the tool knows the answer teaches a reader to distrust
+    the marks that matter.
+
+    The evidence strength is not lost: `source` says `os.access` rather than
+    `O_TMPFILE`, the reason names the caveat, and `--probe-write` settles it by
+    writing. The same function already trusted a NEGATIVE from `os.access` as
+    durable on the strength of 100% measured agreement with `listdir`.
     """
     verdict = probe_writable(str(tmp_path), uid=os.getuid() + 12345)
-    assert verdict.category == VerdictCategory.NOT_PROBED
-    assert verdict.value is None
-    assert verdict.known is False
+    assert verdict.confirmed is True
+    assert verdict.source == "os.access"
     assert "root-squashed" in verdict.reason
+    assert "--probe-write" in verdict.reason
 
 
 def test_the_default_never_trusts_w_ok_for_root(tmp_path):
-    """uid 0 is the identity squashing remaps, so it is never unambiguous."""
+    """uid 0 is the identity squashing remaps, so it is never unambiguous.
+
+    The control for the test above: a non-root caller now gets an answer, and
+    root still does not, because root is the one identity the hazard is about.
+    """
     verdict = probe_writable(str(tmp_path), uid=0)
     assert verdict.category == VerdictCategory.NOT_PROBED
+    assert verdict.value is None
 
 
 @skip_if_root

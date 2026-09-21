@@ -418,34 +418,106 @@ def test_a_summarised_row_is_not_also_tabled():
     assert cli._says_something(elsewhere) is False
 
 
-def test_a_family_of_silent_children_folds_into_its_parent():
-    """`/project2/reference` has twenty collections in one fileset, so the
-    parent holds the only figure and each child is a `?`. Twenty rows for one
-    fact was the worst case in the default view.
+def _mine(root):
+    """Full access: listable and confirmed writable."""
+    root.reach = Reach.LISTABLE
+    root.writable = confirmed()
+    return root
+
+
+def test_the_highest_directory_you_fully_own_is_the_only_row():
+    """If the whole tree is yours, the tree is the answer.
+
+    Enumerating your own filing is not information. One row saying "this is
+    yours" scales to a project with ten thousand subdirectories; a row per
+    subdirectory does not.
     """
-    parent = _measured(_root("/project2/reference", "project2-reference"))
+    top = _mine(_measured(_root("/project/xyz", "project-xyz")))
     children = [
-        _root("/project2/reference/%s" % name, "project2-reference")
-        for name in ("newsome", "brook", "pdb", "gtdb")
+        _mine(_root("/project/xyz/%s" % name, "project-xyz"))
+        for name in ("data", "code", "runs/2026", "data/raw/batch1")
     ]
 
-    kept, folded = cli._collapse_families([parent] + children)
+    kept, folded = cli._collapse_families([top] + children)
 
-    assert [r.path for r in kept] == ["/project2/reference"]
+    assert [r.path for r in kept] == ["/project/xyz"]
     assert folded == 4
-    assert parent.policy["contains"] == 4
+    assert top.policy["contains"] == 4
 
 
-def test_a_child_with_something_to_say_is_never_folded():
+def test_when_the_parent_is_not_fully_yours_the_reachable_parts_are_shown():
+    """The case that makes the rule right rather than merely short.
+
+    A PI directory you can read but not write is not "yours", so folding your
+    one writable subdirectory into it would hide the only place in that tree
+    you can actually put data.
+    """
+    pi = _root("/project/theirs", "project-theirs", reach=Reach.LISTABLE)
+    pi.writable = refuted(VerdictCategory.ACCESS_DENIED, "not in the group")
+    mine = _mine(_measured(_root("/project/theirs/shared", "project-theirs")))
+
+    kept, folded = cli._collapse_families([pi, mine])
+
+    assert [r.path for r in kept] == ["/project/theirs", "/project/theirs/shared"]
+    assert folded == 0
+
+
+def test_a_child_on_different_storage_is_never_folded():
+    """`/scratch` is a plain directory holding three clusters' filesystems.
+
+    Folding on path alone would hide two of them behind the first, which is
+    the same conflation that makes `/scratch` not a filesystem.
+    """
+    parent = _mine(_measured(_root("/scratch", "scratch", device="meadow3_perf")))
+    other = _mine(_measured(_root("/scratch/collie3/me", "scratch", device="collie3_perf")))
+
+    kept, folded = cli._collapse_families([parent, other])
+
+    assert len(kept) == 2, "a different device is different storage"
+    assert folded == 0
+
+
+def test_a_child_with_a_delta_is_never_folded():
     """The count is a summary of silence, not of content."""
-    parent = _measured(_root("/project2/reference", "project2-reference"))
-    loud = _measured(_root("/project2/reference/newsome", "project2-newsome"))
-    quiet = _root("/project2/reference/pdb", "project2-reference")
+    top = _mine(_measured(_root("/project/xyz", "project-xyz")))
+    changed = _mine(_root("/project/xyz/new", "project-xyz"))
+    changed.labels = ["new"]
 
-    kept, folded = cli._collapse_families([parent, loud, quiet])
+    kept, folded = cli._collapse_families([top, changed])
 
-    assert "/project2/reference/newsome" in [r.path for r in kept]
-    assert folded == 1
+    assert "/project/xyz/new" in [r.path for r in kept]
+    assert folded == 0
+
+
+def test_a_stranded_child_is_never_folded():
+    top = _mine(_measured(_root("/project/xyz", "project-xyz")))
+    held = _root("/project/xyz/gone", "project-xyz", reach=Reach.CLOSED)
+    held.stranded = True
+
+    kept, _ = cli._collapse_families([top, held])
+
+    assert "/project/xyz/gone" in [r.path for r in kept]
+
+
+def test_the_figure_lands_on_the_row_the_table_keeps():
+    """These two rules have to agree or the number disappears.
+
+    The quota once attached to `/project/hpc/jdoe42` on an ownership
+    preference while the table kept `/project/hpc`, so the figure was folded
+    out of sight and the row fell back to showing the filesystem's free space.
+    """
+    run = cli.Run()
+    top = _mine(_root("/project/hpc", "project-hpc"))
+    sub = _mine(_root("/project/hpc/jdoe42", "project-hpc"))
+    run.roots = [sub, top]
+    row = QuotaRow("project-hpc", "blocks", "user", 11_000_000, mount="/project", guessed=True)
+    run.quota_attempts = [QuotaSnapshot("mmlsquota", [row])]
+
+    cli._attach_quota(run, budget=None, runner=None)
+    kept, _ = cli._collapse_families(run.roots)
+
+    assert top.quota is not None, "the figure belongs on the row that survives"
+    assert [r.path for r in kept] == ["/project/hpc"]
 
 
 def test_the_default_view_orders_by_role_not_by_mount_table():

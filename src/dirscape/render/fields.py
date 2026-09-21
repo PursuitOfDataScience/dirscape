@@ -421,6 +421,17 @@ def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
     # type: (Root, Optional[QuotaSnapshot], str, object, Style, int, bool) -> Tuple[str, str]
     row, how, why = pick_row(snapshot, root.path, kind)
     if row is None:
+        # No quota to report. Before giving up, say what the FILESYSTEM has
+        # left, when something measured it: a `?` where `df` would answer is
+        # technically true and practically useless.
+        #
+        # Rendered as "<n> free", never as `used / limit`, because this is the
+        # whole filesystem's headroom shared with every other user on the
+        # node, and not this caller's usage. Dimmed so a reader scanning the
+        # column can see at a glance which figures are theirs.
+        free = (root.policy or {}).get("free_bytes")
+        if kind == "blocks" and isinstance(free, int) and free >= 0:
+            return style.muted("%s free" % (human_bytes(free),)), ""
         # The whole point of the package: no figure, no invented figure. The
         # caveat is empty rather than carrying `why`, because a caveat
         # qualifies a figure that WAS shown. Why a figure is missing is a
@@ -429,6 +440,11 @@ def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
         return UNKNOWN, ""
     g = style.g
     used = formatter(row.used)  # type: ignore[operator]
+    # The doubt marker goes on the USED figure, because usage is what is in
+    # doubt. Appended after the limit it produced `11T / no limit▒`, which
+    # reads as a mark against the limit or simply as a typo.
+    if row.in_doubt:
+        used = "%s%s" % (used, style.muted(g.doubt))
     text = "%s / %s" % (used, _limit_text(row, formatter))
     caveats = []  # type: List[str]
     if how == "inferred":
@@ -446,13 +462,13 @@ def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
             doubt_share = float(row.in_doubt) / float(limit)
         if show_bar:
             text += "  " + bar(fraction, bar_size, style, doubt=doubt_share)
-        text += " " + style.tint("%d%%" % (int(round(fraction * 100)),), fraction)
+        # Width 3 so 3%, 22% and 100% share a right edge. Left-aligned they
+        # formed a ragged fringe down the column, which is the one place a
+        # percentage is worth reading next to its neighbours.
+        text += " " + style.tint("%3d%%" % (int(round(fraction * 100)),), fraction)
         if fraction >= 1.0:
             text += style.bad(g.warn)
     if row.in_doubt:
-        # The marker is the same shade the bar draws the doubt segment in, so
-        # the picture and the mark are one statement.
-        text += style.muted(g.doubt)
         caveats.append(
             "%s is allocated and not yet accounted for, so a du walk will disagree"
             % (formatter(row.in_doubt),)  # type: ignore[operator]
@@ -485,9 +501,17 @@ def in_doubt_of(root):
 
 def unmeasured(root):
     # type: (Root) -> bool
-    """True when this root's usage figure could not be measured."""
+    """True when nothing at all could be said about this root's space.
+
+    A root the `statvfs` fallback answered for is NOT unmeasured: the footer
+    reported "4 unmeasured" while every row in the table showed a figure,
+    which is a footer contradicting the table directly above it.
+    """
     row, _, _ = pick_row(root.quota, root.path, "blocks")
-    return row is None or row.used is None
+    if row is not None and row.used is not None:
+        return False
+    free = (root.policy or {}).get("free_bytes")
+    return not isinstance(free, int)
 
 
 def trouble(root):

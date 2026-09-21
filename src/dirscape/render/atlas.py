@@ -643,11 +643,30 @@ def render(
             current = row[_ROLE]
             row[_ROLE] = "" if current == previous else current
             previous = current
-        # Inode figures are detail, not headline. The default view answers
-        # "where can I put data and how full is it"; a file count belongs in
-        # `--all`, `--json` and `why`, where a reader has already asked for
-        # more than a glance.
-        constant = set(constant) | {_FILES}
+        # Inode figures are detail, not headline, so they are the first thing
+        # dropped when the window is tight: the default view answers "where
+        # can I put data and how full is it" and a file count belongs in
+        # `--all`, `--json` and `why`.
+        #
+        # **But only when the window is actually tight.** Suppressing it
+        # unconditionally left four columns of content in a 126 column
+        # terminal, and the room left over went into one 40 space gutter to
+        # make the box reach the edge, which is worse than not reaching it:
+        # padding is not use. Spare width goes to a real column first, and
+        # `files / limit` is the one column with real data on every row here.
+        keep_files = (
+            _PATH in KEEP_COLUMNS
+            and _column_width(
+                COLUMNS,
+                rows,
+                [i for i in range(len(COLUMNS)) if i not in constant and i != _POLICY],
+                _INDENT,
+                _GUTTER,
+            )
+            <= budget
+        )
+        if not keep_files:
+            constant = set(constant) | {_FILES}
 
     # The constant set goes IN, so the stage loop never spends width on a
     # column that is about to be removed. KEEP_COLUMNS are excluded from the
@@ -695,11 +714,6 @@ def render(
         # the first one; one full-width rule separates the title from the
         # table and leaves the headings sitting on nothing.
         underline=False,
-        # The owner asked twice why the view did not take the whole width, so
-        # it takes it. `spread` puts the leftover room in the gutter before
-        # the figure column, which right-flushes the figures against the frame
-        # and leaves the left group tight.
-        spread=True,
     )
     # A blank line, then the rule. The blank is what stops the title reading
     # as a first row of the table, and the rule is what stops the headings

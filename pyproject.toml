@@ -65,9 +65,19 @@ dirscape = "dirscape.cli:main"
 # depending on PATH order. That is the same mistake rapiDU made once with `sd`
 # (chmln/sd, packaged in Debian, Ubuntu, Homebrew and Arch) and had to undo.
 #
-# `ds` and `dirs` were also rejected: `ds` is too generic to claim, and `dirs`
-# is a bash builtin, so a script defining it would be shadowed by the shell
-# itself and never run at all.
+# `dirs` was rejected and stays rejected: it is a bash builtin, so a script of
+# that name is shadowed by the shell itself and would never run at all.
+#
+# `ds` was rejected as "too generic to claim" and is now SHIPPED, on the
+# owner's request and after checking what the claim actually costs. The PyPI
+# name `ds` is taken, by a 0.0.1 sdist of asciimoo/ds ("simple data query
+# language") that declares no console script at all, so nothing installable
+# from there can collide. Nothing named `ds` exists in coreutils, in RHEL8, or
+# anywhere on a login node's PATH. That is a materially different situation
+# from `dsc`, where the colliding package ships a `dsc` command and is in
+# active use. Two characters is what the owner will
+# actually type; a short name nobody else claims is worth having.
+ds = "dirscape.cli:main"
 dscape = "dirscape.cli:main"
 
 [project.optional-dependencies]

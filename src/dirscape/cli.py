@@ -58,6 +58,7 @@ from .render import (
     resolve_style,
 )
 from .render import style as render_style
+from .render.atlas import _MIN_BODY
 from .render.style import panel, plain
 from .runner import Budget, RecordedRunner, SubprocessRunner
 from .sitecfg import SITE_TEMPLATE, guess_cluster_name, load_site
@@ -2194,6 +2195,72 @@ def _detail(run, root, style, cols=None, window=None):
     return _fit(panel(lines, style=style, size=cols).splitlines(), cols)
 
 
+def _table_frame(
+    roots,  # type: Sequence[object]
+    cursor,  # type: int
+    run,  # type: Run
+    style,  # type: object
+    width,  # type: Optional[int]
+    footer=(),  # type: Sequence[str]
+    changes=(),  # type: Sequence[object]
+    hidden=0,  # type: int
+    legend_on=False,  # type: bool
+    summary_on=False,  # type: bool
+    show_all=False,  # type: bool
+):
+    # type: (...) -> List[str]
+    """The interactive table with row ``cursor`` highlighted, framed.
+
+    **Module level, and that is the point of it.** This was a closure inside
+    `_browse`, reachable only by driving a pty, and it shipped a defect that
+    the whole static-render test suite could not see: it laid the atlas out
+    against the FULL window while drawing the frame itself, so every line came
+    out four columns too wide and `panel` truncated the last cell. Nothing
+    caught it because nothing could call it. Untestable code is where the bugs
+    live, so it is a function now.
+
+    **Unframed atlas, framed here.** The band is painted on a CONTENT line and
+    the panel is drawn around the result, so the selection sits inside the
+    border. Highlighting the finished view instead would invert the two border
+    characters along with the row and pad the band past them.
+    """
+    window = width or style.size
+    text = render_atlas(
+        roots,
+        meta=run.meta,
+        changes=list(changes),
+        site=run.site,
+        style=style,
+        # **Minus the frame, because this call does not draw it.** With
+        # `frame=False` the atlas lays its content out against the size it is
+        # given, and `panel` below needs four of those columns for its border
+        # and padding. Passing the full window was the truncation bug above.
+        size=max(_MIN_BODY, window - 4),
+        hidden=hidden,
+        legend_on=legend_on,
+        summary=summary_on,
+        all_roots=run.roots,
+        group=not show_all,
+        frame=False,
+    )
+    lines = text.splitlines() + list(footer)
+    # The cursor indexes ROOTS, and the block has a title, a blank line, a rule
+    # and a column header above the first row. Located by matching the row's
+    # own path rather than by counting chrome, because the chrome changes with
+    # the window and a counted offset would put the highlight on the wrong line
+    # at the one width nobody tested.
+    #
+    # Matched against the line with its escapes REMOVED, because a cell may
+    # carry colour and the path is then not a substring of the line it is
+    # printed on.
+    target = roots[cursor].path or (roots[cursor].policy or {}).get("allocation_location", "")
+    for position, line in enumerate(lines):
+        if target and target in plain(line):
+            lines = interactive.highlight(lines, position)
+            break
+    return panel(lines, style=style, size=window).splitlines()
+
+
 def _browse(run, opts, style, width):
     # type: (Run, argparse.Namespace, object, Optional[int]) -> int
     """The atlas, with a highlight you can move and open.
@@ -2214,42 +2281,19 @@ def _browse(run, opts, style, width):
 
     def frame(cursor):
         # type: (int) -> List[str]
-        # **Unframed, on purpose.** The band is painted on a CONTENT line and
-        # the panel is drawn around the result, so the selection sits inside
-        # the border. Highlighting the finished view instead would invert the
-        # two border characters along with the row and pad the band past them.
-        text = render_atlas(
+        return _table_frame(
             roots,
-            meta=run.meta,
-            changes=changes,
-            site=run.site,
+            cursor,
+            run=run,
             style=style,
-            size=width,
+            width=width,
+            footer=footer,
+            changes=changes,
             hidden=hidden,
             legend_on=legend_on,
-            summary=summary_on,
-            all_roots=run.roots,
-            group=not show_all,
-            frame=False,
+            summary_on=summary_on,
+            show_all=show_all,
         )
-        lines = text.splitlines() + footer
-        # The cursor indexes ROOTS, and the block has a title, a blank line, a
-        # rule and a column header above the first row. Located by matching the
-        # row's own path rather than by counting chrome, because the chrome
-        # changes with the window and a counted offset would put the highlight
-        # on the wrong line at the one width nobody tested.
-        #
-        # Matched against the line with its escapes REMOVED. The path cell dims
-        # its parent directories now, so `/home/jdoe42` is three runs and an
-        # escape sequence on screen and is no longer a substring of the line it
-        # is printed on. That silently stopped matching anything, which paints
-        # no band at all.
-        target = roots[cursor].path or (roots[cursor].policy or {}).get("allocation_location", "")
-        for position, line in enumerate(lines):
-            if target and target in plain(line):
-                lines = interactive.highlight(lines, position)
-                break
-        return panel(lines, style=style, size=width or style.size).splitlines()
 
     footer = [
         "",

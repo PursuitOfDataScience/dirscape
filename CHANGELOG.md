@@ -665,6 +665,46 @@ is the heading, a blank, a `label value` field, or the one footer, and none of
 them wraps. That is also what keeps `_browse`'s repaint arithmetic true, which
 is the property a prose block broke twice.
 
+### Eighth pass: padding is not use, and a `ds` shortcut
+
+The previous entry's "the table fills the window" was wrong and is reversed
+here. It reached the edge by stretching one gutter, which at a 126 column
+terminal was a single 40 space gap between `reach` and `space`. The owner:
+"a lot of space is available and unoccupied, why is there still ..." and then
+"the space should be utilized well. but now it's terrible". Correct on both
+counts. A reader cannot track a row across a gulf, and a box touching the
+right edge bought nothing.
+
+- **Spare width buys a real column.** `files / limit` was suppressed from the
+  default view unconditionally as detail. It is suppressed only when the
+  window is actually tight now, so a wide terminal gets a fifth column of
+  real data instead of whitespace, and the box is sized to its content with
+  whatever is left over as margin. The `spread` option is gone from
+  `render.style.table` entirely rather than left switched off, because
+  padding-to-fill is a rejected design and a flag for it is an invitation.
+- **The interactive view truncated its last column, and that was a real
+  bug.** `_browse` drew the frame itself and handed the atlas the FULL window
+  to lay out in, so every line came out four columns too wide and `panel` cut
+  the last cell: `865M / 30G (` and an ellipsis in the interactive view while
+  the static print of the same table was correct. It had been latent since the
+  frame was introduced and only surfaced once the layout used the width it was
+  given.
+- **That closure is now `_table_frame`, at module level.** The defect was
+  invisible to a suite of 538 tests for one reason: it lived in a function
+  nothing could call without driving a pty. It takes its inputs as arguments
+  now, and the test asserts the CONTRACT (the size handed to the renderer
+  leaves room for the border) rather than the symptom, because the symptom
+  only appears at widths where the table happens to fill its budget.
+
+**`ds` is now an entry point**, alongside `dscape` and `dirscape`. This
+reverses the note that rejected it as "too generic to claim", and the check
+that reversed it: the PyPI name `ds` is held by a 0.0.1 sdist of asciimoo/ds
+that declares no console script, so nothing installable from there collides,
+and nothing named `ds` exists in coreutils, in RHEL8, or on a login node's
+PATH. That is a different situation from `dsc`, which is still rejected
+because the colliding package ships a `dsc` command. `dirs` also stays
+rejected: it is a bash builtin, so a script of that name never runs.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

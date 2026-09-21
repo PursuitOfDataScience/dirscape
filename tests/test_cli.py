@@ -402,9 +402,14 @@ def test_a_traversable_fileset_is_not_stranded():
 # --------------------------------------------------------------------------
 
 
-def _measured(root, used=1000, limit=2000):
+def _measured(root, used=1000, limit=2000, inodes=None, inode_limit=0):
     row = QuotaRow(root.fileset or "fs", "blocks", "user", used, hard=limit)
     root.quota = QuotaSnapshot("mmlsquota", [row])
+    if inodes is not None:
+        # The default view only shows the file count where there is room for
+        # it, so a fixture testing that has to supply one.
+        files = QuotaRow(root.fileset or "fs", "files", "user", inodes, hard=inode_limit)
+        root.inode_quota = QuotaSnapshot("mmlsquota", [files])
     return root
 
 
@@ -1080,44 +1085,157 @@ def test_width_is_not_spent_on_a_column_that_gets_dropped_as_constant():
     assert _PATH in columns and _USED in columns and _REACH in columns
 
 
-def test_the_table_fills_the_window_it_was_given():
-    """The owner asked twice why the view did not take the whole width.
+def test_spare_width_buys_a_column_and_never_a_gutter():
+    """Padding is not use, and this is the test that says so.
 
-    Four columns come to about 68 display columns, so at anything past that
-    the box used to stop wherever the content did. `spread` puts the leftover
-    room in the gutter before the figure column, which keeps the left group
-    tight and right-flushes the figures against the frame.
+    The first attempt at "take the whole width" made `table` stretch the
+    gutter before the last column until the box reached the window. At a 126
+    column terminal that was a single 40 space gap between `reach` and
+    `space`, and the owner's verdict was immediate: "a lot of space is
+    available and unoccupied, why is there still ..." and then "the space
+    should be utilized well. but now it's terrible". They were right. A reader
+    cannot track a row across a gulf, and the box reaching the edge bought
+    nothing.
 
-    Asserted at three widths, because a fill that only works at one is an
-    accident. The check is on the FRAME rows, which are the only lines
-    guaranteed to be the full width: a body row ends at its own last
-    character, since trailing spaces are stripped.
+    Spare width goes to a real column instead. `files / limit` has data on
+    every row of a live run and was being suppressed unconditionally as
+    detail, so it is the column the room buys.
+
+    Both halves are asserted, because either alone is satisfiable by doing
+    nothing: the column has to APPEAR when there is room and GO when there is
+    not, and no row may contain a gulf at any width.
     """
     from dirscape.render import atlas, resolve_style
     from dirscape.render.style import width as measure
 
     style = resolve_style(color="never", ascii_only=False, stream=None)
+    # The figures VARY per row on purpose. A column whose value is identical
+    # everywhere is dropped as a caption, so a fixture that repeats itself
+    # tests the constant-column rule instead of the width rule.
     roots = []
+    for offset, (path, role) in enumerate(
+        (
+            ("/home/me", "home"),
+            ("/project/one", "project"),
+            ("/scratch/meadow3/me", "scratch"),
+            ("/software", "software"),
+        )
+    ):
+        root = _measured(
+            _root(path, "fs" + role),
+            used=876_543_210 * (offset + 1),
+            limit=32_212_254_720,
+            inodes=37_000 * (offset + 1),
+            inode_limit=300_000,
+        )
+        root.role = role
+        roots.append(root)
+
+    narrow = atlas.render(roots, style=style, group=True, size=72)
+    wide = atlas.render(roots, style=style, group=True, size=110)
+
+    assert "files" not in narrow, "at 72 columns the file count is the first thing to go"
+    assert "files" in wide, "at 110 columns the room must buy a column, not whitespace"
+
+    # And the box is sized to what it holds, never stretched to the window.
+    # This is the half that forbids the gulf: a frame that has to reach the
+    # right edge can only get there by padding once every column that has
+    # data is already on screen.
+    for window, text in ((72, narrow), (110, wide)):
+        lines = text.splitlines()
+        edge = measure(lines[0])
+        content = max(measure(ln) for ln in lines[1:-1])
+        assert edge == content, "the frame is %d wide around %d of content at window %d" % (
+            edge,
+            content,
+            window,
+        )
+        assert edge <= window, "the frame overflowed the window"
+
+
+def test_the_interactive_frame_does_not_truncate_the_last_column():
+    """The off-by-four the layout change exposed.
+
+    `_browse` renders the atlas with `frame=False` and draws the panel itself,
+    so the content has to be laid out against the window MINUS the four
+    columns the border and its padding take. It was passing the full window,
+    and while the table was narrower than the window anyway nothing showed.
+    The moment the layout used the width it was given, every line came out
+    four columns too wide and `panel` truncated the last cell: the figure read
+    `865M / 30G (` and an ellipsis in the interactive view while the static
+    print of the same table was correct.
+
+    Asserted on the rendered block rather than through a pty, so it runs
+    everywhere: every line of a framed block is exactly the window wide and
+    none of them carries the truncation mark.
+    """
+    from dirscape.render import resolve_style
+    from dirscape.render.style import width as measure
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    run = cli.Run()
+    run.roots = []
     for path, role in (
         ("/home/me", "home"),
         ("/project/one", "project"),
         ("/scratch/meadow3/me", "scratch"),
-        ("/software", "software"),
     ):
-        root = _measured(_root(path, "fs" + role), used=876_543_210, limit=32_212_254_720)
+        root = _measured(
+            _root(path, "fs" + role),
+            used=876_543_210,
+            limit=32_212_254_720,
+            inodes=37_000,
+            inode_limit=300_000,
+        )
         root.role = role
-        roots.append(root)
+        run.roots.append(root)
 
-    for window in (80, 100, 132):
-        text = atlas.render(roots, style=style, group=True, size=window)
-        edges = [ln for ln in text.splitlines() if ln[:1] in ("\u256d", "\u2570")]
-        assert edges, "no frame was drawn at %d columns" % (window,)
-        for line in edges:
-            assert measure(line) == window, "at %d columns the frame is %d wide: %r" % (
+    for window in (80, 110, 126):
+        lines = cli._table_frame(run.roots, 0, run=run, style=style, width=window)
+        assert lines, "no frame at %d columns" % (window,)
+        for line in lines:
+            assert measure(line) <= window, "%r exceeds %d columns" % (line, window)
+            assert style.g.ellipsis not in line, "the last cell was truncated at %d columns: %r" % (
                 window,
-                measure(line),
                 line,
             )
+        # Every row of the block is the same width, which is what makes the
+        # selection band a band and not ragged emphasis.
+        assert len({measure(ln) for ln in lines}) == 1, "the block is ragged at %d columns: %s" % (
+            window,
+            sorted({measure(ln) for ln in lines}),
+        )
+
+        # And the detail view it opens into holds the same property.
+        detail = cli._detail(run, run.roots[0], style, cols=window, window=40)
+        for line in detail:
+            assert measure(line) <= window, "%r exceeds %d columns" % (line, window)
+
+    # The CONTRACT, not just the symptom. A symptom test cannot see this bug
+    # while the table happens to be narrower than the window: the truncation
+    # only fires once the layout actually uses the width it is handed, which
+    # is how it stayed hidden through a whole suite of static-render tests and
+    # then appeared the moment the columns filled out. So the size handed to
+    # the renderer is asserted directly, and it must leave room for the border
+    # this function draws itself.
+    seen = []
+    real = cli.render_atlas
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("size"))
+        return real(*args, **kwargs)
+
+    cli.render_atlas = spy
+    try:
+        for window in (80, 110, 126):
+            seen[:] = []
+            cli._table_frame(run.roots, 0, run=run, style=style, width=window)
+            assert seen == [window - 4], (
+                "the unframed atlas must be laid out 4 columns narrower than the frame "
+                "that wraps it, got %r at window %d" % (seen, window)
+            )
+    finally:
+        cli.render_atlas = real
 
 
 def test_a_no_limit_figure_says_used_rather_than_pairing_with_a_limit():

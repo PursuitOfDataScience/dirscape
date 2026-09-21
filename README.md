@@ -9,24 +9,24 @@ You land on a new cluster. Where does 2 TB go? What gets purged on Friday? Nobod
 you that list, and `du` cannot find it because `du` needs the path you are missing.
 
 ```
-$ dirscape
+$ ds
 
-╭──────────────────────────────────────────────────────────────────────────────────────╮
-│ dirscape  ·  jdoe42  ·  meadow3-0200                                                 │
-│                                                                                      │
-│ ──────────────────────────────────────────────────────────────────────────────────── │
-│    role        path                       reach                    space             │
-│    home        /home/jdoe42               rwx                      859M / 30G (3%)   │
-│    project     /project/hpc               rwx                       11T used         │
-│                /project2/hpc              rwx                      928K used         │
-│    scratch     /scratch/collie3/jdoe42    rwx                        0B / 400G (0%)  │
-│                /scratch/local/jdoe42      rwx                      886G free         │
-│                /scratch/meadow2/jdoe42    rwx                       25T free         │
-│                /scratch/meadow3/jdoe42    rwx                       22G / 100G (22%) │
-│    dataset     /project2/reference        r-x                       23T used         │
-│    software    /software                  rwx                      314G used         │
-│    local       /tmp                       rwx                      886G free         │
-╰──────────────────────────────────────────────────────────────────────────────────────╯
+╭───────────────────────────────────────────────────────────────────────────────────────╮
+│ dirscape  ·  jdoe42  ·  meadow3-0200                                                  │
+│                                                                                       │
+│ ───────────────────────────────────────────────────────────────────────────────────── │
+│    role        path                       reach    space                files / limit │
+│    home        /home/jdoe42               rwx      866M / 30G (3%)         37k / 300k │
+│    project     /project/hpc               rwx       11T used                3.1M used │
+│                /project2/hpc              rwx      928K used                  66 used │
+│    scratch     /scratch/collie3/jdoe42    rwx        0B / 400G (0%)          7 / 5.1M │
+│                /scratch/local/jdoe42      rwx      886G free                        ? │
+│                /scratch/meadow2/jdoe42    rwx       25T free                        ? │
+│                /scratch/meadow3/jdoe42    rwx       22G / 100G (22%)       3.7k / 10M │
+│    dataset     /project2/reference        r-x       23T used                 33k used │
+│    software    /software                  rwx      314G used                2.6M used │
+│    local       /tmp                       rwx      886G free                        ? │
+╰───────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 One box, one row per place you can put data, and nothing else. **In a terminal it is
@@ -41,8 +41,10 @@ per directory use `rdu` or `ncdu`.
 
 ```bash
 pip install dirscape          # zero dependencies, Python 3.6+
-dirscape                      # no flags, no config, no setup
+ds                            # no flags, no config, no setup
 ```
+
+`ds` is the short name; `dscape` and `dirscape` run the same thing.
 
 ## 🔍 Going deeper
 

@@ -11,6 +11,9 @@ end-to-end check replays a captured transcript.
 """
 
 import argparse
+import contextlib
+import os
+import sys
 
 import pytest
 
@@ -180,26 +183,55 @@ def test_internal_bookkeeping_never_reaches_the_policy_column():
 
     It is discovery's own bookkeeping, it tells a reader nothing, and it looks
     like a leaked internal because it is one.
+
+    The filter started at four keys and was short by six. A 200 column run put
+    `crosses_to=['/project/hpc/jdoe42']`, `contains=2`, `free_bytes=...` and
+    `size_bytes=...` in the column, and every one of those is already rendered
+    properly elsewhere in the same view: the fold count is the `+2` on the
+    path, the free figure is the `886G free` in the quota column, and the
+    crossing is the symlink note. So the column was printing raw internals
+    beside their own formatted selves, and it only stayed unseen because the
+    column is the first one dropped when the window is narrow.
     """
     from dirscape.render import fields
 
     root = _root("/project/hpc", "project-hpc")
     root.policy = {
         "rank": "primary",
+        "rank_reason": "the mount table named it",
         "allocation_location": "cfs4/hpc-staff",
         "allocation_gb": 25600.0,
         "allocation_accounts": ["hpc-staff"],
+        "free_bytes": 951_720_603_648,
+        "size_bytes": 959_727_210_496,
+        "contains": 2,
+        "crosses_to": ["/project/hpc/jdoe42"],
+        "fileset_is_filesystem_root": True,
         "purge_days": 30,
     }
     merged = fields.merged_policy(root, site=None)
 
-    for leaked in ("rank", "allocation_location", "allocation_gb", "allocation_accounts"):
+    leaks = (
+        "rank",
+        "rank_reason",
+        "allocation_location",
+        "allocation_gb",
+        "allocation_accounts",
+        "free_bytes",
+        "size_bytes",
+        "contains",
+        "crosses_to",
+        "fileset_is_filesystem_root",
+    )
+    for leaked in leaks:
         assert leaked not in merged
     assert merged["purge_days"] == 30, "real policy must survive the filter"
 
     cell = fields.policy_cell(root, site=None)
     assert "rank" not in cell
     assert "primary" not in cell
+    for leaked in leaks:
+        assert leaked not in cell, "%s reached the rendered cell" % (leaked,)
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +609,31 @@ def _render_default(roots, **kw):
     return atlas.render(roots, group=True, **kw)
 
 
+def _content(text):
+    """The panel's content lines, with the border and any colour removed.
+
+    The default view is one framed block now, so every row arrives as
+    `| ... |` and a test that reads the first word of a line reads the border.
+    Rather than each test learning the frame, they all come through here: the
+    border characters come off, the padding goes, and what is left is what the
+    reader sees inside the box.
+    """
+    import re
+
+    out = []
+    for line in re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", text).splitlines():
+        bare = line.strip()
+        if not bare or set(bare) <= set("+-|"):
+            # The top and bottom borders, and an empty framed line.
+            continue
+        if bare[0] in "|\u2502" and bare[-1] in "|\u2502":
+            bare = bare[1:-1]
+        if not bare.strip() or set(bare.strip()) <= set("-\u2500"):
+            continue
+        out.append(bare.rstrip())
+    return out
+
+
 def test_a_repeated_role_is_printed_once():
     """Nine rows reading `project` is the table stuttering.
 
@@ -597,15 +654,21 @@ def test_a_repeated_role_is_printed_once():
 
     text = _render_default(roots)
 
-    # Counted in the ROLE COLUMN, not in the whole string: the word "project"
-    # also appears inside `/project/a`, `/project/b` and `/project/c`, so a
-    # naive `text.count` measures the paths and not the blanking.
-    body = [ln for ln in text.splitlines() if "/" in ln and "PATH" not in ln]
-    roles = [ln.split()[0] for ln in body if not ln.startswith(" ")]
-    assert roles == ["project", "home"], "each role belongs on the first row of its run, got %r" % (
-        roles,
+    # Read out of the ROLE COLUMN, not out of the whole string: the word
+    # "project" also appears inside `/project/a`, `/project/b` and
+    # `/project/c`, so a naive `text.count` measures the paths and not the
+    # blanking. The column is located from the heading rather than by counting
+    # spaces, because the table is indented inside a frame now and every row
+    # begins with whitespace.
+    lines = _content(text)
+    heading = next(ln for ln in lines if ln.split()[:1] == ["role"])
+    at = heading.index("path")
+    body = [ln for ln in lines if ln != heading and "/" in ln[at:]]
+    roles = [ln[:at].strip() for ln in body]
+    assert [r for r in roles if r] == ["project", "home"], (
+        "each role belongs on the first row of its run, got %r" % (roles,)
     )
-    assert sum(1 for ln in body if ln.startswith(" ")) == 2, "two rows inherit their role"
+    assert sum(1 for r in roles if not r) == 2, "two rows inherit their role"
 
 
 def test_figures_align_on_the_separator():
@@ -618,8 +681,11 @@ def test_figures_align_on_the_separator():
     for root in roots:
         root.role = "project"
 
-    # The header carries "USED / QUOTA", so rows are taken by their path.
-    lines = [ln for ln in _render_default(roots).splitlines() if " / " in ln and "QUOTA" not in ln]
+    # The heading carries "used / quota", so rows are taken by their path. The
+    # comparison is case-sensitive and the heading went lower case, which made
+    # this filter stop excluding it: with the heading in the sample the
+    # separator offsets were two and the test was measuring the wrong thing.
+    lines = [ln for ln in _content(_render_default(roots)) if " / " in ln and "quota" not in ln]
     assert len(lines) == 3
     offsets = {ln.index(" / ") for ln in lines}
     assert len(offsets) == 1, "every separator must sit in one column: %s" % (offsets,)
@@ -633,7 +699,10 @@ def test_a_column_with_one_value_everywhere_is_dropped():
     for root in roots:
         root.role = "project"
     text = _render_default(roots)
-    assert "WHERE" not in text
+    # Lower case since the headings changed, which matters: `"WHERE" not in
+    # text` passed for the wrong reason the moment the heading did.
+    assert "where" not in text
+    assert "path" in text, "and the test is still looking at a real table"
 
 
 def test_path_and_used_survive_even_when_constant():
@@ -668,7 +737,12 @@ def test_the_summary_lines_count_the_unfiltered_roots():
     away.allocated = confirmed()
     away.mounted = refuted(VerdictCategory.NOT_MOUNTED_HERE)
 
-    text = _render_default(shown, all_roots=shown + [held, away])
+    # `summary=True`, because the teasers are behind `--summary` now: three
+    # lines of chrome on every run was the owner's complaint, not a feature.
+    text = _render_default(shown, all_roots=shown + [held, away], summary=True)
+    assert "dirscape stranded" not in _render_default(shown, all_roots=shown + [held, away]), (
+        "the default view carries no teaser at all"
+    )
 
     assert "dirscape stranded" in text
     assert "dirscape elsewhere" in text
@@ -715,6 +789,227 @@ def test_a_capacity_figure_aligns_with_the_quota_figures():
     assert len(edges) == 1, "figures end at columns %s" % (sorted(edges),)
 
 
+def test_the_selected_row_is_one_flat_band_with_no_colour_in_it():
+    """The owner's bug, measured rather than looked at.
+
+    "the highlightor gets truncated by `▎▒░░░░░░   3%` which looks so ugly",
+    and then "it seems like `▎▒░░░░░░   3%` is on top of the highlightor".
+    Both are one cause: under inverse video an explicit FOREGROUND colour is
+    painted as the BACKGROUND, so every coloured run inside the band came out
+    as a block of its own colour sitting on the selection. Measured in a pty
+    before the fix: six of seven frames carried `\x1b[38;2;...m` inside the
+    band.
+
+    Two assertions, because the band needs both: no foreground code survives
+    inside it, and every row's band is the same display width, or the cursor
+    is a different shape on every line instead of a band moving down a
+    column.
+    """
+    import re
+
+    from dirscape.interactive import highlight
+    from dirscape.render import atlas, resolve_style
+    from dirscape.render.style import width as measure
+
+    style = resolve_style(color="always", ascii_only=False, stream=None)
+    roots = [
+        _measured(_root("/home/me", "fs-home"), used=900_000_000, limit=32_212_254_720),
+        _measured(_root("/project/lab", "fs-lab"), used=11_000_000_000_000, limit=0),
+        _measured(_root("/scratch/me", "fs-scratch"), used=0, limit=400_000_000_000),
+    ]
+    roots[0].role = "home"
+    roots[1].role = "project"
+    roots[2].role = "scratch"
+
+    # Unframed, which is what `cli._browse` highlights: the band goes on a
+    # content line and the border is drawn around the result.
+    lines = atlas.render(roots, style=style, group=True, frame=False).splitlines()
+    assert any("\033[38;" in line for line in lines), (
+        "the fixture has to have colour in it or this test proves nothing"
+    )
+
+    foreground = re.compile(r"\033\[(?:38;|9[0-7]m|3[0-7]m|39m)")
+    widths = set()
+    for index in range(len(lines)):
+        painted = highlight(lines, index)[index]
+        body = painted[len("\033[0m\033[7m") : -len("\033[0m")]
+        assert not foreground.search(body), (
+            "a foreground code inside the band becomes its background: %r" % (body,)
+        )
+        assert "\033" not in body, "no escape of any kind belongs inside the band: %r" % (body,)
+        widths.add(measure(body))
+    assert len(widths) == 1, "the band is %s columns wide on different rows" % (sorted(widths),)
+
+
+def test_the_table_draws_no_bar_and_keeps_the_percentage():
+    """Eight cells of blocks for a lossy copy of the number beside them.
+
+    "why do we need this bar here? ... if you can't [fix it], just get rid of
+    it." It was also blank on five of the ten rows of the live view, since an
+    unlimited quota has no fraction and a capacity fallback has no quota, so
+    the one thing a meter column is for, being scanned down, it could not do.
+    The graded colour on the percentage carries fullness now.
+    """
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="always", ascii_only=False, stream=None)
+    root = _measured(_root("/home/me", "fs-home"), used=900_000_000, limit=32_212_254_720)
+    root.role = "home"
+    text = atlas.render([root], style=style, group=True)
+
+    for glyph in "▏▎▍▌▋▊▉█░":
+        assert glyph not in text, "the bar is gone, and %r is one of its cells" % (glyph,)
+    assert "3%" in text, "the percentage is what replaced it"
+    # And the colour is on the percentage, which is the whole substitution.
+    assert "\033[38;" in text
+
+
+def test_ascii_mode_emits_nothing_above_codepoint_127():
+    """`--ascii` and `DIRSCAPE_ASCII=1` are for a `LANG=C` console.
+
+    Checked on the WHOLE view rather than on the glyph table, because the
+    frame, the rule and the separators are all drawn from it and a new glyph
+    with no twin is invisible until something renders it.
+    """
+    from dirscape.render import atlas, resolve_style
+    from dirscape.render.style import _GLYPHS
+
+    for name, _rich, plain_twin in _GLYPHS:
+        assert all(ord(ch) < 128 for ch in plain_twin), "glyph %r has no ASCII twin: %r" % (
+            name,
+            plain_twin,
+        )
+
+    roots = [
+        _measured(_root("/home/me", "fs-home"), used=900_000_000, limit=32_212_254_720),
+        _measured(_root("/project/lab", "fs-lab"), used=11_000_000_000_000, limit=0),
+    ]
+    roots[0].role = "home"
+    roots[1].role = "project"
+    for env in ({"DIRSCAPE_ASCII": "1"}, {}):
+        style = resolve_style(
+            color="always", ascii_only=None if env else True, stream=None, env=env
+        )
+        text = atlas.render(roots, style=style, group=True, summary=True, legend_on=True)
+        bad = sorted({ch for ch in text if ord(ch) >= 128})
+        assert not bad, "non-ASCII escaped into --ascii output: %r" % (bad,)
+        assert "+--" in text, "the frame still has to be a frame"
+
+
+def test_no_color_and_a_dumb_terminal_suppress_every_escape():
+    """Including the frame's gradient, which is the newest thing that could
+    have leaked one.
+
+    `--color always` does not override either: the variable is the user's
+    standing instruction about their own terminal, and a flag that beat it
+    would make `NO_COLOR` advice rather than a setting.
+    """
+    from dirscape.render import atlas, resolve_style
+
+    roots = [_measured(_root("/home/me", "fs-home"), used=900_000_000, limit=32_212_254_720)]
+    roots[0].role = "home"
+    for env in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+        for want in ("auto", "always"):
+            style = resolve_style(color=want, ascii_only=False, stream=None, env=env)
+            text = atlas.render(roots, style=style, group=True, summary=True, legend_on=True)
+            assert "\033" not in text, "an escape survived %r with --color %s" % (env, want)
+            assert "╭" in text, "the frame is still drawn, just without colour"
+
+
+def test_the_frame_opens_and_closes_around_every_row():
+    """A box that is a box everywhere. An unclosed frame reads as a crash."""
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    roots = [_measured(_root("/home/me", "fs-home")), _measured(_root("/project/lab", "fs-lab"))]
+    roots[0].role = "home"
+    roots[1].role = "project"
+    lines = atlas.render(roots, style=style, group=True, size=100).splitlines()
+
+    assert lines[0].startswith("╭") and lines[0].endswith("╮")
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+    for line in lines[1:-1]:
+        assert line.startswith("│") and line.endswith("│"), "unclosed row: %r" % (line,)
+    assert len({len(line) for line in lines}) == 1, "the border has to be rectangular"
+
+
+def test_a_title_that_wraps_does_not_break_the_frame_open():
+    """Found at 60 columns, and it is the frame's sharpest edge.
+
+    `legend` breaks the title to a second line when the next item will not
+    fit, and the atlas was handing that string to `panel` as ONE content
+    line. The border closed after `compute` and the rest of the title landed
+    outside the box with the right-hand border stuck on the end of it:
+
+        | dirscape  .  jdoe42  .  meadow3-0200  .  compute
+        9 devi... |
+    """
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    roots = [_measured(_root("/home/me", "fs-home"))]
+    roots[0].role = "home"
+    meta = {
+        "host": "meadow3-0200",
+        "node_class": "compute",
+        "user": "jdoe42",
+        "devices": 9,
+    }
+    lines = atlas.render(roots, meta=meta, style=style, group=True, size=60).splitlines()
+
+    assert lines[1].count("dirscape") == 1
+    for line in lines[1:-1]:
+        assert line.startswith("│") and line.endswith("│"), "the frame opened: %r" % (line,)
+    assert len({len(line) for line in lines}) == 1
+    # And the title really did need two lines, or this proves nothing.
+    assert any("9 devices" in line for line in lines[1:3])
+    assert "9 devices" not in lines[1]
+
+
+def test_a_path_too_wide_for_a_frame_is_printed_whole_and_unframed():
+    """The frame gives way, not the path.
+
+    A shortened path is a different path and the reader cannot tell which
+    characters went, so the stacked fallback prints it whole and lets the
+    terminal wrap. A border would have to cut it to hold it.
+    """
+    from dirscape.render import atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    deep = "/project/lab/" + "a" * 90
+    root = _measured(_root(deep, "fs-lab"))
+    root.role = "project"
+    text = atlas.render([root], style=style, group=True, size=40)
+
+    assert deep in text, "not one character of a path may go"
+    assert "╭" not in text and "│" not in text, "the frame comes off rather than cutting it"
+
+
+def test_the_drop_order_is_the_documented_one():
+    """Each stage gives up the least urgent thing left, and the order is the
+    view's policy rather than an accident of how it was written.
+
+    The stage that dropped the usage BAR went with the bar itself.
+    """
+    from dirscape.render import atlas
+
+    assert atlas.DROP_STAGES[0] == ()
+    names = [[atlas.COLUMNS[i] for i in stage] for stage in atlas.DROP_STAGES]
+    assert names == [
+        [],
+        ["policy"],
+        ["policy", "files / limit"],
+        ["policy", "files / limit", "role"],
+        ["policy", "files / limit", "role", "reach"],
+        ["policy", "files / limit", "role", "reach", "where"],
+    ]
+    for earlier, later in zip(atlas.DROP_STAGES, atlas.DROP_STAGES[1:]):
+        assert set(earlier) < set(later), "a stage may only add to the one before it"
+    for stage in atlas.DROP_STAGES:
+        for kept in atlas.KEEP_COLUMNS:
+            assert kept not in stage, "path and the figure are never dropped"
+
+
 def test_why_does_not_print_one_line_per_symlink():
     """A home directory with eleven relocated dotfiles produced eleven
     near-identical `note` lines, which was most of a thirty-line screen.
@@ -737,7 +1032,9 @@ def test_why_does_not_print_one_line_per_symlink():
 
     assert code == cli.EXIT_OK
     assert text.count("resolves to") == 0, "the per-symlink lines must be collapsed"
-    assert "6 paths here are symlinks billed elsewhere" in text
+    # Matched against the whitespace-normalised text, because the sentence is
+    # wrapped to the window and the line it breaks on moves with the width.
+    assert "6 paths here are symlinks into other storage" in " ".join(text.split())
     assert len(text.splitlines()) < 20, "why is a screen, not a transcript"
 
 
@@ -747,6 +1044,11 @@ def test_why_omits_a_probe_that_never_ran():
     The allocation database is only consulted for storage with no path here,
     so a question mark against a question nobody asked teaches a reader to
     skip the column.
+
+    Reworded, not weakened: the view no longer prints the model's labels
+    ("allocated", "mounted") at a reader, so the assertion moved onto what it
+    was always about. The allocation probe never ran and must be silent; the
+    reachability probe answered and must show its answer.
     """
     run = cli.Run()
     root = _measured(_root("/project/lab", "project-lab"))
@@ -758,8 +1060,9 @@ def test_why_omits_a_probe_that_never_ran():
 
     text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
 
-    assert "allocated" not in text
-    assert "mounted" in text
+    assert "not probed" not in text, "a probe that never ran was reported anyway"
+    assert "allocation" not in text, "the unasked allocation question must be silent"
+    assert "attached to the machine you are on" in text, "the answered probe must show"
 
 
 # --------------------------------------------------------------------------
@@ -972,19 +1275,28 @@ def test_a_failed_save_is_reported_rather_than_claimed():
     assert "has been recorded" not in text
 
 
-def test_run_warnings_reach_the_table():
+def test_run_warnings_reach_the_user_on_stderr():
     """They were collected into `Run.warnings` and only ever reached `--json`,
     so a malformed site.conf, a damaged baseline and a failed plugin were all
     silent in the view a user actually reads.
+
+    They went into the table next, and then out of it again: the table is one
+    framed panel of storage facts and a run-level failure is not one of them,
+    and it must not move behind `--summary` with the counts either, or a failed
+    save is silent again. So the channel is stderr, which also keeps
+    `dirscape | grep` clean. What this pins is that the text still gets OUT.
     """
+    run = cli.Run()
+    run.warnings = ["ignored malformed config /etc/dirscape/site.conf"]
+    assert cli._surfaceable(run) == ["ignored malformed config /etc/dirscape/site.conf"]
+
     from dirscape.render import atlas
 
     root = _measured(_root("/project/lab", "project-lab"))
     root.role = "project"
-    text = atlas.render(
-        [root], group=True, warnings=["ignored malformed config /etc/dirscape/site.conf"]
+    assert "malformed" not in atlas.render([root], group=True), (
+        "a run-level warning is not a row of the table"
     )
-    assert "malformed config" in text
 
 
 def test_the_stranded_summary_is_not_repeated_as_a_warning():
@@ -1112,7 +1424,7 @@ def test_why_accepts_an_allocation_location():
 
     assert code == cli.EXIT_OK
     assert "cfs4/acct" in text
-    assert "an allocation, not a path on this node" in text
+    assert "an allocation, not a directory you can use from this machine" in text
     # 20480 DECIMAL GB is 20.48e12 bytes, which is 18.6 TiB and renders as
     # 19T. The database publishes decimal GB and the display is binary, so the
     # number a reader sees is smaller than the one in the allocation table;
@@ -1136,3 +1448,345 @@ def test_why_on_a_location_with_a_leading_slash_also_matches():
     text, code = cli._why(run, "/cfs4/acct", resolve_style(color="never", stream=None))
     assert code == cli.EXIT_OK
     assert "an allocation" in text
+
+
+# --------------------------------------------------------------------------
+# The detail view has to fit the window it repaints in
+# --------------------------------------------------------------------------
+
+
+def _detail_fixture():
+    """A root carrying the fields that made the block overflow in real use.
+
+    The 157 character writable reason is the actual string `discover.access`
+    returns, and it is what made `_why("/project/hpc")` occupy 19 rows while
+    reporting 18 lines. The notes and the long fileset name are here because
+    `_fit` has to hold for a line with no space in it as well as for prose.
+    """
+    run = cli.Run()
+    root = _measured(_root("/project/hpc", "project-hpc"), used=11765797488, limit=0)
+    root.role = "project"
+    root.reach = Reach.LISTABLE
+    root.writable = confirmed(
+        "os.access reports write; not owner-confirmed, and W_OK can be wrong under a "
+        "root-squashed export, so pass --probe-write to settle it by writing",
+        source="os.access",
+    )
+    root.add_source("group-template")
+    root.add_source("dir-owner")
+    root.add_source("quota-fileset")
+    root.add_note("matched group hpc")
+    root.add_note("directory hpc is group-owned by a group you are in")
+    root.add_note("holds the fileset project-hpc")
+    root.add_note("also reachable at /gpfs/meadow3/cap/project/hpc/a/very/long/alias/path/indeed")
+    run.roots = [root]
+    return run, root
+
+
+def _physical_rows(lines, columns):
+    """How many rows a terminal ``columns`` wide gives these lines.
+
+    The arithmetic `interactive.select` gets wrong when it is not one to one:
+    it moves the cursor up by `len(lines)` and the terminal has consumed this
+    many rows instead.
+    """
+    from dirscape.render.style import width
+
+    total = 0
+    for line in lines:
+        span = width(line)
+        total += max(1, -(-span // columns))
+    return total
+
+
+@pytest.mark.parametrize("color", ["never", "always"])
+@pytest.mark.parametrize("columns", [80, 90, 100, 110, 120, 42])
+def test_the_detail_block_takes_one_row_per_line(color, columns):
+    """The header-repeat bug, measured rather than looked at.
+
+    `interactive.select` repaints by moving the cursor up by the number of
+    lines it last WROTE. Measured on the previous `_why("/project/hpc")`: 18
+    lines written against 19 rows occupied, at every width from 80 to 120,
+    because the writable verdict's reason ran to 157 characters and wrapped.
+    The cursor stopped a row short, the erase began a row too low, and one row
+    survived every repaint: thirteen presses of Down left thirteen copies of
+    `/project/hpc` stacked above the detail.
+    """
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    style = resolve_style(color=color, stream=None, size=columns)
+    lines = cli._detail(run, root, style, cols=columns, window=0)
+
+    assert lines, "the detail block cannot be empty"
+    assert _physical_rows(lines, columns) == len(lines), "%d lines occupy %d rows at %d columns" % (
+        len(lines),
+        _physical_rows(lines, columns),
+        columns,
+    )
+
+
+def test_the_detail_block_leaves_the_window_a_spare_row():
+    """A block taller than the window has scrolled before it is erased.
+
+    The cursor-up then lands at the top of the WINDOW rather than the top of
+    the block, and the erase takes whatever the reader had above it. That is
+    the "entire terminal turns empty" report, one level below the table it was
+    first found on.
+    """
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    style = resolve_style(color="never", stream=None, size=100)
+    for window in (10, 14, 24, 40):
+        lines = cli._detail(run, root, style, cols=100, window=window)
+        assert len(lines) + 1 <= window, "%d lines in a %d row window" % (len(lines), window)
+    # And the reader is told the screen was cut, with the command that is not.
+    short = " ".join(" ".join(cli._detail(run, root, style, cols=100, window=14)).split())
+    assert "dirscape why /project/hpc" in short
+
+
+def test_up_and_down_do_not_repaint_a_one_row_view():
+    """There is nowhere to move, so a repaint is pure cost.
+
+    `select` wraps the cursor round onto the same row and paints the same
+    block again, which is one more chance for the cursor arithmetic to be
+    wrong for no benefit at all.
+    """
+    import re
+
+    from dirscape import interactive
+
+    keys = iter(
+        [
+            interactive.Key.DOWN,
+            interactive.Key.DOWN,
+            interactive.Key.UP,
+            interactive.Key.QUIT,
+        ]
+    )
+    written = []  # type: list
+    outcome = interactive.select(
+        lambda i: ["only one row"],
+        1,
+        keys=cli._still(lambda: next(keys)),
+        write=written.append,
+        raw=False,
+    )
+    text = "".join(written)
+
+    assert outcome == interactive.Key.QUIT
+    # One cursor-up in the whole session, and it is the erase on the way out.
+    assert len(re.findall(r"\033\[\d+A", text)) == 1, text.replace("\033", "ESC")
+    assert text.count("only one row") == 1, "the block was painted more than once"
+
+
+def test_the_movement_keys_still_move_the_table():
+    """The guard above is for a ONE ROW view and must not reach the atlas."""
+    import re
+
+    from dirscape import interactive
+
+    keys = iter([interactive.Key.DOWN, interactive.Key.QUIT])
+    written = []  # type: list
+    interactive.select(
+        lambda i: ["row %d" % (i,)],
+        3,
+        keys=keys.__next__,
+        write=written.append,
+        raw=False,
+    )
+    text = "".join(written)
+    assert len(re.findall(r"\033\[\d+A", text)) == 2, "one repaint and one erase"
+    assert "row 1" in text, "Down did not move the cursor"
+
+
+# --------------------------------------------------------------------------
+# The detail view's vocabulary is the reader's, not the model's
+# --------------------------------------------------------------------------
+
+
+def test_no_discovery_source_token_reaches_the_prose():
+    """`found by group-template, dir-owner, quota-fileset` was the worst line
+    on the old screen: three internal constants shown to a human.
+
+    `model.py` already owns the fix (`category_label`, after nodetop printed
+    raw enum members in a prose column), so the sources got the same
+    treatment and the tokens stay in `--json`.
+    """
+    from dirscape import discover
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None))
+
+    for token in discover.SOURCE_LABELS:
+        assert token not in text, "%r is a wire token and reached the screen" % (token,)
+    flat = " ".join(text.split())
+    assert "dirscape shows you this directory because" in flat
+    assert discover.source_label("dir-owner") in flat
+
+
+def test_no_verdict_category_token_reaches_the_detail_view():
+    """The invariant `render/__init__` states: a `VerdictCategory` never
+    reaches a prose column, `category_label()` does.
+    """
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    root.allocated = refuted(VerdictCategory.ALLOCATED_ELSEWHERE, "nothing here")
+    root.present = unknown(VerdictCategory.PROBE_TIMEOUT, "took too long")
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None))
+
+    for name in dir(VerdictCategory):
+        if name.startswith("_"):
+            continue
+        token = getattr(VerdictCategory, name)
+        if isinstance(token, str):
+            assert token not in text, "%r is a wire token and reached the screen" % (token,)
+
+
+def test_the_detail_view_repeats_nothing_discovery_already_said():
+    """A source label and the note that explains the same source are one fact.
+
+    `/project/hpc` carried "matched group hpc", "directory hpc is group-owned
+    by a group you are in" and "holds the fileset project-hpc" underneath the
+    three labels that say exactly that.
+    """
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None))
+
+    assert "matched group hpc" not in text
+    assert "holds the fileset" not in text
+    # A note that is NOT a source restatement survives, because dropping it
+    # would cost a fact rather than a repetition.
+    assert "also reachable at" in " ".join(text.split())
+
+
+def test_an_unmeasured_figure_is_not_explained_as_a_measured_one():
+    """The honesty rule, on the sentence that says where a figure came from.
+
+    With no quota reading and no `statvfs` fallback there is no figure, so
+    there is nothing to attribute, and the view has to say that rather than
+    describe accounting that did not happen.
+    """
+    from dirscape.render import resolve_style
+
+    run = cli.Run()
+    root = _root("/project/lab", "project-lab")
+    root.reach = Reach.LISTABLE
+    run.roots = [root]
+
+    text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
+    flat = " ".join(text.split())
+
+    assert "space     ?" in text, "an unmeasured figure is the unknown mark: %r" % (text,)
+    assert "could not measure the space here" in flat
+    assert "counted by the filesystem itself" not in flat
+
+
+def test_an_unpublished_policy_is_not_reported_as_no_policy():
+    """Silence from a site is not a claim that nothing is backed up."""
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None))
+    assert "not published" in text
+    assert "not backed up" not in text
+
+
+def test_a_published_policy_is_spelled_out():
+    """And when a site does publish one, it is a sentence and not a token."""
+    from dirscape.render import resolve_style
+
+    run, root = _detail_fixture()
+    root.policy = dict(root.policy or {})
+    root.policy.update({"purge_days": 30, "backup": False})
+    text, _ = cli._why(run, "/project/hpc", resolve_style(color="never", stream=None))
+    flat = " ".join(text.split())
+
+    assert "not backed up" in flat
+    assert "deleted 30 days after they are written" in flat
+    assert "purge_days" not in flat
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_real_pty_does_not_repaint_the_detail_view():
+    """The owner's report, end to end in an actual terminal.
+
+    Thirteen presses of Down in the detail view left thirteen copies of the
+    path stacked above it, one per repaint, because the block occupied one row
+    more than the number of lines the repaint arithmetic was counting.
+
+    Two counts, and neither depends on what the views render:
+
+    * **Three raw sessions.** One per `select` call, so three proves the Enter
+      opened the detail view and the Left came back out of it. Without this the
+      test would pass by having its keystrokes dropped, which is exactly what
+      an output-driven harness does once the repaint it was waiting on is gone.
+    * **Three cursor-up sequences**, which are the three erases: leaving the
+      table, leaving the detail, and leaving the table again. The four Down
+      presses in between add none. Before the fix they added one each.
+    """
+    pty = pytest.importorskip("pty")
+    import re
+    import select as sel
+    import struct
+    import time
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pid, fd = pty.fork()
+    if pid == 0:  # pragma: no cover - the child execs
+        os.environ["TERM"] = "xterm"
+        os.environ["PYTHONPATH"] = os.path.join(root, "src")
+        os.execv(sys.executable, [sys.executable, "-m", "dirscape", "--no-state"])
+
+    import fcntl
+    import termios
+
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
+
+    out = b""
+    # Keys go on a wall clock and not on output, because the fix under test
+    # REMOVES the output a repaint-driven harness would wait for.
+    script = [b"\r", b"\x1b[B", b"\x1b[B", b"\x1b[B", b"\x1b[B", b"\x1b[D", b"q"]
+    sent = 0
+    opened = None
+    deadline = time.time() + 90
+    try:
+        while time.time() < deadline:
+            ready, _, _ = sel.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            if opened is None:
+                if b"\033[?25l" in out:
+                    opened = time.time() + 0.6
+                continue
+            if time.time() < opened or sent >= len(script):
+                continue
+            os.write(fd, script[sent])
+            sent += 1
+            opened = time.time() + 0.5
+        text = out.decode("utf-8", "replace")
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.waitpid(pid, os.WNOHANG)
+
+    if "\033[?25l" not in text:
+        pytest.skip("the browse never started here, so there is nothing to measure")
+
+    assert text.count("\033[?25l") == 3, (
+        "expected three raw sessions (table, detail, table): the keystrokes did not land"
+    )
+    ups = re.findall(r"\033\[(\d+)A", text)
+    assert len(ups) == 3, "one erase per level and no repaint per keypress, got %r" % (ups,)

@@ -1,12 +1,22 @@
 """The default view: one row per root, and what you can actually do with it.
 
-    ROLE | PATH | WHERE | REACH | USED / QUOTA | FILES / LIMIT | POLICY
+    role | path | where | reach | used / quota | files / limit | policy
 
-`WHERE` is the column this tool exists for. The site quota wrapper here reports
+`where` is the column this tool exists for. The site quota wrapper here reports
 `/cfs3` and `/cfs4` from a node where neither path exists, and "allocated, and
 not mounted on this node" is the most useful sentence the tool can produce. So
-the node class is in the header beside the hostname: mount visibility is a
+the node class is in the title beside the hostname: mount visibility is a
 property of the node you are standing on, not of the filesystem.
+
+**The whole view is one framed panel**, titled, ruled, and closed under the
+last row. That is `nodetop`'s shape and it is deliberately the same shape, so
+the two tools read as one family; `style.panel` carries the gradient and the
+reasoning. What the frame changed here is mostly what it made obvious: the view
+was three lines of table and three lines of chrome underneath it, and inside a
+box the chrome had nowhere to hide. So the alert teasers and the counts moved
+behind `--summary`, the usage bar went (see `fields._figure_cell`), and the
+headings went lower case and indented, which is most of the temperature
+difference.
 
 **Narrow terminals are handled by dropping columns, never by truncating a
 path.** A shortened path is a different path, and the reader cannot tell which
@@ -15,18 +25,19 @@ characters went. The stages, in order, with the reason for each place:
 ===== ====================== =====================================================
 stage what goes              why it goes there
 ===== ====================== =====================================================
-1     POLICY                 advisory site text, the widest cell, least urgent
-2     FILES / LIMIT          inodes are the second quota axis, bytes are the first
-3     ROLE                   a heuristic label, and the path already implies it
-4     the bar                drop the picture, keep the digits it illustrates
-5     REACH                  three characters, and `dirscape why` can say more
-6     USED / QUOTA           the last fact to go
+1     policy                 advisory site text, the widest cell, least urgent
+2     files / limit          inodes are the second quota axis, bytes are the first
+3     role                   a heuristic label, and the path already implies it
+4     reach                  three characters, and `dirscape why` can say more
+5     used / quota           the last fact to go
 ===== ====================== =====================================================
 
-`PATH` and `WHERE` are never dropped. Below the width those two need, the view
+`path` and `where` are never dropped. Below the width those two need, the view
 STACKS instead: the full path on its own line with the remaining cells indented
 beneath it. A path wider than the window is printed whole and left to the
-terminal's own wrap, which loses no characters.
+terminal's own wrap, which loses no characters, and **the frame comes off for
+that case**: a box can only hold a line by cutting it, and cutting a path is
+the one thing this view will not do.
 """
 
 import re
@@ -34,21 +45,27 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..model import Root, VerdictCategory, category_label
 from . import fields
-from .style import Style, legend, table, wrap
+from .style import Style, legend, panel, table, wrap
 from .style import width as measure
 
 __all__ = ["render", "COLUMNS", "DROP_STAGES", "KEEP_COLUMNS"]
 
 
 #: Column headings, in order. The index of each is what `DROP_STAGES` names.
+#:
+#: Lower case, and that is a measured choice rather than a whim. Seven headings
+#: in capitals are seven words shouting above a table of figures, and the
+#: figures are the content; `nodetop` sets its grids in lower case for the same
+#: reason and the owner named it as the reference. The `/` pairs stay, because
+#: `used / quota` is one statement and the heading has to say so.
 COLUMNS = (
-    "ROLE",
-    "PATH",
-    "WHERE",
-    "REACH",
-    "USED / QUOTA",
-    "FILES / LIMIT",
-    "POLICY",
+    "role",
+    "path",
+    "where",
+    "reach",
+    "used / quota",
+    "files / limit",
+    "policy",
 )
 
 _ROLE, _PATH, _WHERE, _REACH, _USED, _FILES, _POLICY = range(7)
@@ -57,23 +74,37 @@ _ROLE, _PATH, _WHERE, _REACH, _USED, _FILES, _POLICY = range(7)
 #: tool is for.
 KEEP_COLUMNS = (_PATH, _USED)
 
-#: Each stage is ``(columns to drop, draw the bar)``. Walked in order until one
-#: fits the window. Documented in the module docstring, and asserted in
-#: `tests/test_render_atlas.py` so the order cannot drift silently.
+#: Columns to drop, per stage, walked in order until one fits the window.
+#: Documented in the module docstring, and asserted in `tests/test_cli.py` so
+#: the order cannot drift silently.
+#:
+#: There used to be a sixth stage that kept every column and dropped the usage
+#: BAR, on the grounds that the digits survive the picture. The bar is gone
+#: from every stage now, so the stage went with it.
 DROP_STAGES = (
-    ((), True),
-    ((_POLICY,), True),
-    ((_POLICY, _FILES), True),
-    ((_POLICY, _FILES, _ROLE), True),
-    ((_POLICY, _FILES, _ROLE), False),
-    ((_POLICY, _FILES, _ROLE, _REACH), False),
+    (),
+    (_POLICY,),
+    (_POLICY, _FILES),
+    (_POLICY, _FILES, _ROLE),
+    (_POLICY, _FILES, _ROLE, _REACH),
     # WHERE goes before USED, and that ordering is the point. The last stage
     # used to drop USED, so at 40 columns the table degraded to a bare list of
     # paths with no number anywhere on it, which is not a smaller version of
     # this tool's answer but the absence of one. WHERE is context and reads
     # `here` on nearly every row anyway; USED is the answer.
-    ((_POLICY, _FILES, _ROLE, _REACH, _WHERE), False),
+    (_POLICY, _FILES, _ROLE, _REACH, _WHERE),
 )
+
+#: What the table is indented by, inside the frame, and the run of spaces
+#: between two columns.
+#:
+#: Both were two, and "horizontal spacing is also an issue" was the owner's
+#: verdict on the result: a right-aligned figure sat almost against the cell on
+#: its left, so eleven rows read as one dense block rather than as columns. Four
+#: is what `nodetop` leaves around its numeric pairs, and the room came for
+#: free out of the ten columns the bar gave back.
+_INDENT = "   "
+_GUTTER = "    "
 
 _ALIGNS = ("left", "left", "left", "left", "left", "right", "left")
 
@@ -84,9 +115,14 @@ _ATOMIC = (_PATH, _USED, _FILES)
 
 _NOTE_LIMIT = 4
 
+#: The narrowest body the frame will squeeze the layout into before the frame
+#: itself is the thing making the table not fit. Below this the panel is not
+#: the problem a reader has.
+_MIN_BODY = 28
 
-def _path_cell(root):
-    # type: (Root) -> str
+
+def _path_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> str
     """The path, or the allocation location when there is no path.
 
     An allocated root that is not mounted here HAS no path, deliberately:
@@ -95,8 +131,16 @@ def _path_cell(root):
     away the only identifying thing about the row, so the location is shown
     with a marker saying what it is. Without this the ELSEWHERE rows printed
     `?` in every column and were indistinguishable from each other.
+
+    **The directories leading up to the last one are dimmed, and not one
+    character is removed.** Four of the live rows begin `/scratch/` and three
+    begin `/project`, so at one weight the column's left half is the same
+    prefix repeated and the part that differs is the part that is hardest to
+    find. The plain text is byte for byte what it was, which is what keeps
+    `--json`, a pipe and a `NO_COLOR` terminal identical.
     """
     if root.path:
+        cell = root.path
         held = (root.policy or {}).get("contains")
         if isinstance(held, int) and held > 0:
             # The fold count, which was being stored and never shown. The
@@ -104,23 +148,30 @@ def _path_cell(root):
             # is yours, and the promise was that the parent keeps a count so
             # the information is not lost. It was lost: twenty dataset
             # collections folded into one row and nothing on screen said so.
-            return "%s +%d" % (root.path, held)
-        return root.path
+            cell = "%s +%d" % (root.path, held)
+        if style is None or not style.enabled:
+            return cell
+        lead, sep, leaf = root.path.rpartition("/")
+        fold = cell[len(root.path) :]
+        return style.dim(lead + sep) + leaf + style.dim(fold)
     location = root.policy.get("allocation_location") if root.policy else None
     if location:
         # The trailing marker is not decoration. It is the difference between
         # "you can cd here" and "your allocation database calls it this".
-        return "%s (location)" % (location,)
+        text = "%s (location)" % (location,)
+        if style is None or not style.enabled:
+            return text
+        return location + style.dim(" (location)")
     return fields.UNKNOWN
 
 
-def _row(root, style, site, show_bar):
-    # type: (Root, Style, object, bool) -> Tuple[List[str], str]
-    used, caveat = fields.quota_cell(root, style, show_bar=show_bar)
+def _row(root, style, site):
+    # type: (Root, Style, object) -> Tuple[List[str], str]
+    used, caveat = fields.quota_cell(root, style)
     files, inode_caveat = fields.inode_cell(root, style)
     cells = [
-        fields.role_cell(root),
-        _path_cell(root),
+        fields.role_cell(root, style),
+        _path_cell(root, style),
         fields.where_cell(root, style),
         fields.reach_cell(root, style),
         used,
@@ -144,27 +195,27 @@ def _align_figures(blocks, index):
     # type: (Sequence[List[str]], int) -> None
     """Right-align the used and limit figures inside an already-built cell.
 
-    `USED / QUOTA` is composed per row as one string, so the numbers land
+    `used / quota` is composed per row as one string, so the numbers land
     wherever their own width puts them and a reader cannot compare down the
     column:
 
-        836M / 30G  ...
+        836M / 30G    3%
         11T / no limit
         928K / no limit
-        22G / 100G  ...
+        22G / 100G   22%
 
     Aligning on the separator makes the same four rows read as a column of
     magnitudes, which is the entire reason to put numbers in a table:
 
-         836M / 30G       ...
+         836M / 30G          3%
           11T / no limit
          928K / no limit
-          22G / 100G      ...
+          22G / 100G        22%
 
     Done here rather than by splitting the cell into two real columns, because
-    the figure, its limit and its bar are one statement and `_ATOMIC` already
-    treats them as one unit for fitting. Widths are measured with `width`, not
-    `len`, since the cells carry colour and block characters.
+    the figure, its limit and its percentage are one statement and `_ATOMIC`
+    already treats them as one unit for fitting. Widths are measured with
+    `width`, not `len`, since the cells carry colour.
     """
     parts = []  # type: List[Optional[Tuple[str, str, str]]]
     # The third element is the limit token for a quota figure and the trailing
@@ -240,11 +291,11 @@ def _constant_columns(rows):
     return out
 
 
-def _column_width(headers, rows, columns, indent=""):
-    # type: (Sequence[str], Sequence[Sequence[str]], Sequence[int], str) -> int
+def _column_width(headers, rows, columns, indent="", gutter="  "):
+    # type: (Sequence[str], Sequence[Sequence[str]], Sequence[int], str, str) -> int
     if not columns:
         return 0
-    total = 2 * (len(columns) - 1) + measure(indent)
+    total = measure(gutter) * (len(columns) - 1) + measure(indent)
     for index in columns:
         widest = measure(headers[index])
         for row in rows:
@@ -253,27 +304,39 @@ def _column_width(headers, rows, columns, indent=""):
     return total
 
 
-def _plan(rows_bar, rows_flat, window):
-    # type: (Sequence[Sequence[str]], Sequence[Sequence[str]], int) -> Tuple[List[int], bool, bool]
-    """Choose the column set: ``(columns, show_bar, stacked)``.
+def _plan(rows, window):
+    # type: (Sequence[Sequence[str]], int) -> Tuple[List[int], bool]
+    """Choose the column set: ``(columns, stacked)``.
 
     The first stage that fits wins. When none does, the caller stacks, which is
     the only degradation left that does not shorten a path.
     """
-    for dropped, show_bar in DROP_STAGES:
+    for dropped in DROP_STAGES:
         columns = [i for i in range(len(COLUMNS)) if i not in dropped]
-        rows = rows_bar if show_bar else rows_flat
-        if _column_width(COLUMNS, rows, columns) <= window:
-            return columns, show_bar, False
-    return [_PATH, _USED], False, True
+        if _column_width(COLUMNS, rows, columns, _INDENT, _GUTTER) <= window:
+            return columns, False
+    return [_PATH, _USED], True
 
 
-def _header(roots, meta, style):
-    # type: (Sequence[Root], fields.RunMeta, Style) -> str
-    # One line, and only facts that change what a reader does next. The tool's
-    # own name and version were dropped: a user who wants them types
-    # `--version`, and printing them on every run costs a line of the window
-    # for something nobody reads twice.
+def _header(roots, meta, style, size=None):
+    # type: (Sequence[Root], fields.RunMeta, Style, Optional[int]) -> str
+    """The title line, inside the frame.
+
+    Only facts that qualify every row underneath it. **The user is on it now**,
+    ahead of the host: a quota is per user, so "whose storage is this" is the
+    scope of the whole table and it was the one thing the header never said.
+
+    **The run's own elapsed time came off.** `2.7s` is the tool talking about
+    itself rather than about the storage, `--timing` reports it properly and
+    in more detail, and it was the only item on the line that changed on every
+    single run for no reason a reader acts on. The version is still absent for
+    the same reason: `--version` answers that.
+
+    The weights are the palette's tiers rather than a decoration: the tool and
+    the scope (`user`, `host`) identify, so they take `accent` and `head`; the
+    node class and the device count are measurements, so `muted`; the baseline
+    age is context, so `dim`.
+    """
     node = fields.safe(meta.node_class, limit=32)
     if not node or node == "unknown":
         # `discover.mounts.node_class` answers the literal string "unknown".
@@ -281,19 +344,21 @@ def _header(roots, meta, style):
         # screen the answer to an unanswered question is the mark.
         node = fields.UNKNOWN
     host = fields.safe(meta.host, limit=64) or fields.UNKNOWN
+    user = fields.safe(meta.user, limit=64) or fields.UNKNOWN
     items = [
+        style.head(fields.safe(meta.tool, limit=32) or "dirscape"),
+        style.accent(user),
         style.accent(host.split(".")[0]),
-        node,
-        fields.device_count(roots, meta),
-        fields.human_duration(meta.elapsed_s),
+        style.muted(node),
+        style.muted(fields.device_count(roots, meta)),
     ]
     if meta.baseline_at is not None:
-        items.append("baseline %s" % (fields.age_phrase(meta.baseline_at, meta.now),))
-    return legend(items, style, size=style.size, indent="")
+        items.append(style.dim("baseline %s" % (fields.age_phrase(meta.baseline_at, meta.now),)))
+    return legend(items, style, size=size if size else style.size, indent="")
 
 
-def _delta_lines(roots, changes, style):
-    # type: (Sequence[Root], Sequence[object], Style) -> Tuple[List[str], List[str]]
+def _delta_lines(roots, changes, style, size=None):
+    # type: (Sequence[Root], Sequence[object], Style, Optional[int]) -> Tuple[List[str], List[str]]
     """``(stranded lines, change lines)``. Change records are NOT computed here.
 
     Stranded comes out separately so the caller can give it its own heading
@@ -355,8 +420,9 @@ def _delta_lines(roots, changes, style):
             colour = paint.get(name, style.muted)
             if name == "stranded":
                 stranded.append(
-                    "  %s %s  %s"
+                    "%s%s %s  %s"
                     % (
+                        _INDENT,
                         colour(g.warn),
                         path or fields.UNKNOWN,
                         style.muted(because or fields.UNKNOWN),
@@ -364,71 +430,85 @@ def _delta_lines(roots, changes, style):
                 )
                 continue
             mark = g.warn if name == "gone" else " "
-            deltas.append(
-                "  %s %s  %s  %s"
-                % (
-                    colour(mark),
-                    colour(name.ljust(room)),
-                    path or fields.UNKNOWN,
-                    style.muted(because or fields.UNKNOWN),
-                )
+            head = "%s%s %s  %s" % (
+                _INDENT,
+                colour(mark),
+                colour(name.ljust(room)),
+                path or fields.UNKNOWN,
             )
+            reason = because or fields.UNKNOWN
+            if size is None or measure(head) + 2 + measure(reason) <= size:
+                deltas.append("%s  %s" % (head, style.muted(reason)))
+                continue
+            # Wrapped onto a hanging indent rather than cut. These lines ARE
+            # `dirscape new`, and the useful half of a `shrank` is the second
+            # half: "mmlsquota reports 853.5 MiB, where the run at 14:53
+            # reported 3.3 GiB". Inside a frame an over-long line is truncated,
+            # so left alone every reason ended in an ellipsis exactly where the
+            # comparison began.
+            deltas.append(head)
+            hang = " " * (measure(_INDENT) + 2 + room + 2)
+            for line in wrap(reason, indent=hang, size=size, style=style).splitlines():
+                deltas.append(style.muted(line))
     return stranded, deltas
 
 
-def _notes(roots, caveats, style):
-    # type: (Sequence[Root], Sequence[Tuple[str, str]], Style) -> List[str]
-    lines = []  # type: List[str]
-    for path, text in caveats:
-        lines.append("  %s %s  %s" % (style.muted(style.g.sep), path, style.muted(text)))
+def _caveat_count(roots, caveats):
+    # type: (Sequence[Root], Sequence[Tuple[str, str]]) -> int
+    """How many rows carry a qualification on their figure.
+
+    A COUNT and not the sentences. There used to be a `_notes` builder that
+    formatted one line per caveat, capped at four, and nothing ever printed
+    what it returned: the only caller took its length and handed that to a
+    footer argument the footer ignored. Printed for real under `--summary` it
+    was four lines of prose with an ellipsis eaten into each of them, because
+    a caveat is a sentence and a table cell's worth of width is not a place
+    for one. `dirscape why <path>` is where they belong and it already says
+    them in full, so the summary says how many there are and points there.
+    """
+    total = len(caveats)
     for root in roots:
         if root.symlink_target and root.crosses_boundary:
-            lines.append(
-                "  %s %s %s %s  %s"
-                % (
-                    style.warn(style.g.warn),
-                    root.path,
-                    style.g.arrow,
-                    root.symlink_target,
-                    style.warn(
-                        "crosses a quota boundary, billed to %s" % (fields.billed_to(root, roots),)
-                    ),
-                )
-            )
-    if len(lines) > _NOTE_LIMIT:
-        hidden = len(lines) - _NOTE_LIMIT
-        lines = lines[:_NOTE_LIMIT]
-        lines.append(style.dim("  %s %d more (see --json)" % (style.g.sep, hidden)))
-    return lines
+            total += 1
+    return total
 
 
-def _footer(roots, style, dropped, window, hidden=0, legend_on=False, notes=0):
-    # type: (Sequence[Root], Style, Sequence[str], int, int, bool) -> List[str]
-    """At most two lines, and often none.
+def _footer(roots, style, dropped, window, hidden=0, legend_on=False, counts=False, caveats=0):
+    # type: (Sequence[Root], Style, Sequence[str], int, int, bool, bool, int) -> List[str]
+    """The counts line and the glyph legend, and by default NEITHER.
 
-    The previous version printed six: a dropped-column notice, an unmeasured
-    count, the `rdu` handoff and a two-line glyph legend, every single run.
-    That is four lines of chrome under a table, and a legend reprinted on every
-    invocation is read once and skipped forever after. The glyphs are now
-    explained by `--legend`, and the rest is folded into one line.
+    It printed six lines once: a dropped-column notice, an unmeasured count,
+    the `rdu` handoff and a two-line glyph legend, on every single run. That
+    became one line, and one line is still one line of chrome a reader did not
+    ask for on every run of the tool. **So the counts now need `--summary` and
+    the legend still needs `--legend`**, which is `counts` and `legend_on`
+    here. Nothing is lost: `--all` shows the held-back rows, `dirscape why`
+    explains an unmeasured one, and `--json` has every column.
     """
     g = style.g
     bits = []  # type: List[str]
 
-    if hidden:
-        bits.append("%d hidden (%s)" % (hidden, style.accent("--all")))
-    stuck = [r for r in roots if fields.unmeasured(r)]
-    if stuck:
-        bits.append("%d unmeasured (%s)" % (len(stuck), style.accent("dirscape why <path>")))
-    if dropped:
-        bits.append(
-            "%d column%s hidden (%s)"
-            % (len(dropped), "" if len(dropped) == 1 else "s", style.accent("--json"))
-        )
+    if counts:
+        if hidden:
+            bits.append("%d hidden (%s)" % (hidden, style.accent("--all")))
+        stuck = [r for r in roots if fields.unmeasured(r)]
+        pointer = style.accent("dirscape why <path>")
+        if stuck:
+            bits.append("%d unmeasured (%s)" % (len(stuck), pointer))
+        if caveats:
+            # Sharing one pointer with the line above rather than repeating
+            # it: two advisories that both end in `dirscape why <path>` is the
+            # same sentence twice.
+            bits.append("%d qualified%s" % (caveats, "" if stuck else " (%s)" % (pointer,)))
+        if dropped:
+            bits.append(
+                "%d column%s hidden (%s)"
+                % (len(dropped), "" if len(dropped) == 1 else "s", style.accent("--json"))
+            )
 
     lines = []  # type: List[str]
     if bits:
-        lines.append(style.dim("  " + (" %s " % (g.sep,)).join(bits)))
+        lines.append(style.dim(_INDENT + ("  %s  " % (g.sep,)).join(bits)))
 
     if legend_on:
         for text in (
@@ -437,7 +517,7 @@ def _footer(roots, style, dropped, window, hidden=0, legend_on=False, notes=0):
             "marks: ~ figure attributed rather than published, %s space allocated "
             "and not yet accounted for" % (g.doubt,),
         ):
-            for line in wrap(text, indent="  ", size=window, style=style).splitlines():
+            for line in wrap(text, indent=_INDENT, size=window, style=style).splitlines():
                 lines.append(style.dim(line))
     return lines
 
@@ -453,7 +533,9 @@ def render(
     legend_on=False,
     all_roots=None,
     group=False,
-    warnings=(),
+    summary=False,
+    deltas=False,
+    frame=True,
 ):
     # type: (...) -> str
     """The atlas, as one string.
@@ -466,6 +548,22 @@ def render(
     Root order is the caller's. Discovery order carries information (the mount
     table's order, then the allocation database's) and re-sorting here would
     throw it away.
+
+    ``summary`` adds the alert teasers and the counts back. **Off by default,
+    and that is the owner's call on three lines of the live view**: "don't show
+    things like [that], it looks ugly and uninformative at all. if they want,
+    they can display it when starting the app with the right flag." Nothing is
+    lost, which is why it is a good trade: `dirscape stranded`, `dirscape
+    elsewhere` and `dirscape --all` are first-class commands that give the
+    detail instead of a one-line teaser for it.
+
+    ``deltas`` prints the change records one line each instead of counting
+    them, which is `dirscape new`'s content rather than anybody's chrome.
+
+    ``frame`` draws the panel. A caller that needs the bare lines turns it off:
+    `cli._browse` does, so it can paint the selection band on a content line
+    and frame the result, which keeps the band inside the border instead of
+    inverting the border with it.
     """
     style = style or Style()
     window = size if size else style.size
@@ -475,19 +573,25 @@ def render(
     # the `stranded` line, because the rows those lines describe are exactly
     # the ones the default view holds back.
     census = list(all_roots) if all_roots is not None else list(roots)
-    out = [_header(roots, info, style)]
+    # The frame spends two columns of chrome and one space on each side, so
+    # everything inside it is laid out against this and not against the window.
+    budget = max(_MIN_BODY, window - 4) if frame else window
+    # SPLIT, because the title wraps. `legend` breaks to a second line when
+    # the next item will not fit, and a content line carrying an embedded
+    # newline broke the frame open at 60 columns: the border closed after
+    # `compute` and the rest of the title landed outside the box with the
+    # right-hand border stuck on the end of it.
+    out = _header(roots, info, style, size=budget).splitlines()
 
     if not roots:
-        out.append(style.dim("  no roots were handed to this view"))
-        return "\n".join(out)
+        out.append(style.dim(_INDENT + "no roots were handed to this view"))
+        return _finish(out, style, window, frame)
 
-    rows_bar = []  # type: List[List[str]]
-    rows_flat = []  # type: List[List[str]]
+    rows = []  # type: List[List[str]]
     caveats = []  # type: List[Tuple[str, str]]
     for root in roots:
-        cells, caveat = _row(root, style, site, True)
-        rows_bar.append(cells)
-        rows_flat.append(_row(root, style, site, False)[0])
+        cells, caveat = _row(root, style, site)
+        rows.append(cells)
         if caveat:
             caveats.append((root.path, caveat))
 
@@ -496,45 +600,50 @@ def render(
     # which spends nine characters of the window saying nothing. Dropped here
     # rather than in `_plan`, because `_plan` is about fitting and this is
     # about content.
-    constant = _constant_columns(rows_bar)
+    constant = _constant_columns(rows)
 
     if group:
-        _align_figures((rows_bar, rows_flat), _USED)
+        _align_figures((rows,), _USED)
         # The role is printed once per run of rows that share it. Nine rows
         # reading `project`, `project`, `project` is the table stuttering: the
         # word carries information the first time and is visual noise after
         # that. Blanking the repeat turns the column into a quiet grouping
         # without moving a single cell, which keeps every number in the same
         # place a reader last saw it.
-        for block in (rows_bar, rows_flat):
-            previous = None
-            for row in block:
-                current = row[_ROLE]
-                row[_ROLE] = "" if current == previous else current
-                previous = current
+        previous = None
+        for row in rows:
+            current = row[_ROLE]
+            row[_ROLE] = "" if current == previous else current
+            previous = current
         # Inode figures are detail, not headline. The default view answers
         # "where can I put data and how full is it"; a file count belongs in
         # `--all`, `--json` and `why`, where a reader has already asked for
         # more than a glance.
         constant = set(constant) | {_FILES}
 
-    columns, show_bar, stacked = _plan(rows_bar, rows_flat, window)
-    rows = rows_bar if show_bar else rows_flat
+    columns, stacked = _plan(rows, budget)
     columns = [i for i in columns if i not in constant] or columns
     dropped = [COLUMNS[i] for i in range(len(COLUMNS)) if i not in columns]
     # A dropped-because-constant column is not news: the reader lost nothing.
     dropped = [name for name in dropped if COLUMNS.index(name) not in constant]
 
     if stacked:
+        # No frame here, deliberately. A path wider than the window is printed
+        # whole and left to the terminal's own wrap, and a border cannot hold
+        # a line it is narrower than without cutting it.
         out.append("")
         for row in rows:
             # The path alone on its line, never cut. Everything else follows
             # indented, so the two read as one entry.
             out.append(style.head(row[_PATH]))
             facts = [row[i] for i in (_WHERE, _REACH, _USED) if row[i]]
-            out.append("    " + "  ".join(facts))
+            out.append(_INDENT + "  ".join(facts))
         out.append("")
-        out.extend(_footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on))
+        out.extend(
+            _footer(
+                roots, style, dropped, window, hidden=hidden, legend_on=legend_on, counts=summary
+            )
+        )
         return "\n".join(out)
 
     body, extra = table(
@@ -542,38 +651,99 @@ def render(
         [[row[i] for i in columns] for row in rows],
         aligns=[_ALIGNS[i] for i in columns],
         style=style,
-        size=window,
+        size=budget,
         keep=[columns.index(i) for i in KEEP_COLUMNS if i in columns],
         atomic=[columns.index(i) for i in _ATOMIC if i in columns],
         drop_empty=False,
+        indent=_INDENT,
+        gutter=_GUTTER,
+        # Ruled ABOVE the headings instead, spanning the panel. A dashed
+        # segment under each heading draws the eye across the table's own
+        # width and then stops, which reads as a second, shorter frame inside
+        # the first one; one full-width rule separates the title from the
+        # table and leaves the headings sitting on nothing.
+        underline=False,
     )
+    # A blank line, then the rule. The blank is what stops the title reading
+    # as a first row of the table, and the rule is what stops the headings
+    # reading as a second title.
     out.append("")
-    out.append(body)
+    # A placeholder, because the rule has to span the panel and the panel is
+    # only as wide as its widest line, which is not known until the table is
+    # built.
+    rule_at = len(out)
+    out.append("")
+    out.extend(body.splitlines())
     dropped.extend(extra)
 
-    stranded, deltas = _delta_lines(census, changes, style)
+    stranded, changed = _delta_lines(census, changes, style, size=budget)
 
-    # Panels are SUMMARISED by default and expanded by a subcommand. The
-    # previous version printed one line per stranded fileset, one per change
-    # and one per note, and on a real account that was nineteen lines under
-    # the table restating what the table had already implied. A reader scans
-    # a summary; nobody reads nineteen.
-    alerts = []  # type: List[Tuple[str, str]]
+    if deltas and changed:
+        # `dirscape new`'s content. Counting them here and pointing the reader
+        # at `dirscape new` is what the default view does; inside `dirscape
+        # new` that is a view telling you to go and look at itself.
+        out.append("")
+        out.extend(changed)
+
+    alerts = _alerts(census, stranded, changed if not deltas else [], style) if summary else []
+    out.extend(alerts)
+
+    tail = _footer(
+        roots,
+        style,
+        dropped,
+        budget,
+        hidden=hidden,
+        legend_on=legend_on,
+        counts=summary,
+        caveats=_caveat_count(roots, caveats),
+    )
+    if tail:
+        # A blank ahead of it, unless the alerts already opened this block: the
+        # counts belong WITH the teasers they qualify, and two blank lines
+        # between the table and one dim line reads as a gap rather than a
+        # separation.
+        if not alerts:
+            out.append("")
+        out.extend(tail)
+
+    inner = max([measure(line) for i, line in enumerate(out) if i != rule_at] or [0])
+    out[rule_at] = style.dim(style.g.h * max(1, min(inner, budget)))
+    return _finish(out, style, window, frame)
+
+
+def _finish(lines, style, window, frame):
+    # type: (Sequence[str], Style, int, bool) -> str
+    """Frame the block, or hand back the bare lines."""
+    if not frame:
+        return "\n".join(lines)
+    return panel(lines, style=style, size=window)
+
+
+def _alerts(census, stranded, changed, style):
+    # type: (Sequence[Root], Sequence[str], Sequence[str], Style) -> List[str]
+    """The `--summary` teasers: what is wrong, and which command explains it.
+
+    One line each and a summary rather than a list, because the version that
+    printed one line per stranded fileset, one per change and one per note was
+    nineteen lines under a ten-line table on a real account. A reader scans a
+    summary; nobody reads nineteen.
+    """
+    alerts = []  # type: List[Tuple[object, str, str]]
     if stranded:
         held = fields.total_stranded(census)
         alerts.append(
             (
+                style.bad,
                 "%s %s"
                 % (
-                    style.bad(style.g.warn),
-                    style.head(
-                        "%d fileset%s hold%s %s you cannot reach"
-                        % (
-                            len(stranded),
-                            "" if len(stranded) == 1 else "s",
-                            "s" if len(stranded) == 1 else "",
-                            held or "space",
-                        )
+                    style.g.warn,
+                    "%d fileset%s hold%s %s you cannot reach"
+                    % (
+                        len(stranded),
+                        "" if len(stranded) == 1 else "s",
+                        "s" if len(stranded) == 1 else "",
+                        held or "space",
                     ),
                 ),
                 "dirscape stranded",
@@ -583,70 +753,41 @@ def render(
     if elsewhere:
         alerts.append(
             (
+                style.warn,
                 "%s %s"
                 % (
-                    style.warn(style.g.warn),
-                    style.head(
-                        "%d allocation%s with no path here"
-                        % (len(elsewhere), "" if len(elsewhere) == 1 else "s")
-                    ),
+                    style.g.warn,
+                    "%d allocation%s with no path here"
+                    % (len(elsewhere), "" if len(elsewhere) == 1 else "s"),
                 ),
                 "dirscape elsewhere",
             )
         )
-    if deltas:
+    if changed:
         alerts.append(
             (
+                style.info,
                 "%s %s"
                 % (
-                    style.info(style.g.warn),
-                    style.head(
-                        "%d change%s since the baseline"
-                        % (len(deltas), "" if len(deltas) == 1 else "s")
-                    ),
+                    style.g.warn,
+                    "%d change%s since the baseline"
+                    % (len(changed), "" if len(changed) == 1 else "s"),
                 ),
                 "dirscape new",
             )
         )
-    if alerts:
-        out.append("")
-        # Padded so the commands form a column. Three lines whose pointers
-        # start at three different offsets read as three unrelated sentences;
-        # aligned, they read as a menu.
-        room = max(measure(text) for text, _ in alerts)
-        for text, command in alerts:
-            pad = " " * max(1, room - measure(text) + 3)
-            out.append("  %s%s%s" % (text, pad, style.accent(command)))
-
-    # The note count joins the footer rather than claiming a line of its own.
-    # Two separate one-line advisories both ending in `dirscape why <path>` is
-    # the same sentence twice.
-    notes = len(_notes(roots, caveats, style))
-    # Run-level warnings, which had nowhere to go at all. They were collected
-    # into `Run.warnings` and only ever reached `--json`, so a malformed
-    # `/etc/dirscape/site.conf`, a damaged baseline, a failed plugin and a
-    # baseline that could not be written were every one of them silent in the
-    # view a user actually reads.
-    trouble = [text for text in warnings if text]
-    if trouble:
-        out.append("")
-        for text in trouble[:2]:
-            body = "%s %s" % (style.g.warn, text)
-            for line in wrap(body, indent="  ", size=window, style=style).splitlines():
-                out.append(style.warn(line))
-        if len(trouble) > 2:
-            out.append(
-                style.dim(
-                    "  %d more warning%s (%s)"
-                    % (
-                        len(trouble) - 2,
-                        "" if len(trouble) - 2 == 1 else "s",
-                        style.accent("--json"),
-                    )
-                )
-            )
-
-    tail = _footer(roots, style, dropped, window, hidden=hidden, legend_on=legend_on, notes=notes)
-    if tail:
-        out.extend(tail)
-    return "\n".join(out)
+    if not alerts:
+        return []
+    # Painted in the alert's OWN colour rather than bold white. A white
+    # sentence with a coloured triangle in front of it says the urgent thing
+    # twice in two vocabularies; one hue for glyph and prose reads as one
+    # statement, and leaves bold white to mean "this is a heading".
+    lines = [""]
+    # Padded so the commands form a column. Three lines whose pointers start at
+    # three different offsets read as three unrelated sentences; aligned, they
+    # read as a menu.
+    room = max(measure(text) for _, text, _ in alerts)
+    for tone, text, command in alerts:
+        gap = " " * max(1, room - measure(text) + 3)
+        lines.append("%s%s%s%s" % (_INDENT, tone(text), gap, style.accent(command)))
+    return lines

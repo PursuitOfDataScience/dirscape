@@ -8,8 +8,8 @@ six places is a rule with six chances to be wrong.
 So there is no code path here from an unknown to a number, a blank or a zero:
 
 * a root with no quota backend gets the unknown mark, never "no limit"
-* a `QuotaRow.fraction` of None gets the unknown mark and NO bar, because an
-  empty bar reads as plenty of room
+* a `QuotaRow.fraction` of None gets the unknown mark and NO percentage,
+  because an invented 0% reads as plenty of room
 * a `Verdict` that is neither confirmed nor refuted gets the unknown mark,
   never "no"
 * a `VerdictCategory` never reaches a prose column: `category_label()` does,
@@ -38,7 +38,7 @@ from ..model import (
     sanitize,
     unknown,
 )
-from .style import Style, bar
+from .style import Style
 
 __all__ = [
     "UNKNOWN",
@@ -400,8 +400,8 @@ def pick_row(snapshot, path, kind="blocks"):
     return None, "", "the backend answered without a row for this path"
 
 
-def _limit_text(row, formatter):
-    # type: (QuotaRow, object) -> str
+def _limit_text(row, formatter, style=None):
+    # type: (QuotaRow, object, Optional[Style]) -> str
     """The limit, "no limit" for an explicit zero, unknown when unreported.
 
     The two are different facts and the model collapses them in `limit`, which
@@ -409,16 +409,24 @@ def _limit_text(row, formatter):
     enforced here"; a backend that printed nothing said nothing. The word
     "unlimited" appears nowhere in this package: it is the word that carries
     the lie when a quota was simply not measured.
+
+    **"no limit" is DIM, and the words stay.** It was on five of ten rows of
+    the live default view at the same weight as the figures, so the loudest
+    repeated token in the table was the one place there is no number to read.
+    Dim is the context tier, which is what it is: not a measurement, and not
+    the absence of one either. Replacing it with a marker was considered and
+    refused, because `?` already means "nobody measured this" and the two must
+    not converge.
     """
     if row.limit is not None:
         return formatter(row.limit)  # type: ignore[operator]
     if row.soft == 0 or row.hard == 0:
-        return "no limit"
+        return (style or Style()).dim("no limit")
     return UNKNOWN
 
 
-def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
-    # type: (Root, Optional[QuotaSnapshot], str, object, Style, int, bool) -> Tuple[str, str]
+def _figure_cell(root, snapshot, kind, formatter, style, percent=False):
+    # type: (Root, Optional[QuotaSnapshot], str, object, Style, bool) -> Tuple[str, str]
     row, how, why = pick_row(snapshot, root.path, kind)
     if row is None:
         # No quota to report. Before giving up, say what the FILESYSTEM has
@@ -445,7 +453,7 @@ def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
     # reads as a mark against the limit or simply as a typo.
     if row.in_doubt:
         used = "%s%s" % (used, style.muted(g.doubt))
-    text = "%s / %s" % (used, _limit_text(row, formatter))
+    text = "%s / %s" % (used, _limit_text(row, formatter, style))
     caveats = []  # type: List[str]
     if how == "inferred":
         # `~` before the figure, so a reader scanning the column sees which
@@ -455,17 +463,31 @@ def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
     if row.guessed:
         caveats.append("the mount for this row was inferred from its name")
     fraction = row.fraction
-    if fraction is not None:
-        doubt_share = None  # type: Optional[float]
-        limit = row.limit
-        if row.in_doubt and limit:
-            doubt_share = float(row.in_doubt) / float(limit)
-        if show_bar:
-            text += "  " + bar(fraction, bar_size, style, doubt=doubt_share)
+    if percent and fraction is not None:
+        # **There is no bar here any more, and that is the whole point.**
+        #
+        # It was eight cells of block characters plus the spaces to align
+        # them, spent on a lossy picture of the exact percentage printed
+        # immediately to their right, in the widest column of the table. It
+        # was also blank on five of the ten rows of the live default view (an
+        # unlimited quota has no fraction and a capacity fallback has no
+        # quota), so the one thing a meter column is for, being scanned down,
+        # it could not do. At 3% it drew a single thin glyph that read as
+        # dirt, at 0% it was eight cells of trough saying what `0B` already
+        # said, and under the interactive highlight its foreground colours
+        # became the band's BACKGROUND and painted coloured blocks over the
+        # selection. Owner's verdict: "why do we need this bar here".
+        #
+        # The graded colour survives and now carries fullness on its own,
+        # which is what `tint` was always for. Two spaces before the figure,
+        # never one: `atlas._align_figures` splits the tail on the first run
+        # of two, and with a single space a bare `100%` left it nothing to
+        # split on and the column lost its alignment.
+        #
         # Width 3 so 3%, 22% and 100% share a right edge. Left-aligned they
         # formed a ragged fringe down the column, which is the one place a
         # percentage is worth reading next to its neighbours.
-        text += " " + style.tint("%3d%%" % (int(round(fraction * 100)),), fraction)
+        text += "  " + style.tint("%3d%%" % (int(round(fraction * 100)),), fraction)
         if fraction >= 1.0:
             text += style.bad(g.warn)
     if row.in_doubt:
@@ -478,18 +500,26 @@ def _figure_cell(root, snapshot, kind, formatter, style, bar_size, show_bar):
     return text, "; ".join(c for c in caveats if c)
 
 
-def quota_cell(root, style=None, bar_size=8, show_bar=True):
-    # type: (Root, Optional[Style], int, bool) -> Tuple[str, str]
-    """``used / limit`` with a bar, or the unknown mark. Plus any caveat."""
+def quota_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> Tuple[str, str]
+    """``used / limit`` and a graded percentage, or the unknown mark.
+
+    Plus any caveat.
+    """
     style = style or Style()
-    return _figure_cell(root, root.quota, "blocks", human_bytes, style, bar_size, show_bar)
+    return _figure_cell(root, root.quota, "blocks", human_bytes, style, percent=True)
 
 
 def inode_cell(root, style=None):
     # type: (Root, Optional[Style]) -> Tuple[str, str]
-    """``files / limit``, no bar: the bytes column already carries the picture."""
+    """``files / limit``, with no percentage.
+
+    One graded figure per row is a ranking; two is a reader deciding which of
+    them the row was sorted by. Bytes are the axis that stops the writes, so
+    bytes get the colour.
+    """
     style = style or Style()
-    return _figure_cell(root, root.inode_quota, "files", human_count, style, 0, False)
+    return _figure_cell(root, root.inode_quota, "files", human_count, style)
 
 
 def in_doubt_of(root):
@@ -701,19 +731,37 @@ def reach_cell(root, style=None):
         return style.warn(text + g.warn)
     if root.reach == Reach.CLOSED:
         return style.bad(text)
+    if text == "rwx":
+        # Eight of ten rows of the live default view read `rwx`, so at full
+        # weight the column was a block of identical letters drawing the eye
+        # away from the one row that reads `r-x`. Muted rather than dim: it is
+        # a probe RESULT and not context, and the tiers are the two different
+        # things. The restricted rows keep full weight, which is the whole
+        # reason to quiet this one.
+        return style.muted(text)
     return text
 
 
-def role_cell(root):
-    # type: (Root) -> str
+def role_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> str
     """The advisory role, or the unknown mark.
 
     Advisory: `sitecfg` derives it from path patterns, and `model` says it is
     "never used to decide access". It is still the first thing a reader looks
     for, which is why it leads the row and is also the first identity-shaped
     column the atlas gives up when the window is narrow.
+
+    **Dim, because it is a guess derived from the path beside it.** A word in
+    the context tier still groups a run of rows at a glance, which is the job;
+    at full weight it was competing with the figures for attention it had not
+    earned. The word itself stays: a coloured marker in its place would put
+    the only copy of the role in the colour channel, and `NO_COLOR` has to
+    tell every state of this tool apart.
     """
-    return safe(root.role, limit=32) or UNKNOWN
+    text = safe(root.role, limit=32)
+    if not text:
+        return UNKNOWN
+    return (style or Style()).dim(text)
 
 
 # --------------------------------------------------------------------------
@@ -765,7 +813,26 @@ def merged_policy(root, site=None):
     # integration run printed `rank=primary` in the POLICY cell of every row,
     # which tells a reader nothing and looks like a leaked internal, because
     # it is one.
-    internal = ("rank", "allocation_location", "allocation_accounts", "allocation_gb")
+    #
+    # The list started at `rank` and was short by six. A 200 column run put
+    # `crosses_to=['/project/hpc/jdoe42']`, `contains=2`, `free_bytes=...` and
+    # `size_bytes=...` in the POLICY column, and every one of those is already
+    # rendered properly somewhere else in the same view: the fold count is the
+    # `+2` on the path, the free figure is the `886G free` in the quota
+    # column, and the crossing is the symlink note. So the column was showing
+    # raw internals beside their own formatted selves.
+    internal = (
+        "rank",
+        "rank_reason",
+        "allocation_location",
+        "allocation_accounts",
+        "allocation_gb",
+        "free_bytes",
+        "size_bytes",
+        "contains",
+        "crosses_to",
+        "fileset_is_filesystem_root",
+    )
     if callable(lookup):
         published = lookup(root.path)
         if isinstance(published, dict):

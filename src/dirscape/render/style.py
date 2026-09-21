@@ -38,11 +38,12 @@ __all__ = [
     "Style",
     "resolve_style",
     "width",
+    "plain",
     "pad",
     "truncate",
     "term_width",
-    "bar",
     "table",
+    "panel",
     "rule",
     "legend",
     "wrap",
@@ -116,6 +117,22 @@ def width(text):
             continue
         total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
     return total
+
+
+def plain(text):
+    # type: (str) -> str
+    """The text with every escape removed, exactly what :func:`width` measures.
+
+    Public because two callers outside this module need the STRING and not
+    just its width. `interactive.highlight` paints a selected row as one
+    uniform inverse band, and any surviving foreground code inside that band
+    becomes the BACKGROUND under inverse video: measured in a pty, the usage
+    bar's three coloured segments painted three differently coloured blocks
+    and the band appeared to stop at the bar. `cli._browse` locates a row by
+    its path, which no longer survives as a substring once the path cell
+    dims its parent directories.
+    """
+    return _strip_ansi(text)
 
 
 def pad(text, size, align="left", have=None):
@@ -229,16 +246,11 @@ _GLYPHS = (
     ("sep", "·", "-"),
     ("ellipsis", "…", "..."),
     ("bullet", "⏺", "*"),
-    # Eighth blocks, so a bar of 8 cells resolves about 1/64 and a nearly
-    # empty quota still shows something.
-    ("blocks", "▏▎▍▌▋▊▉█", "#"),
-    # The bar's remainder. ASCII is a colon rather than a period: a period is
-    # too common in paths and prose for a reader, or a test, to tell a trough
-    # from a sentence.
-    ("trough", "░", ":"),
     # Space the backend says is allocated but has not accounted for
-    # (`blockInDoubt`). Drawn into the bar AND used as the cell marker, so the
-    # picture and the note agree.
+    # (`blockInDoubt`), marked on the used figure itself. There used to be a
+    # matching shade inside a usage bar so the picture and the note agreed;
+    # the bar is gone (see `fields._figure_cell`) and the marker is the whole
+    # of that fact now.
     ("doubt", "▒", "+"),
     # A treemap cell's fill.
     ("tile", "▓", "="),
@@ -401,6 +413,15 @@ class Style(object):
 
         The colourless branch is part of the honest-unknown rule: a hue on the
         unknown mark would imply a reading behind it, and there is none.
+
+        **Bold above `WARN_FRACTION`, and only there.** With the usage bar
+        gone from the table the graded colour is the only picture of fullness
+        left, and four ramp steps of increasing lightness are a gentle
+        gradient: a reader scanning ten rows for the one that is about to
+        stop their writes needs the crossing of the filesystem's own
+        threshold to be a step change rather than one more shade. Weight is
+        the axis that is still free, since hue is spoken for by the ramp and
+        by the verdict trio.
         """
         role = self.role_for(fraction)
         if not role:
@@ -409,7 +430,7 @@ class Style(object):
             if not self.enabled or not text:
                 return text
             return self._sgr(_RAMP[int(role[4:])]) + text + "\033[0m"
-        return self.paint(role, text)
+        return self.paint(role, text, bold=True)
 
     @staticmethod
     def role_for(fraction):
@@ -462,6 +483,19 @@ class Style(object):
         # type: (str) -> str
         return self.paint("text", text, bold=True)
 
+    def column(self, text):
+        # type: (str) -> str
+        """A column HEADING, which is a label rather than a finding.
+
+        Deliberately not `head`. Bold white on every heading of every table
+        made the labels the brightest thing on screen, competing with the
+        figures underneath them for the one row a reader is actually hunting
+        for. `muted` keeps them legible and puts them behind the numbers,
+        which leaves three weights in the table instead of two: findings at
+        full brightness, headings muted, the rule under them dim.
+        """
+        return self.paint("muted", text, bold=True)
+
 
 def resolve_style(color="auto", ascii_only=None, stream=None, size=None, env=None):
     # type: (str, Optional[bool], object, Optional[int], Optional[Dict[str, str]]) -> Style
@@ -495,72 +529,6 @@ def resolve_style(color="auto", ascii_only=None, stream=None, size=None, env=Non
 
 
 # --------------------------------------------------------------------------
-# meters
-# --------------------------------------------------------------------------
-
-
-def bar(fraction, size=8, style=None, doubt=None):
-    # type: (float, int, Optional[Style], Optional[float]) -> str
-    """A horizontal meter with sub-cell resolution.
-
-    **Raises on an unmeasured fraction rather than drawing an empty bar.** An
-    empty bar reads as "plenty of room", which is the same lie as reporting an
-    unmeasured quota as having no limit, so there is no code path from None to
-    a picture: a caller with nothing to draw prints the unknown mark instead.
-    That is why this signature takes a float and not an Optional.
-
-    ``doubt`` is the share of the limit the backend says is allocated but not
-    yet accounted for. It is drawn after the fill in its own shade, so the
-    reader can see that the figure has room to move before they go and compare
-    it against `du`.
-    """
-    if fraction is None:
-        raise ValueError(
-            "bar() needs a measured fraction. Print the unknown mark instead: "
-            "an empty bar reads as plenty of room."
-        )
-    style = style or Style()
-    g = style.g
-    size = max(1, size)
-    fraction = max(0.0, min(1.0, float(fraction)))
-    whole = fraction >= 1.0
-
-    if not g.unicode:
-        filled = int(round(fraction * size))
-        # Short of the whole, keep one cell of trough. ASCII has no partial
-        # block to spend, so the cell is the smallest reserve there is, and a
-        # bar drawn completely full has to mean all of it: 5115 of 5120 is the
-        # one thing a meter must not round away.
-        if not whole:
-            filled = min(filled, max(0, size - 1))
-        fill = g.blocks * filled
-        drawn = width(fill)
-    else:
-        eighths = int(round(fraction * size * 8))
-        if not whole:
-            eighths = min(eighths, max(0, size * 8 - 1))
-        full, remainder = divmod(eighths, 8)
-        fill = g.blocks[-1] * full
-        if remainder:
-            fill += g.blocks[remainder - 1]
-        drawn = width(fill)
-
-    room = max(0, size - drawn)
-    doubt_cells = 0
-    if doubt:
-        # Doubt is drawn only into the room that is left. Letting it overflow
-        # the bar would make a meter wider than its column and imply usage
-        # past the limit that nobody measured.
-        doubt_cells = min(room, max(1, int(round(max(0.0, float(doubt)) * size))))
-    trough = room - doubt_cells
-    return (
-        style.tint(fill, fraction)
-        + style.paint("muted", g.doubt * doubt_cells)
-        + style.track(g.trough * trough)
-    )
-
-
-# --------------------------------------------------------------------------
 # tables
 # --------------------------------------------------------------------------
 
@@ -576,6 +544,8 @@ def table(
     priority=(),  # type: Sequence[int]
     atomic=(),  # type: Sequence[int]
     drop_empty=True,  # type: bool
+    gutter="  ",  # type: str
+    underline=True,  # type: bool
 ):
     # type: (...) -> Tuple[str, List[str]]
     """An aligned table, measured in display columns, fitted by DROPPING.
@@ -590,6 +560,13 @@ def table(
     dropped, ``atomic`` indices never shrink and never truncate. A path column
     is always both, because an ellipsis inside a path produces a different path
     rather than a shorter one.
+
+    ``gutter`` is the run of spaces between columns. Two is tight enough that
+    a right-aligned figure sits almost against the cell on its left, which is
+    what made the atlas read as one dense block instead of as columns; the
+    atlas asks for four. ``underline`` draws the dashed rule under the
+    headings, and a view that rules ABOVE its headings instead turns it off
+    rather than getting two rules.
     """
     style = style or Style()
     window = size if size else style.size
@@ -625,7 +602,7 @@ def table(
         # type: (Sequence[int]) -> int
         if not columns:
             return 0
-        return sum(sizes_for(columns)) + 2 * (len(columns) - 1) + width(indent)
+        return sum(sizes_for(columns)) + width(gutter) * (len(columns) - 1) + width(indent)
 
     for index in priority:
         if total(live) <= window:
@@ -645,7 +622,7 @@ def table(
         else:
             floors.append(min(width(heads[index]), 6) or 3)
     guard = 0
-    available = window - width(indent) - 2 * max(0, len(live) - 1)
+    available = window - width(indent) - width(gutter) * max(0, len(live) - 1)
     while sum(widths) > available and guard < 4096:
         slack = [widths[i] - floors[i] for i in range(len(live))]
         if max(slack) <= 0:
@@ -659,9 +636,12 @@ def table(
         text = heads[index]
         if index not in atomic and width(text) > widths[offset]:
             text = truncate(text, widths[offset], style.g.ellipsis)
-        head_cells.append(style.head(pad(text, widths[offset], align[index])))
-    lines.append((indent + "  ".join(head_cells)).rstrip())
-    lines.append(indent + "  ".join(style.dim(style.g.h * widths[i]) for i in range(len(live))))
+        head_cells.append(style.column(pad(text, widths[offset], align[index])))
+    lines.append((indent + gutter.join(head_cells)).rstrip())
+    if underline:
+        lines.append(
+            indent + gutter.join(style.dim(style.g.h * widths[i]) for i in range(len(live)))
+        )
     for row in cells:
         out = []
         for offset, index in enumerate(live):
@@ -669,8 +649,180 @@ def table(
             if index not in atomic and width(text) > widths[offset]:
                 text = truncate(text, widths[offset], style.g.ellipsis)
             out.append(pad(text, widths[offset], align[index]))
-        lines.append((indent + "  ".join(out)).rstrip())
+        lines.append((indent + gutter.join(out)).rstrip())
     return "\n".join(lines), dropped
+
+
+# --------------------------------------------------------------------------
+# frames
+# --------------------------------------------------------------------------
+
+#: The frame gradient, as anchor colours to interpolate between. Every one of
+#: them is a LIGHT colour, and that is the whole point.
+#:
+#: A frame that sweeps light to deep puts the highlight at the top left like
+#: gloss on a card, and puts the darkest end of the ramp at the bottom right,
+#: where on a dark terminal it simply disappears. A gradient whose range leaves
+#: the visible band is not a gradient with a subtle end, it is one that is
+#: broken for half its length. So the sweep moves in HUE and stays put in
+#: brightness.
+#:
+#: Periwinkle to lilac to light orchid, which is at least dE2000 21 from every
+#: step of :data:`_RAMP` and from `ok`, `warn` and `bad`. It deliberately
+#: avoids the cyans: the ramp lives there, and a cyan frame around a cyan
+#: column is chrome competing with the content it is supposed to contain.
+#:
+#: Taken verbatim from `nodetop`, which measured them, so the two tools read as
+#: one family. Copied rather than imported, since these packages share no code
+#: by design, which is the same argument :data:`_PALETTE` carries.
+_FRAME_ANCHORS = ((195, 209, 246), (200, 194, 246), (215, 183, 234), (230, 190, 222))
+
+#: The same sweep on the xterm-256 cube, held to the same rule: nothing below
+#: the bright band, or the bottom border vanishes. The cube is thin on pale
+#: violets, so this is three tones rather than ten, which is what a frame
+#: needs, the gradient being a texture and not a scale.
+_FRAME_256 = (189, 189, 189, 189, 183, 183, 182, 182, 182, 182)
+
+#: Sixteen colours, which is what `TERM=screen` and most tmux defaults
+#: advertise, and the depth with no room to be clever. Bright variants only:
+#: plain blue at this depth is a murky navy that disappears against a dark
+#: background, and because the sweep runs diagonally that is exactly where the
+#: bottom border lands.
+_FRAME_16 = (94, 95)
+
+#: Steps to quantise the truecolor sweep into: fine enough that the bands are
+#: invisible, coarse enough that runs of equal colour still group into one
+#: escape sequence instead of one per column.
+_FRAME_STEPS = 24
+
+
+def _frame_ramp(style):
+    # type: (Style) -> List[Tuple[Tuple[int, int, int], int, int]]
+    """Tones for the frame gradient, lightest first; empty when colour is off.
+
+    Empty is what makes `NO_COLOR` and `TERM=dumb` work: the caller falls back
+    to `paint`, which is a no-op at depth zero, so the frame degrades to bare
+    box characters rather than to box characters wearing an escape sequence.
+    """
+    if not style.enabled:
+        return []
+    if style.depth >= 24:
+        span = len(_FRAME_ANCHORS) - 1
+        out = []  # type: List[Tuple[Tuple[int, int, int], int, int]]
+        for i in range(_FRAME_STEPS):
+            scaled = (i / float(_FRAME_STEPS - 1)) * span
+            low = min(span, int(scaled))
+            high = min(span, low + 1)
+            fraction = scaled - low
+            rgb = (
+                int(
+                    round(
+                        _FRAME_ANCHORS[low][0]
+                        + (_FRAME_ANCHORS[high][0] - _FRAME_ANCHORS[low][0]) * fraction
+                    )
+                ),
+                int(
+                    round(
+                        _FRAME_ANCHORS[low][1]
+                        + (_FRAME_ANCHORS[high][1] - _FRAME_ANCHORS[low][1]) * fraction
+                    )
+                ),
+                int(
+                    round(
+                        _FRAME_ANCHORS[low][2]
+                        + (_FRAME_ANCHORS[high][2] - _FRAME_ANCHORS[low][2]) * fraction
+                    )
+                ),
+            )
+            out.append((rgb, 0, 0))
+        return out
+    if style.depth >= 8:
+        return [((0, 0, 0), code, 0) for code in _FRAME_256]
+    return [((0, 0, 0), 0, code) for code in _FRAME_16]
+
+
+def panel(lines, style=None, size=None, shrink=True, role=None):
+    # type: (Sequence[str], Optional[Style], Optional[int], bool, Optional[str]) -> str
+    """A framed block, for content that should read as one unit.
+
+    The border carries a DIAGONAL colour sweep: hue advances with ``x + y``, so
+    the lightest point is the top left corner and the sweep travels round to
+    the bottom right the way a highlight falls across a glossy surface. It is
+    drawn in runs of equal tone rather than per character, which costs about
+    ten escape sequences per border instead of one per column.
+
+    ``shrink`` sizes the frame to its widest line instead of stretching it to
+    the window. A box ruled out to 200 columns around 76 columns of content
+    reads as an empty room; sized to the content it reads as one object, which
+    is the only reason to draw a frame at all.
+
+    ``role`` forces one flat palette colour instead, for a frame that has to
+    mean something. Deliberately not the default: the frame is chrome, and
+    chrome that shouts a semantic colour competes with the numbers inside it.
+
+    **A content line wider than the frame is truncated, which is a backstop
+    and not a policy.** A path must never be shortened, so the caller that
+    cannot fit one is expected to stop framing rather than to hand it over and
+    have an ellipsis eaten into it. See `atlas`, which drops to an unframed
+    stacked layout at exactly that point.
+    """
+    style = style or Style()
+    g = style.g
+    window = size if size else style.size
+    rows = list(lines)
+    if shrink and rows:
+        window = min(window, max([width(line) for line in rows]) + 4)
+    window = max(window, MIN_WIDTH // 2)
+    inner = window - 4
+    height = len(rows) + 2
+    ramp = [] if role is not None else _frame_ramp(style)
+
+    def tone_at(x, y):
+        # type: (int, int) -> Optional[str]
+        """Hue for one frame cell, sweeping diagonally from the top left."""
+        if not ramp:
+            return None
+        across = x / float(window - 1) if window > 1 else 0.0
+        down = y / float(height - 1) if height > 1 else 0.0
+        at = 0.5 * across + 0.5 * down
+        return style._sgr(ramp[min(len(ramp) - 1, max(0, int(at * len(ramp))))])
+
+    def cell(text, x, y):
+        # type: (str, int, int) -> str
+        prefix = tone_at(x, y)
+        if prefix is None:
+            return style.paint(role or "dim", text)
+        return prefix + text + "\033[0m"
+
+    def sweep(text, y):
+        # type: (str, int) -> str
+        """A horizontal border run, grouping equal tones into one escape."""
+        if not ramp:
+            return style.paint(role or "dim", text)
+        out = []  # type: List[str]
+        buffered = []  # type: List[str]
+        current = None  # type: Optional[str]
+        for i, ch in enumerate(text):
+            tone = tone_at(i, y)
+            if current is not None and tone != current:
+                out.append(current + "".join(buffered) + "\033[0m")
+                buffered = []
+            current = tone
+            buffered.append(ch)
+        if buffered and current is not None:
+            out.append(current + "".join(buffered) + "\033[0m")
+        return "".join(out)
+
+    # The frame is unbroken, and a title lives INSIDE it as a content line. A
+    # title inlaid into the top edge cuts the border where the eye expects it
+    # to continue, and a box that is a box everywhere is worth more than a
+    # label saving one line.
+    out = [sweep(g.tl + g.h * (window - 2) + g.tr, 0)]
+    for i, line in enumerate(rows):
+        fitted = pad(truncate(line, inner, g.ellipsis), inner)
+        out.append(cell(g.v, 0, i + 1) + " " + fitted + " " + cell(g.v, window - 1, i + 1))
+    out.append(sweep(g.bl + g.h * (window - 2) + g.br, height - 1))
+    return "\n".join(out)
 
 
 def rule(title="", style=None, size=None):

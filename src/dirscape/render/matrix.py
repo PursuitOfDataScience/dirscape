@@ -123,7 +123,10 @@ def render(roots, site=None, style=None, size=None, extra=None):
     if not roots:
         return style.dim("no roots were handed to this view")
 
-    headers = ["PATH"] + list(COLUMNS)
+    # Lower case, to match the other five headings in this very row and the
+    # atlas's. `PATH` in capitals beside `exists`, `mounted` and `quota` was
+    # one table shouting at itself.
+    headers = ["path"] + list(COLUMNS)
     rows = [[root.path or fields.UNKNOWN] + _cells(root, style, site, extra) for root in roots]
 
     # Drop any column that is the unknown mark on EVERY row. Three of them

@@ -345,7 +345,7 @@ def test_a_real_pty_paints_moves_and_exits():
             if not chunk:
                 break
             out += chunk
-            if not sent and b"USED / QUOTA" in out:
+            if not sent and b"used / quota" in out:
                 time.sleep(0.4)
                 os.write(fd, b"\x1b[B\x1b[B")  # down, down
                 time.sleep(0.4)
@@ -360,7 +360,7 @@ def test_a_real_pty_paints_moves_and_exits():
         with contextlib.suppress(OSError):
             os.waitpid(pid, os.WNOHANG)
 
-    if "USED / QUOTA" not in text:
+    if "used / quota" not in text:
         pytest.skip("no storage discoverable here, so there is nothing to browse")
 
     assert "\033[7m" in text, "no row was highlighted"
@@ -396,30 +396,28 @@ def test_the_band_is_the_same_width_on_every_row():
     assert widths == {len(max(rows, key=len))}
 
 
-def test_an_embedded_reset_re_asserts_the_inverse():
-    """The load-bearing one, and the actual cause of the ragged band.
+def test_the_band_carries_no_sgr_of_its_own():
+    """The load-bearing one, and it replaces a weaker guarantee.
 
-    The table's cells carry their own colours, so a row contains `\\033[0m`
-    several times along its length. Wrapping such a line in inverse turns the
-    band OFF at the first embedded reset and the highlight stops mid-row.
+    The table's cells carry their own colours. The first version of this test
+    asserted that every `\\033[0m` embedded in the row was followed by a fresh
+    inverse, which kept the band CONTINUOUS: without it the band switched off
+    at the first embedded reset and the highlight stopped mid-row.
+
+    Continuity was never the whole problem. Under inverse video an explicit
+    FOREGROUND becomes the background, so the surviving colours painted a
+    differently coloured block per coloured run, on top of the band. Owner's
+    words: "the highlightor gets truncated by `▎▒░░░░░░   3%` which looks so
+    ugly". The row's own styling is stripped now, which subsumes the old
+    assertion: a body with no escapes in it cannot contain a reset that ends
+    the band, and cannot contain a colour that recolours it.
     """
     line = "left \033[31mred\033[0m middle \033[32mgreen\033[0m right"
     painted = highlight([line], 0)[0]
 
     body = painted[len(interactive.RESET + interactive.INVERSE) : -len(interactive.RESET)]
-    # Every reset inside the body must be immediately followed by an inverse,
-    # or the band ends at that point.
-    cursor = 0
-    while True:
-        at = body.find(interactive.RESET, cursor)
-        if at < 0:
-            break
-        after = body[at + len(interactive.RESET) :]
-        assert after.startswith(interactive.INVERSE), (
-            "a reset at offset %d is not followed by an inverse, so the band stops there" % (at,)
-        )
-        cursor = at + len(interactive.RESET)
-    assert body.count(interactive.RESET) == 2, "the fixture has two embedded resets"
+    assert "\033" not in body, "the band must carry no escape of its own: %r" % (body,)
+    assert body == "left red middle green right", "and not one character may be lost"
 
 
 def test_the_band_covers_the_padding_and_then_stops():

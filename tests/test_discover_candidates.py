@@ -939,3 +939,61 @@ def test_a_root_json_round_trips(tmp_path):
     assert payload["path"] == roots[0].path
     assert payload["mounted"]["known"] is True
     assert "identity" in payload
+
+
+# --------------------------------------------------------------------------
+# The human form of a source
+# --------------------------------------------------------------------------
+
+
+def test_every_source_has_a_human_label():
+    """Exhaustive, the way `CATEGORY_LABELS` is, and for the same reason.
+
+    These tokens are a wire vocabulary: they go into `--json` and into the
+    state file. A token with no label is a token that reaches a user's screen,
+    which is what `dirscape why` did when it printed "found by group-template,
+    dir-owner, quota-fileset" at a reader. A new source with no sentence must
+    be a test failure here, not a discovery in a bug report.
+    """
+    tokens = [
+        value
+        for name, value in vars(candidates_module).items()
+        if name.startswith("SOURCE_") and isinstance(value, str)
+    ]
+    assert tokens, "no source constants found, so this test is not testing anything"
+    for token in tokens:
+        assert token in candidates_module.SOURCE_LABELS, "%r has no human label" % (token,)
+        label = candidates_module.source_label(token)
+        assert label and label != token
+        # The label completes "dirscape shows you this directory because ...",
+        # so it is a clause: lower case, no trailing stop.
+        assert label[0].islower(), "%r does not read as a clause" % (label,)
+        assert not label.endswith("."), "%r carries its own full stop" % (label,)
+
+
+def test_a_source_with_no_label_falls_back_instead_of_raising():
+    """Lossy on purpose. An unlabelled source is a bug the test above catches,
+    and it should not take down a user's terminal in the meantime.
+    """
+    assert candidates_module.source_label("brand-new-source") == "brand new source"
+    assert candidates_module.source_label("") == ""
+
+
+def test_a_note_that_only_restates_its_source_is_recognised():
+    """So a view can print the label or the note and never both.
+
+    `/project/hpc` carried "matched group hpc", "directory hpc is group-owned
+    by a group you are in" and "holds the fileset project-hpc" under the three
+    labels that say exactly that.
+    """
+    sources = [SOURCE_GROUP_TEMPLATE, SOURCE_DIR_OWNER, SOURCE_QUOTA_FILESET]
+    for note in (
+        "matched group hpc",
+        "directory hpc is group-owned by a group you are in",
+        "holds the fileset project-hpc",
+    ):
+        assert candidates_module.restates_source(note, sources)
+    # A fact no label carries survives, and a prefix only counts for a source
+    # the root actually has.
+    assert not candidates_module.restates_source("also reachable at /gpfs/x", sources)
+    assert not candidates_module.restates_source("matched group hpc", [SOURCE_MOUNTS])

@@ -68,6 +68,10 @@ __all__ = [
     "SOURCE_QUOTA_FILESET",
     "SOURCE_DATASET_ROOT",
     "SOURCE_ALLOCATION",
+    "SOURCE_LABELS",
+    "SOURCE_RESTATEMENTS",
+    "source_label",
+    "restates_source",
     "ENV_VARS",
     "PROJECT_LIKE_ROLES",
     "TEMPLATE_ROLES",
@@ -89,6 +93,71 @@ SOURCE_QUOTA_FILESET = "quota-fileset"
 SOURCE_DATASET_ROOT = "dataset-root"
 # An allocation database's claim. Never derived into a path by this module.
 SOURCE_ALLOCATION = "allocation"
+
+
+# The tokens above are a WIRE vocabulary: they go into `--json` and into the
+# state file, so a consumer may switch on them and they must not change
+# casually. The human form therefore lives BESIDE them instead of being
+# derived from them, which is `model.CATEGORY_LABELS` applied to this
+# vocabulary and for the same reason. `dirscape why` printed "found by
+# group-template, dir-owner, quota-fileset" at a user, which is nodetop's NT-5
+# (raw enum members in a prose column) arriving through a second column.
+#
+# Each label completes the sentence "dirscape shows you this directory
+# because ...", so they are clauses and not nouns.
+SOURCE_LABELS = {
+    SOURCE_MOUNTS: "the machine you are on mounts it",
+    SOURCE_ENV: "a standard environment variable leads here",
+    SOURCE_GROUP_TEMPLATE: "its name matches your user name or one of your groups",
+    SOURCE_DIR_OWNER: "a group you belong to owns it",
+    SOURCE_QUOTA_FILESET: "the filesystem's own records say you hold space in it",
+    SOURCE_DATASET_ROOT: "it sits in a shared data collection this site publishes",
+    SOURCE_ALLOCATION: "an allocation record names it",
+}
+
+# Notes this module writes for the sole purpose of explaining one of those
+# sources, by leading text. A view that prints the label AND the note says one
+# thing twice: `/project/hpc` carried "matched group hpc", "directory hpc is
+# group-owned by a group you are in" and "holds the fileset project-hpc",
+# which is the three labels again in the tool's own words.
+#
+# Keyed by source, so a note only disappears when the source that writes it is
+# actually on the root, and unmatched text is KEPT. The failure mode of a
+# prefix that goes stale is therefore one redundant line rather than a lost
+# fact, which is the direction this package errs in everywhere else.
+SOURCE_RESTATEMENTS = {
+    SOURCE_ENV: ("from $",),
+    SOURCE_GROUP_TEMPLATE: ("matched ",),
+    SOURCE_DIR_OWNER: ("directory ",),
+    SOURCE_QUOTA_FILESET: (
+        "holds the fileset ",
+        "the quota backend published this path for fileset ",
+    ),
+    SOURCE_DATASET_ROOT: ("in the shared area ",),
+    SOURCE_ALLOCATION: ("the allocation database names this storage ",),
+}
+
+
+def source_label(source):
+    # type: (str) -> str
+    """The human clause for a discovery source, never the token itself.
+
+    Falls back to the de-hyphenated token rather than raising, exactly as
+    `model.category_label` does: a source with no label is a test failure, and
+    it should not take down a user's terminal in the meantime.
+    """
+    return SOURCE_LABELS.get(source, (source or "").replace("-", " "))
+
+
+def restates_source(note, sources):
+    # type: (str, Sequence[str]) -> bool
+    """True when a note only repeats a source label that is already on screen."""
+    for source in sources or ():
+        for prefix in SOURCE_RESTATEMENTS.get(source, ()):
+            if note.startswith(prefix):
+                return True
+    return False
+
 
 # ``$PROJECT`` and ``$WORK`` are unset on this cluster and set on many others.
 # Reading them costs nothing and not reading them makes the tool site-specific.

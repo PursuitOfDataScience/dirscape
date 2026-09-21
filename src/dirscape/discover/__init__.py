@@ -54,10 +54,14 @@ from .candidates import (
     SOURCE_DIR_OWNER,
     SOURCE_ENV,
     SOURCE_GROUP_TEMPLATE,
+    SOURCE_LABELS,
     SOURCE_MOUNTS,
     SOURCE_QUOTA_FILESET,
+    SOURCE_RESTATEMENTS,
     discover,
+    restates_source,
     role_for_path,
+    source_label,
 )
 from .identity import Identity, cluster_fingerprint, group_names, read_identity, user_name
 from .mounts import (
@@ -121,6 +125,10 @@ __all__ = [
     "SOURCE_QUOTA_FILESET",
     "SOURCE_DATASET_ROOT",
     "SOURCE_ALLOCATION",
+    "SOURCE_LABELS",
+    "SOURCE_RESTATEMENTS",
+    "source_label",
+    "restates_source",
     "RANK_PRIMARY",
     "RANK_SECONDARY",
 ]

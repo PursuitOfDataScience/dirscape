@@ -3,10 +3,13 @@
 **The renderer may not print a value it was not given.** There is no code path
 in this package that turns an unknown into a number, a blank or a zero:
 
-* a root with no quota backend renders `?`, never "no limit" and never an
-  empty bar
-* a `QuotaRow.fraction` of None renders `?`, and `style.bar()` raises rather
-  than draw a 0% meter, because an empty bar reads as plenty of room
+* a root with no quota backend renders `?`, never "no limit" and never a
+  figure of any kind
+* a `QuotaRow.fraction` of None renders `?` and NO percentage, because an
+  invented 0% reads as plenty of room. There used to be a `style.bar()` here
+  that raised rather than draw an empty meter, which was the same rule in
+  picture form; the bar is gone (see `fields._figure_cell`) and the rule is
+  now simply that a percentage is printed only where a fraction was measured
 * a refused `scandir` renders `?`, and the `ncdu` export flags it, rather than
   looking like an empty directory
 * a `Verdict` that is neither confirmed nor refuted renders `?`, never "no"

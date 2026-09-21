@@ -372,6 +372,139 @@ exactly (256000 GB renders as 233T, which is 232.8 TiB).
   without a leading slash, and explains the allocation: size, account, and the
   fact that the absence is about this node rather than about the storage.
 
+### The detail view, rewritten for the reader
+
+`dirscape why <path>` and the row you open from the browse are one block, and
+it was written in the tool's own vocabulary. Reported from real use: "do you
+actually know what the text here means? it's so confusing. what does mount
+mean here? everything needs to be accessible."
+
+- **Pressing Down in the detail view repeated the header.** Thirteen presses
+  left thirteen copies of `/project/hpc` stacked above the detail. The
+  interactive layer repaints by moving the cursor up by the number of lines it
+  WROTE, and the block occupied one row more than that: measured at 18 lines
+  against 19 rows at every width from 80 to 120, because the writable
+  verdict's reason ran to 157 characters and the terminal wrapped it. The
+  block is now hard wrapped to the window before it is handed over, so lines
+  and rows are one to one (measured at 42, 80, 90, 100, 110 and 120 columns,
+  with colour on and off), and Up or Down in a one row view no longer repaints
+  at all.
+- **A detail block taller than the window is cut rather than left to scroll**,
+  with a line saying so and naming the command that prints it in full. A block
+  that has scrolled puts the erase at the top of the window instead of the top
+  of the block, which is the "entire terminal turns empty" failure the table
+  above it already guarded against.
+- **`found by group-template, dir-owner, quota-fileset` was three internal
+  constants shown to a user.** Those are the values discovery puts in `--json`
+  and in the state file, so they are a wire vocabulary, and this is exactly
+  the mistake `category_label()` exists for. Each source now has a human
+  clause and the screen reads "dirscape shows you this directory because its
+  name matches your user name or one of your groups, a group you belong to
+  owns it, and the filesystem's own records say you hold space in it". The
+  tokens are unchanged in `--json`.
+- **"mounted" and "the gpfs mount /project" are gone.** What the axis means to
+  a reader is whether the storage is attached to the machine they are typing
+  on, which is why `/cfs3` is there from a login node and absent from a
+  compute one, and that is what the line says now.
+- **`meadow3_cap:project-hpc` was device:fileset, explained nowhere.** Both
+  halves now appear inside the sentence that answers the question a reader
+  actually brings to a quota figure: "the figures above are your own usage
+  under the quota named project-hpc on the filesystem meadow3_cap, counted by
+  the filesystem itself rather than by walking this directory, so du can
+  report a different number".
+- **The marks on a figure are explained the first time they appear**, and only
+  when they appear: `▒` says how much space and how many files the filesystem
+  has handed out and not yet counted (6.7G and 1.5k files on one project
+  directory here), `~` says the figure was matched to this directory rather
+  than published for it.
+- **Backups and deletion are on the screen**, since a researcher deciding
+  where data can live asks that before anything else. Silence from a site
+  reads as "not published", never as "not backed up".
+- **The `writable` paragraph shrank to its conclusion.** The 157 character
+  sentence about `os.access`, root-squashed exports and `W_OK` is what
+  `--probe-write` and `--json` are for, and both are named at the foot of the
+  view.
+- **`✓ present ok` is gone**, along with `quota mmlsquota` and the `note`
+  lines that restated a source label. A confirmed probe with nothing to add
+  prints no line, so a screen with nothing wrong is short and a problem is the
+  only thing that is loud.
+
+### The view, redesigned against `nodetop`, and the selection band fixed
+
+Three owner reports, and they turned out to be one problem seen from three
+angles: "the highlightor gets truncated by `▎▒░░░░░░   3%` which looks very ugly",
+"the ui isn't cool at all. it looks drab and boring", and "the text colors look
+so weird ... you should learn from `nodetop`".
+
+- **The selected row is one flat band again.** The cause was not the padding
+  and not the embedded resets, both of which had already been fixed: it was
+  that the row's own FOREGROUND colours survived inside the band, and under
+  inverse video a foreground is painted as the background. So the usage bar's
+  three coloured segments came out as three differently coloured tiles sitting
+  on top of the selection, and the band appeared to stop at the bar. Measured
+  in a pty at 110 columns: six of seven frames carried `\x1b[38;2;...m` inside
+  the band before, none of nine after, and the band is one uniform 73 columns
+  on every row. The row's styling is stripped now rather than re-armed, which
+  costs nothing, because colour is never load bearing in this package and
+  every state a row reports is still on the line in words and glyphs.
+- **The usage bar is gone.** Eight cells of block characters plus the spaces to
+  align them, spent on a lossy picture of the exact percentage printed
+  immediately to their right, in the widest column of the table. It was also
+  blank on five of the ten rows of the live view, since an unlimited quota has
+  no fraction and a `statvfs` fallback has no quota, so the one thing a meter
+  column exists for, being scanned down, it could not do. At 3% it drew a
+  single thin glyph and at 0% it was eight cells of trough saying what `0B`
+  already said. `style.bar()` and the `blocks` and `trough` glyphs went with
+  it; the in-doubt marker `▒` stays on the used figure, where the fact belongs.
+  Ten columns came back and went to the figures.
+- **The whole view is one framed panel now**, titled, ruled and closed under the
+  last row, with the pale violet diagonal gradient and the `╭ ─ ╮ │ ╰ ╯` set
+  taken from `nodetop` so the two tools read as one family. The palette was
+  already `nodetop`'s values verbatim; what was missing was the frame and the
+  discipline of its tiers. `muted` is a measurement that is not the one the
+  view was ranked by, `dim` is context, and a figure is never `dim`: so the
+  role word, the directories leading up to the last one and `no limit` are
+  context, a granted `rwx` and `886G free` are secondary measurements, and only
+  the figures and the graded percentage are at full weight. The headings are
+  lower case and indented, and the gutter went from two spaces to four, which
+  is the "horizontal spacing is also an issue" report.
+- **The alert teasers and the counts are behind `--summary`.** "don't show
+  things like [that], it looks ugly and uninformative at all. if they want,
+  they can display it when starting the app with the right flag." Three lines
+  of chrome under a ten-line table, on every run, about things the reader had
+  not asked about. Nothing is lost: `dirscape stranded`, `dirscape elsewhere`
+  and `dirscape --all` are first-class commands that give the detail rather
+  than a one-line teaser for it. Run-level warnings did NOT move there with
+  them, because a malformed `site.conf` or a baseline that could not be
+  written is the tool saying it could not do its job: those go to stderr, so
+  they cannot become silent again and a piped table stays clean.
+- **`dirscape new` prints its changes instead of counting them.** The delta
+  records were built on every run and only their LENGTH was ever used, so the
+  view whose entire purpose is to show changes showed a count and a pointer to
+  itself. The reasons wrap onto a hanging indent rather than being cut, because
+  the useful half of a `shrank` is the second half.
+
+And two defects found while doing it:
+
+- **Discovery's bookkeeping was leaking into the POLICY column.** The filter
+  held four keys and needed ten: a 200 column run printed
+  `crosses_to=['/project/hpc/jdoe42']`, `contains=2`, `free_bytes=951720603648`
+  and `size_bytes=959727210496` at the user, and every one of those is already
+  rendered properly elsewhere in the same view (the fold count is the `+2` on
+  the path, the free figure is the `886G free` in the quota column, the
+  crossing is the symlink note). It stayed unseen because POLICY is the first
+  column dropped when the window is narrow, so it only appeared past about 130
+  columns. This is the `rank=primary` defect again, with six more keys.
+- **The interactive view printed its key hints twice**, once inside the frame
+  and once below it, because the block already carried them when the footer was
+  appended a second time.
+
+`--ascii`, `NO_COLOR` and `TERM=dumb` are all pinned by tests now rather than by
+docstrings: every codepoint of an `--ascii` render is under 128 and every glyph
+in the table has an ASCII twin, and `NO_COLOR` or `TERM=dumb` emits not one
+escape byte, frame and gradient included, with `--color always` unable to
+override either.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

@@ -340,7 +340,25 @@ def highlight(lines, index, style=None, pad_to=None):
     usage bar, and the cursor looked like a different shape on every row
     instead of a band moving down a column. Padding is what makes it read as
     one selection rather than as ragged emphasis.
+
+    **The row's OWN colours are stripped, not preserved, and that is the fix
+    for the band that "gets truncated by `▎▒░░░░░░   3%`".** Under inverse
+    video an explicit foreground code becomes the BACKGROUND, so each coloured
+    run inside the band painted as a block of its own colour sitting on top of
+    the selection: measured in a pty, six of seven frames carried
+    `\033[38;2;90;140;220m` and friends inside the band and the usage bar
+    rendered as three differently coloured tiles where the band should have
+    been flat.
+
+    An earlier fix re-asserted the inverse after every embedded reset, which
+    kept the band CONTINUOUS and could do nothing about its colour, because
+    the colour was never the reset's fault. Stripping is the whole answer and
+    it costs nothing: a selected row does not need per-cell colour, the band
+    is the signal, and this package's standing rule is that colour is never
+    load bearing, so every state the row reports is still on the line in
+    glyphs and words.
     """
+    from .render.style import plain
     from .render.style import width as measure
 
     room = pad_to
@@ -350,18 +368,9 @@ def highlight(lines, index, style=None, pad_to=None):
     out = []  # type: List[str]
     for position, line in enumerate(lines):
         if position == index:
-            gap = " " * max(0, room - measure(line))
-            # Every reset ALREADY IN the line has to re-assert the inverse,
-            # and this is the whole trick. The table's cells carry their own
-            # colours, so a row ends up with `\033[0m` several times along its
-            # length; wrapping such a line in inverse turns the band off at
-            # the first embedded reset and the highlight stops mid-row. That
-            # is what made the cursor look like a different width on every
-            # line: measured in a pty, three rows highlighted at 47, 69 and 74
-            # columns, each stopping exactly where its first coloured cell
-            # ended.
-            body = line.replace(RESET, RESET + INVERSE)
-            out.append(RESET + INVERSE + body + gap + RESET)
+            bare = plain(line)
+            gap = " " * max(0, room - measure(bare))
+            out.append(RESET + INVERSE + bare + gap + RESET)
         else:
             out.append(line)
     return out

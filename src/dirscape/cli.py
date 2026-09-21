@@ -28,9 +28,10 @@ import argparse
 import contextlib
 import errno
 import os
+import shutil
 import sys
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, interactive
 from .discover import (
@@ -40,6 +41,8 @@ from .discover import (
     node_class,
     read_identity,
     read_mount_table,
+    restates_source,
+    source_label,
 )
 from .model import Reach, VerdictCategory, confirmed, refuted, sanitize, unknown
 from .plugins import detect_plugins
@@ -54,6 +57,8 @@ from .render import (
     render_treemap,
     resolve_style,
 )
+from .render import style as render_style
+from .render.style import panel, plain
 from .runner import Budget, RecordedRunner, SubprocessRunner
 from .sitecfg import SITE_TEMPLATE, guess_cluster_name, load_site
 from .state import Lineage, Snapshot, cutoff_for, diff
@@ -201,7 +206,13 @@ def _add_global_args(parser, suppress=False):
         "--legend",
         action="store_true",
         default=_absent(suppress),
-        help=h("explain the reach letters and the bar marks"),
+        help=h("explain the reach letters and the figure marks"),
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        default=_absent(suppress),
+        help=h("add the stranded, elsewhere and hidden-row counts under the table"),
     )
 
 
@@ -1046,9 +1057,407 @@ def _visible(run, show_all):
 # Views
 # --------------------------------------------------------------------------
 
+# The detail view's vocabulary lives in the next few helpers, and it is a
+# rewrite rather than a tidy-up. The owner's words on the version it replaces:
+# "do you actually know what the text here means? it's so confusing. what does
+# mount mean here? everything needs to be accessible."
+#
+# The reader is a researcher deciding where their data can live, not a storage
+# administrator, so the screen answers their questions in their order: how much
+# room is there and how full is it, can I read and write here, is it kept or
+# deleted, where does the figure come from (so a `du` that disagrees makes
+# sense), and why is dirscape showing me this directory at all. Everything
+# else moved to `--json`, which every view now names at the foot.
+#
+# Two mechanical rules came out of the same rewrite:
+#
+# * **Quiet on a good answer, loud on a bad one.** `✓ present ok` said nothing
+#   twice, once in a label taken from the model and once in the word `ok`, so a
+#   confirmed probe with nothing to add now prints no line at all.
+# * **Every line fits the window.** `interactive.select` repaints by moving the
+#   cursor up by the number of lines it WROTE, so one line the terminal wraps
+#   makes the block a row taller than the count. See `_fit`.
 
-def _why_allocation(root, style):
+
+def _room(style, size=None):
+    # type: (object, Optional[int]) -> int
+    """Columns this block has to fit inside.
+
+    The floor is 20 rather than `MIN_WIDTH`: clamping UP to 32 in a 24 column
+    terminal would hand back a width wider than the window, which is the exact
+    mismatch the wrapping is there to prevent.
+    """
+    if size:
+        return max(20, int(size))
+    return max(20, int(getattr(style, "size", 0) or render_style.FALLBACK_WIDTH))
+
+
+def _prose(style, room, text, indent="  "):
+    # type: (object, int, str, str) -> List[str]
+    """Wrapped prose, dimmed one line at a time.
+
+    Tinted per line rather than once over the paragraph. `style.dim` wraps the
+    whole string in a single escape pair, so wrapping afterwards leaves the
+    opening escape on the first line and the reset on the last, and every line
+    between them comes out undimmed.
+    """
+    wrapped = render_style.wrap(text, indent=indent, size=room, style=style)
+    return [style.dim(line) for line in wrapped.splitlines()]
+
+
+def _field(style, room, label, value):
+    # type: (object, int, str, str) -> List[str]
+    """A labelled line, folding UNDER its own label rather than off the edge.
+
+    The value is returned UNTOUCHED whenever it fits, because the space and
+    files figures arrive pre-formatted from `render.fields`, which lines a
+    column up with runs of spaces and pads inside the percentage, and `wrap`
+    normalises whitespace. Folding only happens where the alternative is a
+    line the terminal breaks for us in the wrong place.
+    """
+    head = "  %-9s " % (label,)
+    if render_style.width(head + value) <= room:
+        return [head + value]
+    lead = render_style.width(head)
+    pieces = render_style.wrap(value, indent="", size=room - lead, style=style).splitlines()
+    if not pieces:
+        return [head.rstrip()]
+    return [head + pieces[0]] + [" " * lead + piece for piece in pieces[1:]]
+
+
+def _bullet(style, room, glyph, sentence):
+    # type: (object, int, str, str) -> List[str]
+    """A glyph and a sentence, with the sentence hanging under itself."""
+    head = "  %s " % (glyph,)
+    lead = render_style.width(head)
+    pieces = render_style.wrap(sentence, indent="", size=room - lead, style=style).splitlines()
+    if not pieces:
+        return []
+    return [head + style.dim(pieces[0])] + [" " * lead + style.dim(piece) for piece in pieces[1:]]
+
+
+def _kind_phrase(root):
+    # type: (object) -> str
+    """What sort of place this is, in one clause.
+
+    Replaces `project  gpfs  meadow3_cap:project-hpc`, whose third field was
+    `device:fileset` and was explained nowhere on the screen. Both halves of it
+    now appear once, inside the sentence about where the space figure comes
+    from, which is the only question they answer for a reader.
+    """
+    role = (getattr(root, "role", "") or "").strip()
+    fstype = (getattr(root, "fstype", "") or "").strip()
+    if role and fstype:
+        return "a %s directory on a %s filesystem" % (role, fstype)
+    if role:
+        return "a %s directory" % (role,)
+    if fstype:
+        return "a directory on a %s filesystem" % (fstype,)
+    return ""
+
+
+#: Reach, as something a reader can act on. `Reach.label` answers the model's
+#: question ("listable") and this answers the reader's ("can I see what is in
+#: it"), which is the same split `category_label` makes for a verdict.
+_REACH_PHRASE = {
+    Reach.LISTABLE: "you can see what is in this directory",
+    Reach.TRAVERSE: (
+        "you can use paths inside this directory that you already know, but you cannot "
+        "list what is in it"
+    ),
+    Reach.CLOSED: "you cannot get into this directory",
+    Reach.UNKNOWN: "dirscape could not work out what you can do here",
+}
+
+
+def _access_phrase(root):
+    # type: (object) -> str
+    """Read and write in one sentence, and the write CONCLUSION only.
+
+    The write verdict's reason is a paragraph of administration detail
+    ("os.access reports write; not owner-confirmed, and W_OK can be wrong
+    under a root-squashed export, so pass --probe-write to settle it by
+    writing"). At 157 characters it was also the line that broke the
+    interactive repaint. The caveat is still reachable, through the
+    `--probe-write` and `--json` pointers at the foot of the view.
+    """
+    reach = getattr(root, "reach", Reach.UNKNOWN)
+    phrase = _REACH_PHRASE.get(reach, Reach.label(reach))
+    write = getattr(root, "writable", None)
+    if write is None:
+        return phrase
+    if write.confirmed:
+        return phrase + ", and you can write to it"
+    if write.refuted:
+        return phrase + ", but you cannot write to it"
+    if write.category == VerdictCategory.NOT_PROBED:
+        # A question nobody asked gets no answer printed, which is the rule
+        # that keeps `? allocated not probed` off every mounted root.
+        return phrase
+    return phrase + ", and whether you can write to it went unanswered (%s)" % (write.label,)
+
+
+def _keeping_phrase(root, site):
     # type: (object, object) -> str
+    """Backed up, deleted on a schedule, or simply unpublished.
+
+    Silence means UNPUBLISHED and never "no". A site that says nothing about
+    backups has not told us there are none, and of every field on this screen
+    this is the one a reader is most likely to act on by leaving data
+    somewhere, so the unknown says so in words.
+    """
+    policy = render_fields.merged_policy(root, site)
+    parts = []  # type: List[str]
+
+    if "backup" in policy:
+        value = policy.get("backup")
+        if isinstance(value, bool):
+            parts.append("backed up" if value else "not backed up")
+        else:
+            parts.append("backups: %s" % (render_fields.safe(value, limit=32) or "?",))
+
+    if "purge_days" in policy:
+        days = policy.get("purge_days")
+        # `isinstance(True, int)` is True, so the bool test comes first or a
+        # site writing `purge_days=yes` prints "deleted after 1 days".
+        if isinstance(days, bool) or days is None:
+            parts.append("this site publishes a deletion rule here that dirscape could not read")
+        elif isinstance(days, (int, float)) and days > 0:
+            parts.append("files here are deleted %d days after they are written" % (int(days),))
+        elif isinstance(days, (int, float)):
+            parts.append("nothing here is deleted on a schedule")
+        else:
+            parts.append("deleted: %s" % (render_fields.safe(days, limit=32) or "?",))
+    elif "purge" in policy:
+        parts.append("deleted: %s" % (render_fields.safe(policy.get("purge"), limit=32) or "?",))
+
+    if policy.get("readonly"):
+        parts.append("the site publishes this path as read-only")
+
+    parts = [part for part in parts if part]
+    if not parts:
+        # Leads with the STATE and not with a reassurance. "not published" is
+        # what is true; "nothing is deleted here" is what a reader would infer
+        # from silence, and it is the inference that loses data.
+        return "not published: this site says nothing about backups or deletion here"
+    return "; ".join(parts)
+
+
+def _findings(root, style, axes=("mounted", "present", "allocated")):
+    # type: (object, object, Sequence[str]) -> List[Tuple[str, str]]
+    """One (glyph, sentence) per axis with something to say.
+
+    "mounted" is gone from the wording. It is the word the owner picked out as
+    meaningless here, and what it means to a reader is whether the storage is
+    attached to the machine they are typing on: on this cluster `/cfs3` is
+    there from a login node and absent from a compute one, which is the whole
+    reason the axis exists.
+
+    A confirmed `present` prints nothing. The figures and the access line above
+    it cannot be there for a directory that is not, so the line only ever said
+    `ok` about something already visible.
+    """
+    g = style.g
+    out = []  # type: List[Tuple[str, str]]
+    for axis in axes:
+        verdict = getattr(root, axis, None)
+        if verdict is None or verdict.category == VerdictCategory.NOT_PROBED:
+            continue
+        glyph = render_fields.verdict_glyph(verdict, g)
+        if axis == "mounted":
+            if verdict.confirmed:
+                out.append(
+                    (
+                        style.ok(glyph),
+                        "This storage is attached to the machine you are on, and not every "
+                        "machine has every filesystem.",
+                    )
+                )
+            elif verdict.refuted:
+                # Two endings, because only one of them is always true. A row
+                # with no path here has nothing to measure, and saying so is
+                # the whole answer for an allocation; a row that HAS a path
+                # may still be carrying a figure from the quota layer, and
+                # "nothing could be measured" would contradict the number
+                # printed four lines above it.
+                if getattr(root, "path", ""):
+                    ending = "so you cannot use this path from where you are standing"
+                else:
+                    ending = "and there is no path for it here to measure"
+                out.append(
+                    (
+                        style.bad(glyph),
+                        "This storage is not attached to the machine you are on, %s. That is a "
+                        "fact about this machine and not about the storage." % (ending,),
+                    )
+                )
+            else:
+                out.append(
+                    (
+                        glyph,
+                        "dirscape could not tell whether this storage is attached to the "
+                        "machine you are on (%s)." % (verdict.label,),
+                    )
+                )
+        elif axis == "present":
+            if verdict.confirmed:
+                continue
+            if verdict.refuted:
+                out.append(
+                    (style.bad(glyph), "The directory is not there (%s)." % (verdict.label,))
+                )
+            else:
+                out.append(
+                    (
+                        glyph,
+                        "dirscape could not check that the directory is there (%s)."
+                        % (verdict.label,),
+                    )
+                )
+        elif axis == "allocated":
+            if verdict.confirmed:
+                out.append((style.ok(glyph), "An allocation record lists this space as yours."))
+            elif verdict.refuted:
+                out.append(
+                    (
+                        style.bad(glyph),
+                        "No allocation record names this space as yours (%s)." % (verdict.label,),
+                    )
+                )
+            else:
+                out.append(
+                    (
+                        glyph,
+                        "dirscape could not read the allocation records (%s)." % (verdict.label,),
+                    )
+                )
+    return out
+
+
+def _scope_phrase(row):
+    # type: (object) -> str
+    """Whose usage a quota row counts. The distinction a reader acts on.
+
+    A figure that counts the whole group's usage and one that counts only the
+    caller's are different answers to "how much room do I have left", and the
+    scope is the only field that says which was measured.
+    """
+    return {
+        "user": "your own usage",
+        "group": "your group's usage",
+        "fileset": "everything stored there, not only your files",
+        "project": "everything stored there, not only your files",
+    }.get(getattr(row, "scope", "") or "", "")
+
+
+def _space_notes(root, style, figures):
+    # type: (object, object, str) -> List[str]
+    """Where the figures came from, and what any mark on them means.
+
+    This is the answer to "why does `du` say something else", which is the
+    question a reader brings to a quota number and the one the old screen
+    answered with the word `mmlsquota` in a value column.
+
+    A mark is explained only when it is actually ON the screen: `figures` is
+    the rendered text of the space and files cells, and each legend below is
+    gated on finding its own glyph in there. That way the legend cannot
+    outlive a change to how `render.fields` draws a figure.
+    """
+    g = style.g
+    out = []  # type: List[str]
+    row, how, why = render_fields.pick_row(getattr(root, "quota", None), root.path, "blocks")
+
+    if row is None:
+        free = (root.policy or {}).get("free_bytes")
+        if isinstance(free, int) and free >= 0:
+            out.append(
+                "No quota was measured for this directory, so the figure above is what the "
+                "whole filesystem has left, shared with everyone using it, and not room set "
+                "aside for you."
+            )
+        else:
+            # `why` comes back populated from every branch of `pick_row`, so
+            # the fallback is belt and braces rather than a real case.
+            out.append(
+                "dirscape could not measure the space here: %s." % (why or "no reading was taken",)
+            )
+        return out
+
+    scope = _scope_phrase(row)
+    fileset = getattr(row, "fileset", "") or ""
+    device = getattr(row, "device", "") or ""
+    if fileset and device and fileset != device:
+        where = "the quota named %s on the filesystem %s" % (fileset, device)
+    elif fileset or device:
+        # One name, and it is the name of a QUOTA. Calling it the filesystem
+        # would be a claim about which of the two the backend answered for,
+        # and `QuotaRow` keeps them apart precisely because one device here is
+        # mounted at four places with four different quotas.
+        where = "the quota named %s" % (fileset or device,)
+    else:
+        where = "the quota the filesystem reports for this path"
+    out.append(
+        "The figures above are %s%s, counted by the filesystem itself rather than by "
+        "walking this directory, so du can report a different number."
+        % (("%s under " % (scope,)) if scope else "", where)
+    )
+
+    if g.doubt in figures:
+        # `blockInDoubt` / `filesInDoubt`: handed out to a writer and not yet
+        # charged to anybody. Measured on one home fileset here at 2.18 GiB
+        # against 831 MiB used, so it is the difference a reader who
+        # cross-checks with du will actually see.
+        held = []  # type: List[str]
+        blocks = render_fields.in_doubt_of(root)
+        if blocks:
+            held.append("%s of space" % (render_fields.human_bytes(blocks),))
+        files_row, _, _ = render_fields.pick_row(
+            getattr(root, "inode_quota", None), root.path, "files"
+        )
+        if files_row is not None and files_row.in_doubt:
+            held.append("%s files" % (render_fields.human_count(files_row.in_doubt),))
+        out.append(
+            "%s marks %sthe filesystem has handed out and not yet counted here, which is the "
+            "other reason a du walk disagrees."
+            % (g.doubt, ("%s " % (" and ".join(held),)) if held else "")
+        )
+
+    if how == "inferred" and "~" in figures:
+        out.append(
+            "~ marks a figure dirscape matched to this directory rather than one the "
+            "filesystem published."
+        )
+    elif getattr(row, "guessed", False):
+        out.append(
+            "The filesystem did not say which directory this quota covers, so dirscape "
+            "matched the two by name."
+        )
+    return out
+
+
+def _because_phrase(root):
+    # type: (object) -> str
+    """Why this directory is on the reader's screen at all.
+
+    `found by group-template, dir-owner, quota-fileset` was the worst line on
+    the old screen: three internal constants from `discover.candidates`, which
+    is a wire vocabulary shown to a human. `model.py` already owns the fix for
+    that mistake (`category_label`, after nodetop's NT-5), so the sources got
+    the same treatment and `discover.source_label` holds the sentences.
+    """
+    clauses = [source_label(name) for name in getattr(root, "sources", ()) or ()]
+    clauses = [clause for clause in clauses if clause]
+    if not clauses:
+        return ""
+    # Serial comma, and the last clause joined with "and": three sources read
+    # as a list of reasons rather than as a comma-separated token dump, which
+    # is the whole complaint about the line this replaces.
+    joined = clauses[0] if len(clauses) == 1 else ", ".join(clauses[:-1]) + ", and " + clauses[-1]
+    return "dirscape shows you this directory because %s." % (joined,)
+
+
+def _why_allocation(root, style, size=None):
+    # type: (object, object, Optional[int]) -> str
     """Explain a root that the allocation database names and this node lacks.
 
     Separate from `_why` because every probe it would print is inapplicable:
@@ -1058,42 +1467,36 @@ def _why_allocation(root, style):
     """
     policy = root.policy or {}
     location = str(policy.get("allocation_location") or "?")
-    out = [style.head(location), style.dim("  an allocation, not a path on this node"), ""]
+    room = _room(style, size)
+    out = [
+        style.head(location),
+        style.dim("  an allocation, not a directory you can use from this machine"),
+        "",
+    ]
 
     gb = policy.get("allocation_gb")
     if isinstance(gb, (int, float)) and gb > 0:
-        out.append("  %-11s %s" % ("size", render_fields.human_bytes(int(gb * 1000 * 1000 * 1000))))
+        size_text = render_fields.human_bytes(int(gb * 1000 * 1000 * 1000))
+        out.extend(_field(style, room, "size", size_text))
     accounts = policy.get("allocation_accounts")
     if isinstance(accounts, (list, tuple)) and accounts:
-        out.append("  %-11s %s" % ("account", ", ".join(str(a) for a in accounts)))
+        out.extend(_field(style, room, "account", ", ".join(str(a) for a in accounts)))
     if root.role:
-        out.append("  %-11s %s" % ("role", root.role))
+        out.extend(_field(style, room, "kind", "%s storage" % (root.role,)))
     out.append("")
-    out.append(
-        "  %s %-9s %s"
-        % (
-            root.allocated.glyph(),
-            "allocated",
-            style.dim(root.allocated.reason or root.allocated.label),
-        )
-    )
-    out.append(
-        "  %s %-9s %s"
-        % (root.mounted.glyph(), "mounted", style.dim(root.mounted.reason or root.mounted.label))
-    )
-    out.append("")
-    out.append(
-        style.dim(
-            "  Nothing here could be measured, because no path for it exists on\n"
-            "  this node. That is a fact about where you are standing and not\n"
-            "  about the storage."
-        )
-    )
+
+    # Allocation first, then the machine. In that order the two lines read as
+    # one statement: the space is yours, and the reason you cannot see it is
+    # where you are standing. `present` is left out entirely, because "the
+    # directory is not there" about a row that has no path is a restatement
+    # dressed up as a second finding.
+    for glyph, sentence in _findings(root, style, axes=("allocated", "mounted")):
+        out.extend(_bullet(style, room, glyph, sentence))
     return "\n".join(out)
 
 
-def _why(run, path, style):
-    # type: (Run, str, object) -> Tuple[str, int]
+def _why(run, path, style, size=None):
+    # type: (Run, str, object, Optional[int]) -> Tuple[str, int]
     """One path, explained in a screen you can read.
 
     The first version printed everything it knew: raw byte counts, every
@@ -1105,6 +1508,11 @@ def _why(run, path, style):
     So: the headline first, the verdicts as a block, and anything repetitive
     collapsed to a count with a command that expands it. `--json` still
     carries every field for anyone who wants the lot.
+
+    The second version printed the right facts in the tool's own vocabulary:
+    `device:fileset` with no explanation, `mounted`, `found by dir-owner`. The
+    helpers above hold the rewrite; `size` is here so the caller that has to
+    know the block's exact height (`_browse`) can fix the width it wraps at.
     """
     target = os.path.abspath(os.path.expanduser(path))
     # Sanitised for DISPLAY only, and matched on the raw value. A path from
@@ -1132,7 +1540,7 @@ def _why(run, path, style):
             for root in run.roots:
                 location = str((root.policy or {}).get("allocation_location") or "")
                 if location and location.strip("/") == typed:
-                    return _why_allocation(root, style), EXIT_OK
+                    return _why_allocation(root, style, size), EXIT_OK
     if match is None:
         best = ""
         for root in run.roots:
@@ -1168,105 +1576,98 @@ def _why(run, path, style):
             EXIT_PATH,
         )
 
+    room = _room(style, size)
     out = []  # type: List[str]
     out.append(style.head(match.path))
     if match.path != target:
-        out.append(style.dim("  the enclosing root of %s" % (shown,)))
-
-    where = [x for x in (match.role, match.fstype, match.fileset) if x]
-    if match.device and match.fileset:
-        where = [x for x in (match.role, match.fstype) if x]
-        where.append("%s:%s" % (match.device, match.fileset))
-    out.append(style.dim("  " + "  ".join(where)))
-    out.append("")
-
-    # The headline: the two numbers and the one-word access summary.
-    figure, caveat = render_fields.quota_cell(match, style, show_bar=True)
-    out.append("  %-9s %s" % ("space", figure))
-    inodes, _ = render_fields.inode_cell(match, style)
-    if inodes and inodes != render_fields.UNKNOWN:
-        out.append("  %-9s %s" % ("files", inodes))
-    out.append(
-        "  %-9s %s%s"
-        % (
-            "access",
-            Reach.label(match.reach),
-            ", writable" if match.writable.confirmed else "",
+        out.extend(
+            _prose(style, room, "the nearest directory dirscape knows about, above %s" % (shown,))
         )
-    )
-    if match.elsewhere:
-        out.append("  %-9s %s" % ("where", style.warn("allocated, but not mounted on this node")))
+    kind = _kind_phrase(match)
+    if kind:
+        out.append(style.dim("  " + kind))
     out.append("")
 
-    # The probes, one line each, with the glyph doing the work.
-    for label, verdict in (
-        ("mounted", match.mounted),
-        ("present", match.present),
-        ("writable", match.writable),
-        ("allocated", match.allocated),
-    ):
-        # A probe that was never run has nothing to report. `? allocated not
-        # probed` appeared on every mounted root, because the allocation
-        # database is only consulted for storage that has no path here, and a
-        # question mark against a question nobody asked is noise that teaches
-        # a reader to skip the column.
-        if verdict.category == VerdictCategory.NOT_PROBED:
-            continue
-        detail = verdict.reason or verdict.label
-        out.append("  %s %-9s %s" % (verdict.glyph(), label, style.dim(detail)))
-    out.append("")
+    # 1. How much room, and how full. The question that brought the reader
+    #    here, so it is the first thing on the screen.
+    figure, _caveat = render_fields.quota_cell(match, style)
+    out.extend(_field(style, room, "space", figure))
+    inodes, _inode_caveat = render_fields.inode_cell(match, style)
+    if inodes and inodes != render_fields.UNKNOWN:
+        out.extend(_field(style, room, "files", inodes))
 
-    # Provenance, short.
-    if match.quota is not None and match.quota.source:
-        out.append("  %-9s %s" % ("quota", style.dim(match.quota.source)))
-    if match.sources:
-        out.append("  %-9s %s" % ("found by", style.dim(", ".join(match.sources))))
+    # 2. What the reader can do here, and 3. whether it is kept. Both are one
+    #    sentence in a labelled row, because the label is a word a researcher
+    #    would use and it is doing work.
+    out.extend(_field(style, room, "access", _access_phrase(match)))
+    out.extend(_field(style, room, "backups", _keeping_phrase(match, run.site)))
     if match.labels:
-        out.append("  %-9s %s" % ("changed", style.dim(", ".join(match.labels))))
+        out.extend(_field(style, room, "changed", ", ".join(match.labels)))
 
-    # The repetitive part, collapsed. Eleven symlinks out of a home directory
-    # are one fact about that directory, not eleven facts.
+    # 4. The axes with something to say. Nothing prints for a probe that was
+    #    never run, or for a confirmed `present`.
+    findings = _findings(match, style)
+    if findings:
+        out.append("")
+        for glyph, sentence in findings:
+            out.extend(_bullet(style, room, glyph, sentence))
+
+    # 5. Where the figures come from, which is what makes a disagreeing `du`
+    #    make sense instead of looking like a bug in one of the two tools.
+    notes = _space_notes(match, style, "%s %s" % (figure, inodes))
+    if notes:
+        out.append("")
+        for note in notes:
+            out.extend(_prose(style, room, note))
+
+    # 6. Why this directory is on the screen at all.
+    because = _because_phrase(match)
+    if because:
+        out.append("")
+        out.extend(_prose(style, room, because))
+
+    # 7. The repetitive part, collapsed. Eleven symlinks out of a home
+    #    directory are one fact about that directory, not eleven facts.
     crossings = [n for n in match.notes if "resolves to" in n]
-    others = [n for n in match.notes if "resolves to" not in n]
+    others = [
+        n for n in match.notes if "resolves to" not in n and not restates_source(n, match.sources)
+    ]
     if crossings:
         targets = sorted({n.split("resolves to")[1].split(",")[0].strip() for n in crossings})
         out.append("")
-        out.append(
-            "  %s %d path%s here are symlinks billed elsewhere: %s"
-            % (
+        out.extend(
+            _bullet(
+                style,
+                room,
                 style.warn(style.g.warn),
-                len(crossings),
-                "" if len(crossings) == 1 else "s",
-                ", ".join(targets[:2]) + ("..." if len(targets) > 2 else ""),
+                "%d path%s here are symlinks into other storage (%s), so what they hold counts "
+                "against that storage and not against this directory. dirscape tree shows the "
+                "whole picture."
+                % (
+                    len(crossings),
+                    "" if len(crossings) == 1 else "s",
+                    ", ".join(targets[:2]) + ("..." if len(targets) > 2 else ""),
+                ),
             )
         )
-        out.append(style.dim("    %s for the whole picture" % (style.accent("dirscape tree"),)))
-    for note in others[:3]:
-        out.append("  %-9s %s" % ("note", style.dim(note)))
-    if len(others) > 3:
-        out.append(
-            style.dim(
-                "  %-9s %d more (%s)" % ("", len(others) - 3, style.accent("dirscape --json"))
+    if others:
+        out.append("")
+        for note in others[:2]:
+            out.extend(_prose(style, room, note))
+        if len(others) > 2:
+            out.extend(
+                _prose(style, room, "%d more notes are in dirscape --json." % (len(others) - 2,))
             )
-        )
-    if caveat:
-        # Deduplicated. Each backend appends its own caveat and the blocks and
-        # inodes rows append the same ones again, so the raw string said "the
-        # mount for this row was inferred from its name" twice in one line and
-        # then said it a third time in longer words.
-        # One caveat, not four. Each backend appends its own and the blocks
-        # and inodes rows append the same ones again, so the raw string made
-        # the same point about an inferred mount three times in three
-        # different phrasings, which substring dedupe cannot catch and which
-        # was the longest line on the screen. The rest are in `--json`.
-        pieces = [piece.strip() for piece in caveat.split("; ") if piece.strip()]
-        out.append("  %-9s %s" % ("caveat", style.dim(pieces[0])))
-        if len(pieces) > 1:
-            out.append(
-                style.dim(
-                    "  %-9s %d more (%s)" % ("", len(pieces) - 1, style.accent("dirscape --json"))
-                )
-            )
+
+    # 8. The escape hatches, named once each and only where they apply. Every
+    #    caveat this screen dropped is behind one of them, which is the trade
+    #    the rewrite makes: a paragraph of administration detail off the screen
+    #    and one line saying where it went.
+    out.append("")
+    hatch = "Every field behind this is in dirscape why %s --json." % (match.path or shown,)
+    if match.writable.confirmed and match.writable.source == "os.access":
+        hatch += " Add --probe-write to settle the write answer by writing a file."
+    out.extend(_prose(style, room, hatch))
 
     return "\n".join(out), EXIT_OK
 
@@ -1320,6 +1721,7 @@ def _render(run, opts, command, style, width):
     roots, hidden = _visible(run, show_all)
     changes = list(run.changes or [])
     legend_on = bool(_merge_flag(opts, "legend", False))
+    summary_on = bool(_merge_flag(opts, "summary", False))
 
     if _merge_flag(opts, "json", False):
         caveats = list(run.warnings)
@@ -1373,6 +1775,7 @@ def _render(run, opts, command, style, width):
                 style=style,
                 size=width,
                 legend_on=legend_on,
+                summary=summary_on,
                 # No changes and an empty census on purpose: a detail view must
                 # not reprint the summary line that sent the reader to it.
                 # Three alert lines under the very list they point at is the
@@ -1479,6 +1882,7 @@ def _render(run, opts, command, style, width):
                     style=style,
                     size=width,
                     legend_on=legend_on,
+                    summary=summary_on,
                     all_roots=run.roots,
                     group=True,
                 ),
@@ -1493,6 +1897,11 @@ def _render(run, opts, command, style, width):
                 style=style,
                 size=width,
                 legend_on=legend_on,
+                summary=summary_on,
+                # The change records one line each. `new` exists to show them,
+                # so they are its content; the default view counts them and
+                # points here, which inside this view would point at itself.
+                deltas=True,
                 all_roots=run.roots,
                 group=True,
             ),
@@ -1509,11 +1918,11 @@ def _render(run, opts, command, style, width):
             size=width,
             hidden=hidden,
             legend_on=legend_on,
+            summary=summary_on,
             # The unfiltered list, so the summary lines can count the rows the
             # default view deliberately holds back.
             all_roots=run.roots,
             group=not show_all,
-            warnings=_surfaceable(run),
         ),
         EXIT_OK,
     )
@@ -1546,12 +1955,19 @@ def _write(text):
 
 def _surfaceable(run):
     # type: (Run) -> List[str]
-    """Warnings worth a line in the table.
+    """Warnings worth telling the user about, whatever the view is.
 
-    The stranded summary is excluded: it already has its own alert line with a
-    subcommand, and repeating it as a warning said the same thing twice. The
-    seeded-baseline note is excluded for the same reason, since the `new` view
-    says it in full.
+    The stranded summary is excluded: it has its own subcommand, and repeating
+    it as a warning said the same thing twice. The seeded-baseline note is
+    excluded for the same reason, since the `new` view says it in full.
+
+    **These go to stderr, not into the table.** A malformed
+    `/etc/dirscape/site.conf`, a damaged baseline and a baseline that could not
+    be written are the tool saying it could not do its job, so they are not
+    chrome and they cannot move behind `--summary` with the counts. stderr is
+    where they belong for the same reason `--timing` uses it: `dirscape | grep`
+    should get a clean table, and a failure should still reach the person at
+    the terminal.
     """
     skip = ("holds space in ", "no baseline yet, seeded")
     out = []  # type: List[str]
@@ -1561,6 +1977,205 @@ def _surfaceable(run):
         if text not in out:
             out.append(text)
     return out
+
+
+# --------------------------------------------------------------------------
+# Making a block fit the window it is repainted in
+# --------------------------------------------------------------------------
+
+#: The escape byte, spelled once. `_atoms` and `_sgr_state` both reason about
+#: where an escape sequence starts, and the literal in three places is three
+#: chances to mistype it.
+ESC = "\033"
+
+
+def _window_cols(style):
+    # type: (object) -> int
+    """Columns the repaint arithmetic has to live inside.
+
+    `style.size` comes from `term_width`, which CLAMPS to [MIN_WIDTH,
+    MAX_WIDTH]: a 120 column window is laid out at 120 and a 300 column one at
+    200, and wrapping at either is safe because both are at most the real
+    width. A window NARROWER than MIN_WIDTH is the case that clamp gets wrong
+    for this purpose, since it hands back 32 for a 24 column terminal while
+    the terminal still wraps at 24, so the measured figure wins here.
+    """
+    room = int(getattr(style, "size", 0) or render_style.FALLBACK_WIDTH)
+    try:
+        columns = int(shutil.get_terminal_size().columns)
+    except Exception:  # pragma: no cover - nothing to ask
+        columns = 0
+    if columns > 0:
+        room = min(room, columns)
+    return max(8, room)
+
+
+def _atoms(text):
+    # type: (str) -> List[Tuple[str, int]]
+    """One (piece, display width) pair per character, each ANSI escape whole.
+
+    The unit a hard break is allowed to happen between. Breaking on characters
+    alone would cut an escape sequence in half and send its tail to the
+    terminal as text.
+    """
+    out = []  # type: List[Tuple[str, int]]
+    index = 0
+    size = len(text)
+    while index < size:
+        if text[index] == ESC:
+            end = index + 1
+            if end < size and text[end] == "[":
+                end += 1
+                while end < size and not (0x40 <= ord(text[end]) <= 0x7E):
+                    end += 1
+            out.append((text[index : end + 1], 0))
+            index = end + 1
+            continue
+        out.append((text[index], render_style.width(text[index])))
+        index += 1
+    return out
+
+
+def _sgr_state(atoms, start=""):
+    # type: (Sequence[Tuple[str, int]], str) -> str
+    """The colour run still open after these atoms, "" when none is."""
+    state = start
+    for piece, span in atoms:
+        if span == 0 and piece.startswith(ESC):
+            state = "" if piece in (interactive.RESET, ESC + "[m") else state + piece
+    return state
+
+
+def _fit(lines, size, hang="    "):
+    # type: (Sequence[str], int, str) -> List[str]
+    """Break every line to ``size`` columns, so LOGICAL lines equal physical rows.
+
+    `interactive.select` repaints by moving the cursor up by the number of
+    lines it last WROTE and clearing from there. A line the terminal wraps
+    occupies two rows and counts as one, so the cursor stops a row short, the
+    erase starts a row too low, and one row survives every repaint.
+
+    Measured on `_why("/project/hpc")` before the detail view was rewritten:
+    18 lines written against 19 rows occupied, at every width from 80 to 120,
+    because the writable verdict's reason ran to 157 characters. Thirteen
+    presses of Down left thirteen copies of the header stacked above the
+    detail, which is the bug this exists for.
+
+    Breaks at the last space that fits, and mid-token only when a token is
+    itself too long. That case is the one that matters: a path contains no
+    spaces, and `render.style.wrap` leaves an over-long word hanging off the
+    edge rather than splitting it. The colour run open at a break is closed
+    and re-opened, so a wrapped coloured sentence keeps its tint on the second
+    row.
+    """
+    room = max(8, int(size))
+    out = []  # type: List[str]
+    for line in lines:
+        if render_style.width(line) <= room:
+            out.append(line)
+            continue
+        indent = line[: len(line) - len(line.lstrip(" "))] + hang
+        prefix = ""
+        carry = ""
+        held = []  # type: List[Tuple[str, int]]
+        used = 0
+        cut = -1
+        for atom in _atoms(line):
+            piece, span = atom
+            # At least four columns of content per row whatever the indent
+            # measures, so a pathological leading indent cannot stall this.
+            limit = max(4, room - render_style.width(prefix))
+            if used + span > limit and held:
+                head, tail = (held[:cut], held[cut:]) if cut > 0 else (held, [])
+                while head and head[-1][0] == " ":
+                    head.pop()
+                state = _sgr_state(head, carry)
+                body = "".join(text for text, _ in head)
+                out.append(prefix + carry + body + (interactive.RESET if state else ""))
+                carry = state
+                prefix = indent
+                held = tail
+                used = sum(span_of for _, span_of in tail)
+                cut = -1
+            held.append(atom)
+            used += span
+            if piece == " ":
+                cut = len(held)
+        if held:
+            out.append(prefix + carry + "".join(text for text, _ in held))
+    return out
+
+
+def _still(reader=None):
+    # type: (Optional[Callable[[], str]]) -> Callable[[], str]
+    """A key reader that turns Up and Down into a key nothing repaints for.
+
+    A one row view has nowhere to move, so a repaint on Up or Down is pure
+    cost: `select` wraps the cursor round onto the same row and paints the
+    same block again. `Key.OTHER` is the one decoded key `select` ignores
+    without repainting, which is why these map onto it.
+
+    Done from the caller rather than inside `select`, which has to keep
+    treating Up and Down as movement for the table above.
+    """
+
+    def read():
+        # type: () -> str
+        key = (reader or interactive.read_key)()
+        if key in (interactive.Key.UP, interactive.Key.DOWN):
+            return interactive.Key.OTHER
+        return key
+
+    return read
+
+
+def _detail(run, root, style, cols=None, window=None):
+    # type: (Run, object, object, Optional[int], Optional[int]) -> List[str]
+    """One row's `why`, framed and guaranteed to fit the window it repaints in.
+
+    A function rather than six lines inside `_browse` because the property it
+    has to hold is testable and was broken: **every line is at most one
+    physical row, and the whole block is at most one row shorter than the
+    window.** `interactive.select` repaints by moving the cursor up by the
+    number of lines it wrote, so a block that occupies more rows than it has
+    lines leaves one behind on every keypress, and a block taller than the
+    window has scrolled by the time it is erased. See `_fit`.
+
+    Four columns of every row belong to the frame `panel` draws, so the detail
+    is built and wrapped to what is left. Wrapping here rather than leaving it
+    to the terminal also keeps `panel` from having to truncate, which on this
+    block would eat an ellipsis into a path.
+    """
+    cols = _window_cols(style) if cols is None else max(8, int(cols))
+    inner = max(8, cols - 4)
+    window = interactive.window_rows() if window is None else int(window)
+    detail, _ = _why(run, root.path or "/", style, size=inner)
+    lines = _fit(
+        detail.splitlines()
+        + ["", style.dim("   %s back   %s quit" % (style.accent("left"), style.accent("q")))],
+        inner,
+    )
+    if window:
+        # Three rows are spoken for: the frame's two borders, and the one
+        # `select` leaves the cursor on below the block. Dropping the tail
+        # keeps the arithmetic true, and the line that replaces it names the
+        # command that prints the screen in full.
+        fits = max(1, window - 3)
+        if len(lines) > fits:
+            marker = _fit(
+                _prose(
+                    style,
+                    inner,
+                    "The window is too short for the rest. dirscape why %s prints it in full."
+                    % (root.path or "/",),
+                ),
+                inner,
+            )
+            lines = (lines[: max(1, fits - len(marker))] + marker)[:fits]
+    # `_fit` again over the framed block, as the backstop: if `panel` ever
+    # returns a row wider than the window it was given, a broken looking box
+    # is a far smaller failure than a repaint that wipes the scrollback.
+    return _fit(panel(lines, style=style, size=cols).splitlines(), cols)
 
 
 def _browse(run, opts, style, width):
@@ -1579,9 +2194,14 @@ def _browse(run, opts, style, width):
     roots, hidden = _visible(run, show_all)
     changes = list(run.changes or [])
     legend_on = bool(_merge_flag(opts, "legend", False))
+    summary_on = bool(_merge_flag(opts, "summary", False))
 
     def frame(cursor):
         # type: (int) -> List[str]
+        # **Unframed, on purpose.** The band is painted on a CONTENT line and
+        # the panel is drawn around the result, so the selection sits inside
+        # the border. Highlighting the finished view instead would invert the
+        # two border characters along with the row and pad the band past them.
         text = render_atlas(
             roots,
             meta=run.meta,
@@ -1591,25 +2211,34 @@ def _browse(run, opts, style, width):
             size=width,
             hidden=hidden,
             legend_on=legend_on,
+            summary=summary_on,
             all_roots=run.roots,
             group=not show_all,
+            frame=False,
         )
-        lines = text.splitlines()
-        # The cursor indexes ROOTS, and the block has a header, a blank line,
-        # a column header and a rule above the first row. Located by matching
-        # the row's own path rather than by counting chrome, because the
-        # chrome changes with the window and a counted offset would put the
-        # highlight on the wrong line at the one width nobody tested.
+        lines = text.splitlines() + footer
+        # The cursor indexes ROOTS, and the block has a title, a blank line, a
+        # rule and a column header above the first row. Located by matching the
+        # row's own path rather than by counting chrome, because the chrome
+        # changes with the window and a counted offset would put the highlight
+        # on the wrong line at the one width nobody tested.
+        #
+        # Matched against the line with its escapes REMOVED. The path cell dims
+        # its parent directories now, so `/home/jdoe42` is three runs and an
+        # escape sequence on screen and is no longer a substring of the line it
+        # is printed on. That silently stopped matching anything, which paints
+        # no band at all.
         target = roots[cursor].path or (roots[cursor].policy or {}).get("allocation_location", "")
         for position, line in enumerate(lines):
-            if target and target in line:
-                return interactive.highlight(lines, position)
-        return lines
+            if target and target in plain(line):
+                lines = interactive.highlight(lines, position)
+                break
+        return panel(lines, style=style, size=width or style.size).splitlines()
 
     footer = [
         "",
         style.dim(
-            "  %s move   %s open   %s quit"
+            "   %s move   %s open   %s quit"
             % (
                 style.accent("up/down"),
                 style.accent("enter"),
@@ -1643,7 +2272,7 @@ def _browse(run, opts, style, width):
     # `interactive.supported()` cannot catch this: it knows the window height
     # but not what is about to be drawn in it.
     rows = interactive.window_rows()
-    first = frame(0) + footer
+    first = frame(0)
     if rows and len(first) + 1 > rows:
         text, _ = _render(run, opts, "atlas", style, width)
         _write(text)
@@ -1656,7 +2285,7 @@ def _browse(run, opts, style, width):
     cursor = 0
     while True:
         chosen = interactive.select(
-            lambda i: frame(i) + footer,
+            frame,
             len(roots),
             initial=cursor,
             escapable=False,
@@ -1664,12 +2293,7 @@ def _browse(run, opts, style, width):
         if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
             return leave()
         cursor = int(chosen)  # type: ignore[arg-type]
-        root = roots[cursor]
-        detail, _ = _why(run, root.path or "/", style)
-        lines = detail.splitlines() + [
-            "",
-            style.dim("  %s back   %s quit" % (style.accent("left"), style.accent("q"))),
-        ]
+        lines = _detail(run, roots[cursor], style)
         # openable=False: this is the bottom, and Right here would otherwise
         # read as "step back" and bounce the reader into the same view again.
         # `block` is bound as a default rather than captured: `lines` is
@@ -1681,6 +2305,7 @@ def _browse(run, opts, style, width):
         outcome = interactive.select(
             lambda i, block=lines: block,
             1,
+            keys=_still(),
             initial=0,
             escapable=True,
             openable=False,
@@ -1760,6 +2385,10 @@ def main(argv=None):
 
     text, code = _render(run, opts, command, style, width)
     _write(text)
+
+    # Never silent, and never in the table. See `_surfaceable`.
+    for note in _surfaceable(run):
+        sys.stderr.write("dirscape: %s\n" % (note,))
 
     if _merge_flag(opts, "timing", False):
         sys.stderr.write("\nstage timings:\n")

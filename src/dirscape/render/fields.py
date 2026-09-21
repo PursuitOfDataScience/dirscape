@@ -452,7 +452,15 @@ def _figure_cell(root, snapshot, kind, formatter, style, percent=False):
     # doubt. Appended after the limit it produced `11T / no limit▒`, which
     # reads as a mark against the limit or simply as a typo.
     if row.in_doubt:
-        used = "%s%s" % (used, style.muted(g.doubt))
+        # The in-doubt glyph is NOT drawn on the figure any more. It carries a
+        # real fact (GPFS had handed out 2.4G against a home showing 858M
+        # used, which is three times the figure it sat beside and the reason a
+        # `du` disagrees) and it carried it in one character that nobody can
+        # decode. The owner asked what it was, which settles it: a mark that
+        # has to be explained to be read is not communicating on a table this
+        # dense. `why` states it in a sentence, `--legend` names it, and
+        # `--json` carries `in_doubt` for anything mechanical.
+        used = used
     text = "%s / %s" % (used, _limit_text(row, formatter, style))
     caveats = []  # type: List[str]
     if how == "inferred":

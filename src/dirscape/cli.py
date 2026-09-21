@@ -1362,8 +1362,13 @@ def _space_notes(root, style, figures):
     the rendered text of the space and files cells, and each legend below is
     gated on finding its own glyph in there. That way the legend cannot
     outlive a change to how `render.fields` draws a figure.
+
+    That docstring is now half wrong and the half that is wrong is worth
+    recording: keying an explanation to its own glyph is exactly how the
+    in-doubt sentence got deleted by accident when the glyph left the table.
+    The `~` legend below still keys on the mark, because `~` is still drawn;
+    the in-doubt sentence keys on the measurement.
     """
-    g = style.g
     out = []  # type: List[str]
     row, how, why = render_fields.pick_row(getattr(root, "quota", None), root.path, "blocks")
 
@@ -1402,24 +1407,30 @@ def _space_notes(root, style, figures):
         % (("%s under " % (scope,)) if scope else "", where)
     )
 
-    if g.doubt in figures:
+    # Conditioned on the FACT, not on a glyph being on screen.
+    #
+    # This was `if g.doubt in figures`, which tied the explanation to the mark
+    # appearing in the rendered figure. That was a reasonable-looking rule and
+    # it was fragile: the mark was removed from the table (a reader asked what
+    # it was, which is the only test a glyph has to pass) and the explanation
+    # silently left with it, so a home fileset with 2.4G handed out and not
+    # counted reported that nowhere at all. An explanation that depends on its
+    # own decoration is an explanation that can be deleted by accident.
+    held = []  # type: List[str]
+    blocks = render_fields.in_doubt_of(root)
+    if blocks:
+        held.append("%s of space" % (render_fields.human_bytes(blocks),))
+    files_row, _, _ = render_fields.pick_row(getattr(root, "inode_quota", None), root.path, "files")
+    if files_row is not None and files_row.in_doubt:
+        held.append("%s files" % (render_fields.human_count(files_row.in_doubt),))
+    if held:
         # `blockInDoubt` / `filesInDoubt`: handed out to a writer and not yet
-        # charged to anybody. Measured on one home fileset here at 2.18 GiB
-        # against 831 MiB used, so it is the difference a reader who
-        # cross-checks with du will actually see.
-        held = []  # type: List[str]
-        blocks = render_fields.in_doubt_of(root)
-        if blocks:
-            held.append("%s of space" % (render_fields.human_bytes(blocks),))
-        files_row, _, _ = render_fields.pick_row(
-            getattr(root, "inode_quota", None), root.path, "files"
-        )
-        if files_row is not None and files_row.in_doubt:
-            held.append("%s files" % (render_fields.human_count(files_row.in_doubt),))
+        # charged to anybody. Measured on this home fileset at 2.4 GB against
+        # 858 MB used, nearly three times the figure it qualifies, so it is
+        # the difference a reader who cross-checks with du actually sees.
         out.append(
-            "%s marks %sthe filesystem has handed out and not yet counted here, which is the "
-            "other reason a du walk disagrees."
-            % (g.doubt, ("%s " % (" and ".join(held),)) if held else "")
+            "The filesystem has handed out %s here and not yet counted it, which is the "
+            "other reason a du walk disagrees." % (" and ".join(held),)
         )
 
     if how == "inferred" and "~" in figures:

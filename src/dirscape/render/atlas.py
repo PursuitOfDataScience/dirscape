@@ -140,20 +140,17 @@ def _path_cell(root, style=None):
     `--json`, a pipe and a `NO_COLOR` terminal identical.
     """
     if root.path:
-        cell = root.path
-        held = (root.policy or {}).get("contains")
-        if isinstance(held, int) and held > 0:
-            # The fold count, which was being stored and never shown. The
-            # selection rule hides a root's subdirectories when the whole tree
-            # is yours, and the promise was that the parent keeps a count so
-            # the information is not lost. It was lost: twenty dataset
-            # collections folded into one row and nothing on screen said so.
-            cell = "%s +%d" % (root.path, held)
+        # The fold count `+2` is gone. It said this row had absorbed two
+        # subdirectories, which was true and was not something a reader could
+        # do anything with: the count named no path, and the only action
+        # available was `--all`, which lists them properly. The owner read
+        # `/project/hpc +2` and asked what it meant; the honest answer was "a
+        # number you cannot use", and the count survives in `--json` and
+        # `--summary` for anyone who wants it.
         if style is None or not style.enabled:
-            return cell
+            return root.path
         lead, sep, leaf = root.path.rpartition("/")
-        fold = cell[len(root.path) :]
-        return style.dim(lead + sep) + leaf + style.dim(fold)
+        return style.dim(lead + sep) + leaf
     location = root.policy.get("allocation_location") if root.policy else None
     if location:
         # The trailing marker is not decoration. It is the difference between
@@ -349,11 +346,24 @@ def _header(roots, meta, style, size=None):
         style.head(fields.safe(meta.tool, limit=32) or "dirscape"),
         style.accent(user),
         style.accent(host.split(".")[0]),
-        style.muted(node),
-        style.muted(fields.device_count(roots, meta)),
     ]
-    if meta.baseline_at is not None:
-        items.append(style.dim("baseline %s" % (fields.age_phrase(meta.baseline_at, meta.now),)))
+    # The node class, the device count and the baseline age all came off.
+    # The owner read the finished line and asked what it meant, which is the
+    # only test a header has to pass, and it failed all three:
+    #
+    #   `compute`      answers a question nobody asked, and matters only when
+    #                  it CHANGES, which the diff already refuses to do across
+    #                  node classes. `why` states it in a sentence.
+    #   `9 devices`    nobody needs to know how many block devices a node
+    #                  mounts. It was a number the tool found interesting
+    #                  about itself.
+    #   `baseline 47m` is `dirscape new`'s business and that view prints it
+    #                  properly. On a table of current usage it is a date
+    #                  attached to nothing on screen.
+    #
+    # What is left is the scope of every row underneath: which tool, whose
+    # quota, which machine. `node` is still computed above because `--summary`
+    # and the JSON metadata both carry it.
     return legend(items, style, size=size if size else style.size, indent="")
 
 

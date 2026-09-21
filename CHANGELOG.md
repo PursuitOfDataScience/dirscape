@@ -505,6 +505,39 @@ in the table has an ASCII twin, and `NO_COLOR` or `TERM=dumb` emits not one
 escape byte, frame and gradient included, with `--color always` unable to
 override either.
 
+### Fifth pass: if a reader has to ask, it goes
+
+The owner read the finished table and asked, one by one, what `▒` was, what
+`compute` and `9 devices` and `baseline 47m ago` meant, what `3%` was, and why
+a path said `+2`. Having to ask is the whole answer, and the fix is deletion
+rather than a legend.
+
+- **`▒` is off the figures.** It marked GPFS space handed out and not yet
+  counted, which on this home was 2.4G against 858M used, nearly three times
+  the figure it qualified. A real fact in one undecodable character on every
+  row. `why` now states it in a sentence, `--legend` names it, `--json` carries
+  `in_doubt`.
+- **`+2` is off the paths.** This reverses a fix from two rounds ago, and the
+  reversal is the right way round: the count WAS being stored and never shown,
+  which was a genuine defect, so it was rendered. Then a reader saw
+  `/project/hpc +2` and asked what it meant, and the honest answer was "a
+  number you cannot use": it names no path, and the only action is `--all`.
+  It survives in `--json` and `--summary`.
+- **The header is three facts**, down from six: which tool, whose quota, which
+  machine. `compute` matters only when it changes, which the diff already
+  refuses to do across node classes. `9 devices` was the tool finding itself
+  interesting. `baseline 47m ago` is `dirscape new`'s business and that view
+  prints it properly.
+
+`3%` stayed, because a percentage explains itself.
+
+One regression caused and fixed in the same pass. The in-doubt sentence in
+`why` was conditioned on `if g.doubt in figures`, so it was tied to the mark
+appearing on screen; removing the mark deleted the explanation with it, and a
+fileset with 2.4G unaccounted reported that nowhere. It keys on the measurement
+now. An explanation that depends on its own decoration can be deleted by
+accident.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

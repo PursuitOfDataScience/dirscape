@@ -949,11 +949,14 @@ def test_a_title_that_wraps_does_not_break_the_frame_open():
     style = resolve_style(color="never", ascii_only=False, stream=None)
     roots = [_measured(_root("/home/me", "fs-home"))]
     roots[0].role = "home"
+    # The wrap is forced with a long user and host rather than with the node
+    # class and device count, which used to be on this line and were removed:
+    # the owner read them and asked what they meant. The GUARANTEE this test
+    # exists for is unchanged and still bites, because a long login name or a
+    # long hostname wraps the title exactly the same way.
     meta = {
-        "host": "meadow3-0200",
-        "node_class": "compute",
-        "user": "jdoe42",
-        "devices": 9,
+        "host": "an-unusually-long-hostname-for-a-login-node",
+        "user": "a-rather-long-login-name",
     }
     lines = atlas.render(roots, meta=meta, style=style, group=True, size=60).splitlines()
 
@@ -962,8 +965,8 @@ def test_a_title_that_wraps_does_not_break_the_frame_open():
         assert line.startswith("│") and line.endswith("│"), "the frame opened: %r" % (line,)
     assert len({len(line) for line in lines}) == 1
     # And the title really did need two lines, or this proves nothing.
-    assert any("9 devices" in line for line in lines[1:3])
-    assert "9 devices" not in lines[1]
+    assert any("an-unusually-long-hostname" in line for line in lines[1:4])
+    assert "an-unusually-long-hostname" not in lines[1]
 
 
 def test_a_path_too_wide_for_a_frame_is_printed_whole_and_unframed():
@@ -1161,16 +1164,33 @@ def test_why_does_not_second_guess_an_exact_root():
     assert "does not exist" not in text
 
 
-def test_the_fold_count_is_actually_rendered():
-    """It was stored in `policy["contains"]` and never displayed, so twenty
-    dataset collections folded into one row and nothing on screen said so.
+def test_the_fold_count_left_the_table_and_lives_in_json():
+    """`+2` is gone from the path cell, deliberately.
+
+    It reversed an earlier fix in this same file, and the reversal is the
+    right way round. The count WAS being stored and never shown, which was a
+    real defect, so it was rendered as `/project/hpc +2`. Then the owner read
+    that and asked what it meant, and the honest answer was "a number you
+    cannot use": it names no path, and the only action available is `--all`,
+    which lists the folded rows properly.
+
+    So the fact stays and the glyph goes. `--json` still carries `contains`
+    and `--summary` still counts the hidden rows, which is what keeps this a
+    presentation change rather than a loss of information. Verified live:
+    `--json` reports `[('/project/hpc', 2)]`.
     """
     from dirscape.render import atlas
 
     root = _measured(_root("/project2/reference", "project2-reference"))
     root.policy = dict(root.policy or {})
     root.policy["contains"] = 20
-    assert "+20" in atlas._path_cell(root)
+
+    cell = atlas._path_cell(root)
+    assert "+20" not in cell, "the fold count must not be back in the table"
+    assert cell.endswith("/project2/reference")
+
+    # And it is still in the machine-readable output.
+    assert root.to_json()["policy"]["contains"] == 20
 
 
 def test_stranded_is_not_reported_as_a_change():

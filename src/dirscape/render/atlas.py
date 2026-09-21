@@ -55,7 +55,7 @@ _ROLE, _PATH, _WHERE, _REACH, _USED, _FILES, _POLICY = range(7)
 
 #: Never dropped. The path identifies the row and WHERE carries the answer this
 #: tool is for.
-KEEP_COLUMNS = (_PATH, _WHERE)
+KEEP_COLUMNS = (_PATH, _USED)
 
 #: Each stage is ``(columns to drop, draw the bar)``. Walked in order until one
 #: fits the window. Documented in the module docstring, and asserted in
@@ -67,7 +67,12 @@ DROP_STAGES = (
     ((_POLICY, _FILES, _ROLE), True),
     ((_POLICY, _FILES, _ROLE), False),
     ((_POLICY, _FILES, _ROLE, _REACH), False),
-    ((_POLICY, _FILES, _ROLE, _REACH, _USED), False),
+    # WHERE goes before USED, and that ordering is the point. The last stage
+    # used to drop USED, so at 40 columns the table degraded to a bare list of
+    # paths with no number anywhere on it, which is not a smaller version of
+    # this tool's answer but the absence of one. WHERE is context and reads
+    # `here` on nearly every row anyway; USED is the answer.
+    ((_POLICY, _FILES, _ROLE, _REACH, _WHERE), False),
 )
 
 _ALIGNS = ("left", "left", "left", "left", "left", "right", "left")
@@ -92,6 +97,14 @@ def _path_cell(root):
     `?` in every column and were indistinguishable from each other.
     """
     if root.path:
+        held = (root.policy or {}).get("contains")
+        if isinstance(held, int) and held > 0:
+            # The fold count, which was being stored and never shown. The
+            # selection rule hides a root's subdirectories when the whole tree
+            # is yours, and the promise was that the parent keeps a count so
+            # the information is not lost. It was lost: twenty dataset
+            # collections folded into one row and nothing on screen said so.
+            return "%s +%d" % (root.path, held)
         return root.path
     location = root.policy.get("allocation_location") if root.policy else None
     if location:
@@ -252,7 +265,7 @@ def _plan(rows_bar, rows_flat, window):
         rows = rows_bar if show_bar else rows_flat
         if _column_width(COLUMNS, rows, columns) <= window:
             return columns, show_bar, False
-    return [_PATH, _WHERE], False, True
+    return [_PATH, _USED], False, True
 
 
 def _header(roots, meta, style):

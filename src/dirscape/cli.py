@@ -987,7 +987,14 @@ def _visible(run, show_all):
     if show_all:
         return list(run.roots), 0
 
-    primary = [r for r in run.roots if getattr(r, "rank", RANK_PRIMARY) == RANK_PRIMARY]
+    # Read from `policy`, which is where discovery puts it. This was
+    # `getattr(r, "rank", RANK_PRIMARY)` against a `Root` that has no `rank`
+    # attribute, so the default was returned for every root and the whole
+    # rank filter did nothing: memory filesystems and the `/gpfs/*` plumbing
+    # views were only kept out of the default view by the later
+    # `_says_something` test, which is a different question and let a 94G
+    # tmpfs through as somewhere to put data.
+    primary = [r for r in run.roots if (r.policy or {}).get("rank", RANK_PRIMARY) == RANK_PRIMARY]
     kept, folded = _collapse_families(primary)
     speaking = [r for r in kept if _says_something(r)]
 
@@ -1036,11 +1043,30 @@ def _why(run, path, style):
                 if len(candidate) > len(best):
                     best, match = candidate, root
 
+    if match is not None and match.path != target and not os.path.exists(target):
+        # Only when we FELL BACK to an enclosing root. The fallback is right
+        # for a path inside a root and wrong for one that is not there at all:
+        # `dirscape why /nope/nope` walked up, found `/`, and printed a
+        # confident explanation of `/` with exit 0, so a reader asked about one
+        # path and was answered about another.
+        #
+        # An exact root match is never second-guessed here. Discovery already
+        # settled whether it is present, and re-checking the filesystem made
+        # the tool contradict its own probe and emit "X does not exist. The
+        # enclosing root is X", naming the same path twice.
+        return (
+            "%s does not exist.\n\n"
+            "The enclosing root is %s, if that is what you meant." % (target, match.path or "?"),
+            EXIT_PATH,
+        )
+
     if match is None:
+        if not os.path.exists(target):
+            return ("%s does not exist." % (target,), EXIT_PATH)
         return (
             "dirscape found no root at or above %s.\n\n"
-            "That is a statement about discovery and not about the path: it may\n"
-            "exist and be perfectly readable. Try `dirscape --all`." % (target,),
+            "That is a statement about discovery and not about the path: it\n"
+            "exists and may be perfectly readable. Try `dirscape --all`." % (target,),
             EXIT_PATH,
         )
 
@@ -1250,7 +1276,15 @@ def _render(run, opts, command, style, width):
     if command == "map":
         return render_treemap(roots, style=style, size=width), EXIT_OK
     if command == "snapshot":
-        count = len(run.snapshot.records) if run.snapshot is not None else 0
+        if run.snapshot is None:
+            # It reported "Recorded 0 root(s) as a baseline" here, which is a
+            # claim to have done the one thing `--no-state` exists to prevent.
+            return (
+                "Nothing recorded: state tracking is off (--no-state), so "
+                "there is no baseline to compare against later.",
+                EXIT_USAGE,
+            )
+        count = len(run.snapshot.records)
         return (
             "Recorded %d root(s) as a baseline. Run `dirscape new` after the "
             "next change." % (count,),
@@ -1269,7 +1303,22 @@ def _render(run, opts, command, style, width):
                 "after something changes." % (len(roots),),
                 EXIT_OK,
             )
-        if not changes:
+        # `stranded` is a STANDING condition, not a change: the state layer
+        # emits it on every run because the space is still unreachable, so
+        # including it here made `dirscape new` show the same five rows of
+        # other people's filesets for ever, under a heading that said "1
+        # change since the baseline". The table and its own count disagreed.
+        # It keeps its alert line and its own subcommand.
+        moved = [c for c in changes if getattr(c, "label", "") != "stranded"]
+        if not moved:
+            standing = len(changes) - len(moved)
+            if standing:
+                return (
+                    "No change since the last run. %d fileset%s still hold "
+                    "space you cannot reach: dirscape stranded"
+                    % (standing, "" if standing == 1 else "s"),
+                    EXIT_OK,
+                )
             return ("No change since the last run.", EXIT_OK)
         # The atlas renders the delta panel, so it is reused rather than
         # reimplemented. It is handed the roots the changes REFER TO, not an
@@ -1278,17 +1327,39 @@ def _render(run, opts, command, style, width):
         # earlier version of this branch did. Showing the changed rows is also
         # simply better, since a label without its quota and reach is half an
         # answer.
-        changed_paths = {c.path for c in changes if getattr(c, "path", "")}
+        changed_paths = {c.path for c in moved if getattr(c, "path", "")}
         subset = [r for r in run.roots if r.path and r.path in changed_paths]
+        changes = moved
+        if not subset:
+            # Every change is on a root with no path (an allocation), so there
+            # is no row to show. `subset or roots` fell back to the entire
+            # atlas here, which answered "what changed?" with "here is
+            # everything", and dropped the grouping and the census with it.
+            return (
+                render_atlas(
+                    [],
+                    meta=run.meta,
+                    changes=changes,
+                    site=run.site,
+                    style=style,
+                    size=width,
+                    legend_on=legend_on,
+                    all_roots=run.roots,
+                    group=True,
+                ),
+                EXIT_OK,
+            )
         return (
             render_atlas(
-                subset or roots,
+                subset,
                 meta=run.meta,
                 changes=changes,
                 site=run.site,
                 style=style,
                 size=width,
                 legend_on=legend_on,
+                all_roots=run.roots,
+                group=True,
             ),
             EXIT_OK,
         )
@@ -1447,6 +1518,18 @@ def main(argv=None):
     # type: (Optional[Sequence[str]]) -> int
     parser = build_parser()
     opts = parser.parse_args(list(argv) if argv is not None else None)
+
+    timeout = getattr(opts, "timeout", None)
+    if timeout is not None and timeout <= 0:
+        # Silently accepted before, and the result was a run where every probe
+        # came back NOT_PROBED and the table was sixty rows of `?`. A budget of
+        # zero cannot answer anything, so saying so beats performing a run
+        # that cannot work.
+        sys.stderr.write(
+            "dirscape: --timeout must be greater than zero (got %g). "
+            "A zero or negative budget cannot probe anything.\n" % (timeout,)
+        )
+        return EXIT_USAGE
 
     if opts.site_template:
         _write(SITE_TEMPLATE)

@@ -294,6 +294,21 @@ def _quota_source(root):
 # --------------------------------------------------------------------------
 
 
+def root_key(root):
+    # type: (Root) -> Tuple[str, str]
+    """The snapshot key for a live `Root`. Must agree with `RootRecord.key`.
+
+    It exists because `Snapshot.from_roots` used to compute
+    `(root.device, root.path)` inline while `RootRecord.key` had its own rule.
+    The two drifted the moment pathless roots got a location fallback, and the
+    dedupe kept collapsing six allocations into one record while the records
+    themselves keyed distinctly. Two definitions of identity is one too many.
+    """
+    if root.path:
+        return (root.device, root.path)
+    return ("allocation", str((root.policy or {}).get("allocation_location") or "?"))
+
+
 class RootRecord(object):
     """One root on one run, reduced to what a diff needs.
 
@@ -325,6 +340,7 @@ class RootRecord(object):
         "used_inodes",
         "limit_inodes",
         "stranded",
+        "location",
         "sources",
         "quota_source",
         "first_seen",
@@ -347,6 +363,7 @@ class RootRecord(object):
         used_inodes=None,  # type: Optional[int]
         limit_inodes=None,  # type: Optional[int]
         stranded=False,  # type: bool
+        location="",  # type: str
         sources=(),  # type: Sequence[str]
         quota_source="",  # type: str
         first_seen=None,  # type: Optional[float]
@@ -376,6 +393,9 @@ class RootRecord(object):
         self.used_inodes = used_inodes
         self.limit_inodes = limit_inodes
         self.stranded = bool(stranded)
+        # Only set for a root with no path: the allocation database's own name
+        # for the storage, which is the only stable identity such a root has.
+        self.location = location
         self.sources = list(sources)[:_MAX_SOURCES]
         self.quota_source = quota_source
         self.first_seen = first_seen
@@ -383,8 +403,23 @@ class RootRecord(object):
     @property
     def key(self):
         # type: () -> Tuple[str, str]
-        """The identity a diff matches on. See the class docstring."""
-        return (self.device, self.path)
+        """The identity a diff matches on. See the class docstring.
+
+        A root with no path keys on its allocation location instead. Without
+        that fallback every pathless root shares the key `("", "")`, and
+        `Snapshot.from_roots` drops all but the first as a duplicate:
+        measured, **six allocations collapsed to one record**, so five of them
+        were invisible to the state layer for ever and a genuinely new
+        allocation could never be reported. The one survivor also churned,
+        which is where a phantom "1 change since the baseline" came from on
+        every single run.
+        """
+        if self.path:
+            return (self.device, self.path)
+        return ("allocation", self.location or "?")
+
+    # `root_key` above is the same rule for a live `Root`; a test asserts the
+    # two agree on every root of a real run.
 
     @classmethod
     def from_root(cls, root, first_seen=None):
@@ -403,6 +438,7 @@ class RootRecord(object):
         return cls(
             path=root.path,
             device=root.device,
+            location=str((root.policy or {}).get("allocation_location") or ""),
             role=root.role,
             fileset=root.fileset,
             identity=root.identity,
@@ -453,6 +489,12 @@ class RootRecord(object):
             out["limit_inodes"] = self.limit_inodes
         if self.stranded:
             out["stranded"] = True
+        if self.location:
+            # Persisted because it is part of `key` for a pathless root. Left
+            # out of the file, the key would be stable within a run and
+            # different after a reload, so every allocation would read as new
+            # on the next run for ever.
+            out["location"] = self.location
         if self.sources:
             out["sources"] = list(self.sources)
         if self.quota_source:
@@ -467,14 +509,21 @@ class RootRecord(object):
         """One record, or None when the payload is not one.
 
         None rather than a raise, and None rather than a partial record: a file
-        with one unreadable entry should cost the user that entry, not their
-        whole baseline, and a record with no path cannot be matched against
-        anything anyway.
+        with one unreadable entry should cost the user that entry and not
+        their whole baseline.
+
+        A record needs a path OR a location. Requiring a path discarded every
+        allocation-only record on reload, so storage that has no path on this
+        node could never acquire a history: it would read as new on every run
+        for ever. `key` keys those on their location for the same reason.
         """
         if not isinstance(payload, dict):
             return None
         path = payload.get("path")
-        if not isinstance(path, str) or not path:
+        path = path if isinstance(path, str) else ""
+        location = payload.get("location")
+        location = location if isinstance(location, str) else ""
+        if not path and not location:
             return None
         identity = payload.get("identity")
         pair = None  # type: Optional[Tuple[int, int]]
@@ -488,6 +537,7 @@ class RootRecord(object):
         return cls(
             path=path,
             device=str(payload.get("device") or ""),
+            location=location,
             role=str(payload.get("role") or ""),
             fileset=str(payload.get("fileset") or ""),
             identity=pair,
@@ -667,7 +717,7 @@ class Snapshot(object):
         records = []  # type: List[RootRecord]
         live = {}  # type: Dict[Tuple[str, str], Root]
         for root in roots:
-            key = (root.device, root.path)
+            key = root_key(root)
             if key in live:
                 # Deduping by identity is discovery's job, and it has the mount
                 # table to do it with. Here a repeated key would only make the
@@ -710,9 +760,31 @@ class Snapshot(object):
 
     def record_for(self, device, path):
         # type: (str, str) -> Optional[RootRecord]
+        """The record at this device and path.
+
+        Kept for callers that genuinely have a path. It CANNOT find a pathless
+        record, because those key on their allocation location instead, so a
+        caller holding a record should use `match` rather than taking the
+        record apart and putting it back together.
+        """
         self._index()
         assert self._by_key is not None
         return self._by_key.get((device, path))
+
+    def match(self, record):
+        # type: (RootRecord) -> Optional[RootRecord]
+        """The record with the same identity as ``record``, if any.
+
+        Uses `RootRecord.key`, which is the only definition of identity here.
+        The diff used to rebuild the key as `(record.device, record.path)`,
+        which is a THIRD definition and the reason six allocations were
+        reported as `new` and then `unknown` on every single run: pathless
+        records key on their location, the rebuilt key was `("", "")`, the
+        lookup missed, and the diff concluded it had never seen them.
+        """
+        self._index()
+        assert self._by_key is not None
+        return self._by_key.get(record.key)
 
     def by_identity(self, identity):
         # type: (Optional[Tuple[int, int]]) -> Optional[RootRecord]

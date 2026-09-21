@@ -760,3 +760,148 @@ def test_why_omits_a_probe_that_never_ran():
 
     assert "allocated" not in text
     assert "mounted" in text
+
+
+# --------------------------------------------------------------------------
+# The bug-hunt round: things that were silently wrong
+# --------------------------------------------------------------------------
+
+
+def test_the_rank_filter_reads_the_place_discovery_writes():
+    """It was `getattr(root, "rank", ...)` against a Root with no such
+    attribute, so the default came back for every root and the whole rank
+    filter did nothing. A 94G tmpfs was offered as somewhere to put data.
+    """
+    run = cli.Run()
+    good = _measured(_root("/project/lab", "project-lab"))
+    good.role = "project"
+    good.policy = {"rank": "primary"}
+    ram = _measured(_root("/dev/shm", "", device="tmpfs"))
+    ram.role = "local"
+    ram.policy = {"rank": "secondary"}
+    run.roots = [good, ram]
+
+    shown, hidden = cli._visible(run, show_all=False)
+
+    assert [r.path for r in shown] == ["/project/lab"]
+    assert hidden == 1
+    assert len(cli._visible(run, show_all=True)[0]) == 2
+
+
+def test_a_missing_rank_is_treated_as_primary():
+    """A root discovery did not rank must not vanish."""
+    run = cli.Run()
+    root = _measured(_root("/project/lab", "project-lab"))
+    root.role = "project"
+    root.policy = {}
+    run.roots = [root]
+    assert [r.path for r in cli._visible(run, show_all=False)[0]] == ["/project/lab"]
+
+
+def test_a_non_positive_timeout_is_refused():
+    """It was accepted, and the run came back as sixty rows of `?`."""
+    for value in ("0", "-5"):
+        assert cli.main(["--timeout", value]) == cli.EXIT_USAGE
+
+
+def test_snapshot_does_not_claim_to_have_recorded_anything_with_no_state():
+    """It said "Recorded 0 root(s) as a baseline", which is a claim to have
+    done the one thing `--no-state` exists to prevent.
+    """
+    run = cli.Run()
+    run.roots = [_measured(_root("/project/lab", "project-lab"))]
+    run.snapshot = None
+    opts = cli.build_parser().parse_args(["snapshot", "--no-state"])
+
+    text, code = cli._render(run, opts, "snapshot", style=None, width=None)
+
+    assert code == cli.EXIT_USAGE
+    assert "Nothing recorded" in text
+    assert "Recorded 0" not in text
+
+
+def test_why_on_a_path_that_does_not_exist():
+    """It walked up, found `/`, and explained `/` with exit 0, so a reader
+    asked about one path and was answered about another.
+    """
+    run = cli.Run()
+    root = _measured(_root("/", "", device="rootfs"))
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, code = cli._why(run, "/definitely/not/here", resolve_style(color="never", stream=None))
+
+    assert code == cli.EXIT_PATH
+    assert "does not exist" in text
+
+
+def test_why_does_not_second_guess_an_exact_root():
+    """Re-checking the filesystem for an exact match made the tool contradict
+    its own probe and print "X does not exist. The enclosing root is X".
+    """
+    run = cli.Run()
+    # A synthetic root whose path is not on this disk: discovery already
+    # settled that it is present, and `why` must trust that.
+    root = _measured(_root("/synthetic/root/that/is/not/on/disk", "fs"))
+    root.reach = Reach.LISTABLE
+    root.writable = confirmed()
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, code = cli._why(
+        run, "/synthetic/root/that/is/not/on/disk", resolve_style(color="never", stream=None)
+    )
+
+    assert code == cli.EXIT_OK
+    assert "does not exist" not in text
+
+
+def test_the_fold_count_is_actually_rendered():
+    """It was stored in `policy["contains"]` and never displayed, so twenty
+    dataset collections folded into one row and nothing on screen said so.
+    """
+    from dirscape.render import atlas
+
+    root = _measured(_root("/project2/reference", "project2-reference"))
+    root.policy = dict(root.policy or {})
+    root.policy["contains"] = 20
+    assert "+20" in atlas._path_cell(root)
+
+
+def test_stranded_is_not_reported_as_a_change():
+    """It is a standing condition the state layer re-emits on every run, so
+    `dirscape new` showed the same five rows for ever under a heading that
+    said "1 change since the baseline".
+    """
+
+    class Rec(object):
+        def __init__(self, label, path):
+            self.label = label
+            self.path = path
+            self.because = ""
+
+    class Changes(object):
+        no_baseline = False
+        warnings = ()
+
+        def __init__(self, records):
+            self.records = records
+
+        def __iter__(self):
+            return iter(self.records)
+
+        def __len__(self):
+            return len(self.records)
+
+    run = cli.Run()
+    run.roots = [_measured(_root("/project/abe", "project-abe"))]
+    run.changes = Changes([Rec("stranded", "/project/abe")])
+    opts = cli.build_parser().parse_args(["new"])
+
+    text, code = cli._render(run, opts, "new", style=None, width=None)
+
+    assert code == cli.EXIT_OK
+    assert "No change since the last run" in text
+    assert "still hold space you cannot reach" in text

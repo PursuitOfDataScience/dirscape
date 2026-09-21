@@ -66,6 +66,8 @@ def render(roots, style=None, size=None):
     # type: (Sequence[Root], Optional[Style], Optional[int]) -> str
     """The nesting, as one string."""
     style = style or Style()
+    # Caveats already stated in this view, so each is said once.
+    said = set()
     window = size if size else style.size
     g = style.g
     if not roots:
@@ -103,7 +105,19 @@ def render(roots, style=None, size=None):
                 line += style.dim("  (fileset not determined)")
             out.append("%s   %s" % (line, figures))
             if caveat:
-                out.append("%s%s %s" % (cont, style.muted(g.sep), style.muted(caveat)))
+                # First fragment only. Each backend appends its own caveat and
+                # the blocks and inodes rows append the same ones again, so the
+                # raw string ran to about two hundred characters and said the
+                # same thing about an inferred mount three times. Repeated once
+                # per fileset it was most of this view.
+                first = caveat.split(";")[0].strip()
+                # Said ONCE per view. Every fileset on a multi-mount device
+                # carries the same inferred-mount caveat, so it appeared seven
+                # times in a thirty-line view, which is the point at which a
+                # caveat stops being read.
+                if first and first not in said:
+                    said.add(first)
+                    out.append("%s%s %s" % (cont, style.muted(g.sep), style.muted(first)))
             for r_index, root in enumerate(members):
                 last_root = r_index == len(members) - 1
                 r_stem = g.last if last_root else g.branch

@@ -228,6 +228,70 @@ Nothing raised; `886G free` simply sat four columns in while every quota figure
 sat five. Every figure now ends at the same column, verified by measuring the
 rendered output rather than by reading it.
 
+### Bug hunt: eleven defects, four of them silent
+
+Found by exercising every command and flag rather than by reading the code, and
+the worst were the ones that produced plausible output.
+
+**A chain of four around one broken key.** Every root with no path keyed on
+`("", "")`, so the six allocations collapsed to ONE snapshot record: five were
+invisible to the state layer for ever and a genuinely new allocation could
+never have been reported. `RootRecord.from_json` then discarded any record with
+no path, so even a correctly keyed one would not survive a reload. And the diff
+rebuilt the key as `(record.device, record.path)`, a third definition, so it
+could not find what it had just written and emitted six `new` plus six
+`unknown` records on every single run. That is where the phantom "1 change
+since the baseline" came from, and then "12 changes". There is now one
+definition of identity, `root_key` for a live root and `RootRecord.key` for a
+record, with a test that they agree.
+
+**The rank filter never worked.** It read `getattr(root, "rank", ...)` against
+a `Root` that has no `rank` attribute, so the default came back for every root
+and the whole classification was inert. Discovery writes it to
+`policy["rank"]`. The visible effect was a 94G tmpfs offered as somewhere to
+put data, alongside six `/gpfs/<cluster>/<tier>` plumbing views.
+
+**The fold count was stored and never rendered.** The selection rule hides a
+root's subdirectories when the whole tree is yours, and the promise was that
+the parent keeps a count. It was kept in `policy["contains"]` and displayed
+nowhere, so twenty dataset collections folded into one row and nothing on
+screen said so. The path cell shows `+20` now.
+
+Also fixed:
+
+- `dirscape why /nope/nope` walked up, found `/`, and printed a confident
+  explanation of `/` with exit 0. It exits 2 and says the path does not exist.
+  The first version of that fix over-reached and re-checked the filesystem for
+  an exact root match too, which made the tool contradict its own probe and
+  print "X does not exist. The enclosing root is X".
+- `--timeout 0` and `--timeout -5` were accepted, and the run came back as
+  sixty rows of `?`. A non-positive budget is a usage error.
+- `dirscape snapshot --no-state` reported "Recorded 0 root(s) as a baseline",
+  a claim to have done the one thing `--no-state` prevents.
+- `dirscape new` showed the same five stranded rows for ever, under a heading
+  that said "1 change". Stranded is a standing condition, so it keeps its
+  alert line and leaves the change list.
+- At 40 columns the last drop stage sacrificed `USED`, degrading the table to a
+  bare list of paths with no number on it, which is not a smaller answer but
+  the absence of one. `WHERE` goes first now.
+- `tree` printed the same 200-character inferred-mount caveat once per fileset,
+  seven times in a thirty-line view. Said once, and shortened.
+- `matrix` showed three columns that were `?` on every row (`read` by
+  construction, `purge` and `backup` for want of a `site.conf`) and then spent
+  three lines of legend explaining them. Columns that are entirely unknown are
+  dropped and named once.
+
+### Portability, tested rather than claimed
+
+`tests/test_portability.py` runs the whole pipeline on clusters this machine is
+not: real directories under `tmp_path`, a synthetic mount table, and a
+`RecordedRunner` that answers for exactly the tools that site has. A site with
+no quota tooling at all, a Lustre site (the one backend with no live coverage
+anywhere), an ext4 site, a closed directory, and every view rendered on each.
+The load-bearing one runs in STRICT mode, where a backend reaching for a tool
+the fixture never recorded raises instead of guessing: on a real foreign
+cluster that guess is a wrong answer nobody can see.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

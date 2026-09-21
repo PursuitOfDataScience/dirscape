@@ -20,6 +20,7 @@ stated rather than blurred.
 no field for, without this view inventing any.
 """
 
+import re
 from typing import Dict, List, Optional, Sequence
 
 from ..model import Root, Verdict
@@ -104,6 +105,15 @@ def _cells(root, style, site, extra):
     return out
 
 
+_ANSI = re.compile("\033\\[[0-9;?]*[A-Za-z]")
+
+
+def _plain(text):
+    # type: (str) -> str
+    """The glyph a reader sees, with the colour removed."""
+    return _ANSI.sub("", text)
+
+
 def render(roots, site=None, style=None, size=None, extra=None):
     # type: (Sequence[Root], object, Optional[Style], Optional[int], object) -> str
     """The capability grid, as one string."""
@@ -115,6 +125,25 @@ def render(roots, site=None, style=None, size=None, extra=None):
 
     headers = ["PATH"] + list(COLUMNS)
     rows = [[root.path or fields.UNKNOWN] + _cells(root, style, site, extra) for root in roots]
+
+    # Drop any column that is the unknown mark on EVERY row. Three of them
+    # were, on a site with no published policy: `read` by construction, since
+    # this tool never opens a file inside a directory, and `purge` and
+    # `backup` because nobody had written a `site.conf`. Three columns of
+    # solid `?` is what teaches a reader that the marks mean nothing, and the
+    # legend below still explains the ones that survive.
+    unknown_cell = fields.UNKNOWN
+    keepable = [0]
+    for index in range(1, len(headers)):
+        seen = {_plain(row[index]).strip() for row in rows}
+        if seen != {unknown_cell}:
+            keepable.append(index)
+    if len(keepable) > 1:
+        blank = [headers[i] for i in range(len(headers)) if i not in keepable]
+        headers = [headers[i] for i in keepable]
+        rows = [[row[i] for i in keepable] for row in rows]
+    else:
+        blank = []
     body, dropped = table(
         headers,
         rows,
@@ -125,7 +154,7 @@ def render(roots, site=None, style=None, size=None, extra=None):
         # The path is atomic: an ellipsis inside a path makes a different path,
         # and this view's rows are identified by nothing else.
         atomic=(0,),
-        priority=[headers.index(name) for name in DROP_PRIORITY],
+        priority=[headers.index(name) for name in DROP_PRIORITY if name in headers],
         drop_empty=False,
     )
     out = [body, ""]
@@ -152,12 +181,31 @@ def render(roots, site=None, style=None, size=None, extra=None):
             size=window,
         )
     )
-    for text in (
-        "%s to %s come from probes; %s and %s come from published site policy"
-        % (PROBED[0], PROBED[-1], FROM_POLICY[0], FROM_POLICY[1]),
-        "read means a file inside, which this tool does not open, so a column of %s "
-        "here is an answer and not a gap" % (fields.UNKNOWN,),
-    ):
+    # Explain only the columns that SURVIVED. The legend used to describe
+    # `purge`, `backup` and `read` unconditionally, so on a site with no
+    # published policy it spent three lines explaining three columns the view
+    # had just dropped for being entirely unknown.
+    shown = set(headers)
+    notes = []  # type: List[str]
+    if any(name in shown for name in FROM_POLICY):
+        notes.append(
+            "%s to %s come from probes; %s and %s come from published site policy"
+            % (PROBED[0], PROBED[-1], FROM_POLICY[0], FROM_POLICY[1])
+        )
+    if "read" in shown:
+        notes.append(
+            "read means a file inside, which this tool does not open, so a column of %s "
+            "here is an answer and not a gap" % (fields.UNKNOWN,)
+        )
+    if blank:
+        notes.append(
+            "%s: not shown, because %s unknown on every row"
+            % (
+                ", ".join(blank),
+                "it was" if len(blank) == 1 else "they were",
+            )
+        )
+    for text in notes:
         for line in wrap(text, indent="  ", size=window, style=style).splitlines():
             out.append(style.dim(line))
     return "\n".join(out)

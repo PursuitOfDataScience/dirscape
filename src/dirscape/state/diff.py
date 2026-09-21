@@ -695,7 +695,7 @@ def diff(previous, current, since=None):
     # things in a different order, which is what makes two `--json` outputs
     # comparable by a script.
     for record in sorted(current.records, key=lambda r: (r.path, r.device)):
-        before = previous.record_for(record.device, record.path)
+        before = previous.match(record)
         renamed_from = None  # type: Optional[str]
         if before is None:
             # Second chance on the inode. A renamed directory misses on the
@@ -894,7 +894,7 @@ def _identity_notes(current, previous, records):
     for record in sorted(current.records, key=lambda r: r.path):
         if record.path in noted or record.identity is None:
             continue
-        before = previous.record_for(record.device, record.path)
+        before = previous.match(record)
         if before is None or before.identity is None:
             continue
         if before.identity != record.identity:

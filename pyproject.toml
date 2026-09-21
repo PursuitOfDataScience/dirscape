@@ -1,0 +1,149 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dirscape"
+description = "Every storage root you can actually reach on a cluster, and what is new since last time."
+readme = "README.md"
+license = { text = "MIT" }
+# Stdlib only, and deliberately conservative, for the same reason rapiDU is:
+# the moment this tool is most useful is the first hour on an unfamiliar
+# cluster, on the bare `/usr/bin/python3` of a login node, before any conda env
+# exists. On RHEL8 that is 3.6.8. That floor is a feature, and it is what rules
+# out dataclasses and `from __future__ import annotations` throughout.
+requires-python = ">=3.6"
+authors = [{ name = "Youzhi Yu", email = "yuyouzhi666@icloud.com" }]
+# No "slurm" keyword: this package never asks a scheduler anything. It reads
+# mount tables, quota backends, group membership and allocation databases.
+keywords = [
+    "storage",
+    "quota",
+    "filesystem",
+    "discovery",
+    "gpfs",
+    "lustre",
+    "hpc",
+    "inodes",
+    "permissions",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Monitoring",
+    "Typing :: Typed",
+]
+# No runtime dependencies, on purpose. This joins rapiDU and nodetop in the
+# zero-dependency tier rather than slurmwatch/slurmpast's Textual tier: the
+# tool runs before you have set anything up, so it cannot require anything.
+dependencies = []
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/PursuitOfDataScience/dirscape"
+Repository = "https://github.com/PursuitOfDataScience/dirscape.git"
+Documentation = "https://github.com/PursuitOfDataScience/dirscape#readme"
+Issues = "https://github.com/PursuitOfDataScience/dirscape/issues"
+
+[project.scripts]
+dirscape = "dirscape.cli:main"
+# `dscape` is the short alias. Both names were checked against the registries
+# on 2026-09-21, because shadowing somebody else's command is a real cost:
+# `dirscape` and `dscape` are both free on PyPI, npm and crates.io, and no
+# binary of either name exists on a RHEL8 login node.
+#
+# The obvious alias `dsc` was REJECTED. PyPI `dsc` is the package
+# "Dynamic Statistical Comparisons", which ships its own `dsc` console script,
+# so on any machine with both installed one of them would be silently shadowed
+# depending on PATH order. That is the same mistake rapiDU made once with `sd`
+# (chmln/sd, packaged in Debian, Ubuntu, Homebrew and Arch) and had to undo.
+#
+# `ds` and `dirs` were also rejected: `ds` is too generic to claim, and `dirs`
+# is a bash builtin, so a script defining it would be shadowed by the shell
+# itself and never run at all.
+dscape = "dirscape.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    # Upper-bounded on purpose: a formatter with no ceiling turns
+    # `ruff format --check` into a job that fails on a day nobody touched the
+    # repo.
+    "ruff>=0.15,<0.17",
+    "mypy>=1.8,<3",
+    "build>=1.0",
+    "twine>=4.0",
+    "setuptools-scm>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dirscape*"]
+
+[tool.setuptools.package-data]
+dirscape = ["py.typed"]
+
+[tool.setuptools_scm]
+version_file = "src/dirscape/_version.py"
+# The stock template opens with `from __future__ import annotations`, which is
+# a SyntaxError on 3.6 and takes down every import of the package. rapiDU hit
+# this exact failure once; the template below is the 3.6-safe replacement.
+version_file_template = '''__version__ = version = "{version}"
+__version_tuple__ = version_tuple = {version_tuple!r}
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py37"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+# The same rule set the sibling packages select, deliberately including neither
+# `UP` nor `RUF`. Both push toward syntax this package cannot use: `UP` wants
+# f-strings, `X | None` unions and `dict` over `Dict`, and `RUF` wants sorted
+# `__slots__` and `__all__` where the order here is meaningful rather than
+# alphabetical. Selecting them produced 190 findings, none of which were bugs.
+select = ["E", "F", "W", "I", "B", "C4", "SIM", "T20"]
+ignore = [
+    # KNOWN DEVIATION from the sibling packages, and a temporary one.
+    #
+    # This package annotates types in `# type:` COMMENTS rather than inline,
+    # and ruff does not read type comments, so every `typing` import and every
+    # model class used only in a signature comment is reported as unused. That
+    # is 106 findings and not one of them is real: deleting those imports would
+    # leave the runtime working and the type checking silently blind.
+    #
+    # The comment style was a mistake on my part. rapiDU carries the same
+    # `requires-python = ">=3.6"` floor using ordinary inline annotations,
+    # which are perfectly legal on 3.6; only `from __future__ import
+    # annotations` and `X | Y` need anything newer. Converting to inline
+    # annotations is the real fix and it deletes this exemption. Until then,
+    # F401 is off rather than papered over with 106 `noqa` comments.
+    "F401",
+]
+
+[tool.mypy]
+python_version = "3.8"
+warn_unused_configs = true
+warn_redundant_casts = true
+no_implicit_optional = true
+files = ["src/dirscape"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["dirscape"]
+branch = true

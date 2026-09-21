@@ -1,0 +1,281 @@
+{
+ "captured_on": {
+  "fstypes": [
+   "autofs",
+   "binfmt_misc",
+   "bpf",
+   "cgroup",
+   "configfs",
+   "debugfs",
+   "devpts",
+   "devtmpfs",
+   "efivarfs",
+   "fuse",
+   "gpfs",
+   "hugetlbfs",
+   "mqueue",
+   "proc",
+   "pstore",
+   "rpc_pipefs",
+   "securityfs",
+   "sysfs",
+   "tmpfs",
+   "tracefs",
+   "xfs"
+  ],
+  "host_class": "login",
+  "note": "Real transcript from a GPFS site, 6 devices across 3 clusters. Identifying hostnames deliberately omitted; device names are kept because the parsers key on them."
+ },
+ "commands": [
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota"
+   ],
+   "elapsed_s": 0.2235,
+   "not_found": false,
+   "returncode": 22,
+   "stderr": "No quota enabled file system found.\nmmlsquota: tslsquota   failed. Error code 22.\nmmlsquota: Command failed. Examine previous error messages to determine cause.\n",
+   "stdout": "",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-Y",
+    "meadow3_cap"
+   ],
+   "elapsed_s": 0.0571,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:329430160:0:0:0:none:2608451:0:0:0:none:DSS.hpc.local:1:software:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:853744:31457280:36700160:2345808:none:36069:300000:1000000:1453:none:DSS.hpc.local:2:home:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:11765779792:0:0:7126144:none:3119659:0:0:1552:none:DSS.hpc.local:4:project-hpc:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:880:0:0:0:none:6:0:0:0:none:DSS.hpc.local:42:project-mdgreenwood:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:6821808:0:0:0:none:24:0:0:0:none:DSS.hpc.local:63:project-abe:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:11692960:0:0:0:none:600:0:0:0:none:DSS.hpc.local:78:project-dahlias:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:483040:0:0:0:none:2146:0:0:0:none:DSS.hpc.local:139:project-bard:\nmmlsquota:user:0:1:::meadow3_cap:USR:912345678:-:64:0:0:0:none:1:0:0:0:none:DSS.hpc.local:332:project-pelican:\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-Y",
+    "meadow3_perf"
+   ],
+   "elapsed_s": 0.0532,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\nmmlsquota:user:0:1:::meadow3_perf:USR:912345678:-:23127488:104857600:2147483648:0:none:3694:10000000:20000000:0:none:DSS.hpc.local:1:scratch:\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-Y",
+    "meadow2_cap"
+   ],
+   "elapsed_s": 0.0571,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\nmmlsquota:user:0:1:::meadow2_cap:USR:912345678:-:928:0:0:0:none:60:0:0:0:none:GSS.cluster2-storage1:3:project2-hpc:\nmmlsquota:user:0:1:::meadow2_cap:USR:912345678:-:24566740256:0:0:0:none:32609:0:0:0:none:GSS.cluster2-storage1:193:project2-reference:\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-Y",
+    "meadow2_perf"
+   ],
+   "elapsed_s": 0.0544,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\nmmlsquota:user:0:1:::meadow2_perf:USR:912345678:-:0:104857600:5368709120:0:none:1:10000000:20000000:0:none:GSS.cluster2-storage1:0::\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-Y",
+    "collie3_cap"
+   ],
+   "elapsed_s": 0.0536,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-Y",
+    "collie3_perf"
+   ],
+   "elapsed_s": 0.0537,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\nmmlsquota:user:0:1:::collie3_perf:USR:912345678:-:0:419430400:1073741824:0:none:1:5120000:5632000:0:none:DSS.hpc.local:2:scratch:\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "meadow3_cap"
+   ],
+   "elapsed_s": 0.0564,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "                         Block Limits                                               |     File Limits\nFilesystem Fileset    type             KB      quota      limit   in_doubt    grace |    files   quota    limit in_doubt    grace  Remarks\nmeadow3_cap software   USR       329430160          0          0          0     none |  2608451       0        0        0     none DSS.hpc.local\nmeadow3_cap home       USR          853744   31457280   36700160    2345808     none |    36069  300000  1000000     1453     none DSS.hpc.local\nmeadow3_cap project-hpc USR      11765779792          0          0    7126144     none |  3119659       0        0     1552     none DSS.hpc.local\nmeadow3_cap project-mdgreenwood USR             880          0          0          0     none |        6       0        0        0     none DSS.hpc.local\nmeadow3_cap project-abe USR         6821808          0          0          0     none |       24       0        0        0     none DSS.hpc.local\nmeadow3_cap project-dahlias USR        11692960          0          0          0     none |      600       0        0        0     none DSS.hpc.local\nmeadow3_cap project-bard USR          483040          0          0          0     none |     2146       0        0        0     none DSS.hpc.local\nmeadow3_cap project-pelican USR              64          0          0          0     none |        1       0        0        0     none DSS.hpc.local\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "meadow2_perf"
+   ],
+   "elapsed_s": 0.0528,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "                         Block Limits                                    |     File Limits\nFilesystem type             KB      quota      limit   in_doubt    grace |    files   quota    limit in_doubt    grace  Remarks\nmeadow2_perf USR               0  104857600 5368709120          0     none |        1 10000000 20000000        0     none GSS.cluster2-storage1\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "collie3_cap"
+   ],
+   "elapsed_s": 0.0524,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "                         Block Limits                                               |     File Limits\nFilesystem Fileset    type             KB      quota      limit   in_doubt    grace |    files   quota    limit in_doubt    grace  Remarks\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsquota",
+    "-u",
+    "root",
+    "meadow3_cap"
+   ],
+   "elapsed_s": 0.0565,
+   "not_found": false,
+   "returncode": 1,
+   "stderr": "Operation not permitted\nmmlsquota: tslsquota  -u root  DSS.hpc.local:/dev/meadow3_cap failed. Error code 1.\nmmlsquota: Command failed. Examine previous error messages to determine cause.\n",
+   "stdout": "",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsfileset",
+    "meadow3_cap"
+   ],
+   "elapsed_s": 0.0603,
+   "not_found": false,
+   "returncode": 2,
+   "stderr": "No filesets found owned by this user jdoe42\nmmlsfileset: tslsfileset failed. Error code 2.\nmmlsfileset: Command failed. Examine previous error messages to determine cause.\n",
+   "stdout": "",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsattr",
+    "-L",
+    "/home/jdoe42"
+   ],
+   "elapsed_s": 0.0018,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "file name:            /home/jdoe42\nmetadata replication: 1 max 2\nimmutable:            no\nappendOnly:           no\nflags:                \nstorage pool name:    system\nfileset name:         home\nsnapshot name:        \ncreation time:        Mon Feb 27 11:16:26 2023\nMisc attributes:      DIRECTORY\nEncrypted:            no\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsattr",
+    "-L",
+    "/software"
+   ],
+   "elapsed_s": 0.0023,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "file name:            /software\nmetadata replication: 1 max 2\nimmutable:            no\nappendOnly:           no\nflags:                \nstorage pool name:    system\nfileset name:         software\nsnapshot name:        \ncreation time:        Sat Dec  5 07:30:05 2020\nMisc attributes:      DIRECTORY\nEncrypted:            no\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsattr",
+    "-L",
+    "/project/hpc"
+   ],
+   "elapsed_s": 0.0019,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "file name:            /project/hpc\nmetadata replication: 1 max 2\nimmutable:            no\nappendOnly:           no\nflags:                \nstorage pool name:    system\nfileset name:         project-hpc\nsnapshot name:        \ncreation time:        Wed Dec 23 05:34:10 2020\nMisc attributes:      DIRECTORY\nEncrypted:            no\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/usr/lpp/mmfs/bin/mmlsattr",
+    "-L",
+    "/scratch/meadow3"
+   ],
+   "elapsed_s": 0.0019,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "file name:            /scratch/meadow3\nmetadata replication: 1 max 2\nimmutable:            no\nappendOnly:           no\nflags:                \nstorage pool name:    system\nfileset name:         scratch\nsnapshot name:        \ncreation time:        Wed Dec  9 19:09:43 2020\nMisc attributes:      DIRECTORY\nEncrypted:            no\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/opt/site/bin/quota"
+   ],
+   "elapsed_s": 0.9303,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": " \nQuota information updated at :  2026-09-21 09:32:27\n---------------------------------------------------------------------------\nfileset          type                   used      quota      limit    grace\n---------------- ---------------- ---------- ---------- ---------- --------\nMeadow2-home     blocks (user)         5.62M     30.00G     35.00G     none\nMeadow2-home     files  (user)           230     300000    1000000     none\nMeadow3-home     blocks (user)       830.72M     30.00G     35.00G     none\nMeadow3-home     files  (user)         36008     300000    1000000     none\nscratch/meadow2  blocks (user)         0.00K    100.00G      5.00T     none\nscratch/meadow2  files  (user)             1   10000000   20000000     none\nscratch/meadow3  blocks (user)        22.06G    100.00G      2.00T     none\nscratch/meadow3  files  (user)          3694   10000000   20000000     none\nscratch/collie3  blocks (user)         0.00K    400.00G   1024.00G     none\nscratch/collie3  files  (user)             1    5120000    5632000     none\n---------------- ---------------- ---------- ---------- ---------- --------\n>>> Capacity Filesystem: project (Collie3 GPFS mounted at /collie3)\n---------------- ---------------- ---------- ---------- ---------- --------\nhpc-staff        blocks (group)      149.36G   1024.00G      1.10T     none\nhpc-staff        files  (group)       259868     653600     718960     none\n---------------- ---------------- ---------- ---------- ---------- --------\n>>> Capacity Filesystem: project (Meadow3 GPFS mounted at /project)\n---------------- ---------------- ---------- ---------- ---------- --------\nhpc              blocks (group)       77.13T    202.34T    203.34T     none\nhpc              files  (group)     46518574  230900000  231900000     none\n---------------- ---------------- ---------- ---------- ---------- --------\n>>> Capacity Filesystem: project2 (Meadow2 GPFS mounted at /project2)\n---------------- ---------------- ---------- ---------- ---------- --------\nhpc              blocks (group)      198.90T    500.49T    501.49T     none\nhpc              files  (group)     51961393  384875000  385875000     none\n---------------- ---------------- ---------- ---------- ---------- --------\n>>> Low-Cost Filesystem: cfs3 (Ceph mounted at /cfs3) \n---------------- ---------------- ---------- ---------- ---------- --------\nkestrel-lab      blocks (group)      155.12T    165.00T    165.00T     none\nhpc-staff        blocks (group)       58.86M     10.00G     10.00G     none\n---------------- ---------------- ---------- ---------- ---------- --------\n>>> Low-Cost Filesystem: cfs4 (Ceph mounted at /cfs4) \n---------------- ---------------- ---------- ---------- ---------- --------\nhpc-staff        blocks (group)       27.87M     25.00T     25.00T     none\n---------------- ---------------- ---------- ---------- ---------- --------\n>>> Grant-Funded Filesystem: SHARED (Ceph mounted at /shared) \n---------------- ---------------- ---------- ---------- ---------- --------\nhpc-staff        blocks (group)        7.52T     10.00T     10.00T     none\n---------------------------------------------------------------------------\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "/opt/site/bin/allocs",
+    "storage"
+   ],
+   "elapsed_s": 0.4239,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "\n+-----------+------+---------+--------+-------------------+------------+------------+---------------------------------+\n|  Account  |  ID  |  Type   | GB(s)  |     Location      |   Start    |    End     |           Description           |\n+-----------+------+---------+--------+-------------------+------------+------------+---------------------------------+\n| hpc-staff | 301  | Special | 256000 |  cfs1/hpc-staff   | 2016-03-02 | 2100-01-01 | Temporary assistance for Collie |\n| hpc-staff | 1204 | Special |  2048  |  project/biokit   | 2017-12-01 | 9999-12-31 |  BioKit Software Repo / Jordan  |\n| hpc-staff | 1391 | Special |  3072  |  project2/biokit  | 2017-12-01 | 9999-12-31 |  BioKit Software Repo / Jordan  |\n| hpc-staff | 1452 | Special | 120000 |     cfs2/hpc      | 2019-10-01 | 2050-01-01 |            Internal             |\n| hpc-staff | 1583 | Special | 207200 |   project3/hpc    | 0000-00-00 | 9999-12-31 |            internal             |\n| hpc-staff | 2046 |   PAY   |  1024  | collie3/hpc-staff | 2023-10-24 | 2029-01-01 |     PAY 2024-ABC-01 #10001      |\n| hpc-staff | 2718 |   PAY   | 20480  |  cfs4/hpc-staff   | 2026-04-27 | 2026-10-01 |     PAY 2026-ABC-01 #10002      |\n| hpc-staff | 2719 |   PAY   |  5120  |  cfs4/hpc-staff   | 2026-04-28 | 2026-10-01 |     PAY 2026-ABC-002 #10003     |\n+-----------+------+---------+--------+-------------------+------------+------------+---------------------------------+\n\n",
+   "timed_out": false
+  },
+  {
+   "argv": [
+    "xfs_io",
+    "-c",
+    "lsproj",
+    "/tmp"
+   ],
+   "elapsed_s": 0.0029,
+   "not_found": false,
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "projid = 0\n",
+   "timed_out": false
+  }
+ ],
+ "probes": {
+  "accounts": "/opt/site/bin/allocs",
+  "lfs": null,
+  "mmlsattr": "/usr/lpp/mmfs/bin/mmlsattr",
+  "mmlsfileset": "/usr/lpp/mmfs/bin/mmlsfileset",
+  "mmlsquota": "/usr/lpp/mmfs/bin/mmlsquota",
+  "quota": "/opt/site/bin/quota",
+  "xfs_io": "/usr/sbin/xfs_io",
+  "xfs_quota": "/usr/sbin/xfs_quota"
+ }
+}

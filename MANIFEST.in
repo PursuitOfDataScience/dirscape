@@ -1,0 +1,6 @@
+include README.md
+include CHANGELOG.md
+include LICENSE
+include src/dirscape/py.typed
+recursive-include tests *.py
+recursive-include tests/fixtures *.json

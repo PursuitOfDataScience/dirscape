@@ -54,7 +54,23 @@ def group(roots):
 
 def _quota_line(roots, style):
     # type: (Sequence[Root], Style) -> Tuple[str, str]
-    """The fileset's own figures, from the first root that has any."""
+    """The group's figures: one quota, or the sum of several measurements.
+
+    **First-that-has-any is right for a fileset and wrong for a walk**, and
+    the difference is what the grouping means. Every path inside a fileset
+    shares one quota, so any member reports the same number and the first will
+    do. Walked figures are per DIRECTORY, so `/dev/sda1` holding
+    `/scratch/local/jdoe42` at 0B and `/tmp` at 1.2G reported `0B used`: the
+    first member's figure presented as the device's.
+    """
+    walked = [root for root in roots if (root.policy or {}).get("walked")]
+    if walked and len(walked) == len(roots):
+        total = 0
+        for root in walked:
+            row, _how, _why = fields.pick_row(root.quota, root.path, "blocks")
+            if row is not None and row.used is not None:
+                total += int(row.used)
+        return style.muted("%s used" % (fields.human_bytes(total),)), ""
     for root in roots:
         text, caveat = fields.quota_cell(root, style)
         if text != fields.UNKNOWN:
@@ -99,10 +115,22 @@ def render(roots, style=None, size=None):
             # a reader can see which device a path three lines down belongs to.
             cont = "  " + ("  " if last_fileset else style.dim(g.pipe)) + "  "
             figures, caveat = _quota_line(members, style)
-            name = fileset or fields.UNKNOWN
+            # **An absent fileset is not an unknown one.** This printed `?`
+            # and "(fileset not determined)", which is the mark this package
+            # reserves for "nobody could measure it", against a device that
+            # simply has no fileset structure: `/dev/sda1` is XFS, XFS has no
+            # filesets, and the figures beside it were measured by walking the
+            # directory. Nothing failed, so nothing should read as failed.
+            walked = any((member.policy or {}).get("walked") for member in members)
+            if fileset:
+                name, note = fileset, ""
+            elif walked:
+                name, note = "measured", "  (added up by walking, no quota here)"
+            else:
+                name, note = "no fileset", "  (this filesystem has no quota scopes)"
             line = "  %s %s" % (style.dim(f_stem), style.accent(name))
-            if not fileset:
-                line += style.dim("  (fileset not determined)")
+            if note:
+                line += style.dim(note)
             out.append("%s   %s" % (line, figures))
             if caveat:
                 # First fragment only. Each backend appends its own caveat and

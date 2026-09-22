@@ -1739,6 +1739,52 @@ def test_a_directory_with_nothing_inside_says_so(tmp_path):
     assert "nothing to open" in cli.plain("\n".join(lines))
 
 
+def test_the_tree_sums_walked_figures_and_never_calls_them_unknown(tmp_path):
+    """Two defects in one node of `dirscape tree`, both from the same cause.
+
+    Walked figures were keyed on the directory's own path as a fileset name,
+    so `/tmp` and `/scratch/local/jdoe42`, two mounts of one `/dev/sda1`,
+    became two nodes with conflicting names and the view fell back to `?` for
+    the device. A walk measures a DIRECTORY, not a quota scope, so it names no
+    fileset now, and an absent fileset is labelled for what it is rather than
+    printed as the mark this package reserves for "nobody could measure it".
+
+    And the figure was the FIRST member's, not the group's: `0B used` for a
+    device holding 1.2G. Every path in a fileset shares one quota so the first
+    will do; walked figures are per directory and have to be added.
+    """
+    from dirscape.render import render_tree, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    roots = []
+    for name, payload in (("empty", 0), ("full", 3)):
+        directory = tmp_path / name
+        directory.mkdir()
+        for index in range(payload):
+            (directory / ("f%d" % index)).write_bytes(b"x" * 4096)
+        root = _root(str(directory), device="/dev/sda1")
+        root.role = "local"
+        root.fstype = "xfs"
+        root.quota = None
+        roots.append(root)
+
+    for root in roots:
+        # One run each, so `_visible`'s folding of two sibling directories
+        # cannot leave one of them unwalked. What is under test here is the
+        # tree's aggregation, not the measuring pass's scope.
+        run = cli.Run()
+        run.roots = [root]
+        cli._measure(run)
+        assert root.quota is not None, "the fixture needs both roots measured"
+
+    text = render_tree(roots, style=style)
+    assert "?" not in text, "an absent fileset is not an unknown one: %r" % (text,)
+    assert "no quota here" in text, "it says why there is no fileset"
+    # 3 files of one 4k block each, in the second directory only, and the
+    # device node must report the pair rather than whichever came first.
+    assert "12K used" in text or "12.0K used" in text, text
+
+
 def test_the_detail_view_is_fields_and_not_paragraphs():
     """The owner's verdict on the old one: "this chunk of verbose text makes
     no fucking sense. it says the figures above. what figures?"

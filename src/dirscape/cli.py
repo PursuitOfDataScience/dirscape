@@ -379,8 +379,8 @@ def _owned_by_caller(path):
         return False
 
 
-def _attach_quota(run, budget, runner, measure=False):
-    # type: (Run, Budget, object, bool) -> None
+def _attach_quota(run, budget, runner, measure=False, show_all=False):
+    # type: (Run, Budget, object, bool, bool) -> None
     """Give every root the quota reading that actually governs it.
 
     One `read_all` sweep for the whole run, then per-root selection, rather
@@ -510,7 +510,7 @@ def _attach_quota(run, budget, runner, measure=False):
     if measure:
         # After the backends and the capacity fallback, so it only ever walks
         # what nothing else could answer for.
-        _measure(run, budget)
+        _measure(run, budget, show_all=show_all)
 
 
 def _attach_capacity(run):
@@ -579,8 +579,8 @@ WALK_ENTRIES = 100_000
 WALK_TOTAL_SECONDS = 2.5
 
 
-def _measure(run, budget=None):
-    # type: (Run, Optional[Budget]) -> None
+def _measure(run, budget=None, show_all=False):
+    # type: (Run, Optional[Budget], bool) -> None
     """Walk the roots no quota system can speak for. On by default, bounded.
 
     The owner asked the right question about the `?` marks: "do you have a way
@@ -628,6 +628,45 @@ def _measure(run, budget=None):
     # every one of them enormous, and each burning its full deadline to
     # produce a timed-out partial that was then correctly discarded. Walking
     # storage the reader is not looking at is pure cost.
+    # **The rows the default view shows come FIRST, then everything else.**
+    #
+    # Ordering, not filtering, and the difference matters at both ends. The
+    # first version walked every discovered root and spent its whole budget on
+    # shared dataset trees nobody was looking at; the second walked only the
+    # visible set and left `--all` with 144 question marks, including
+    # `/project/hpc/jdoe42`, which is a directory the reader owns and whose
+    # size a walk answers in milliseconds.
+    #
+    # Sorting by visibility gets both: the main view is never degraded by a
+    # slow root it does not show, and the plumbing views get whatever time is
+    # left. `/` and the `/gpfs/*` aliases are in that tail and will mostly run
+    # out, which is the honest outcome for a filesystem root nobody has a
+    # per-user quota on.
+    # **The rows this run will actually show, and no others.**
+    #
+    # Three versions of this scope, and the measurements are why it ended
+    # here. Walking every discovered root spent the whole budget on shared
+    # dataset trees nobody was looking at and filled in nothing. Walking the
+    # default-visible set left `--all` with 144 question marks. Walking
+    # everything with the visible rows sorted first kept the default view
+    # correct and doubled the run to 5.6s while removing three of those 144,
+    # because the tail is `/`, `/home`, `/project` and seven `/gpfs/*`
+    # aliases: filesystem roots with no per-user quota, each burning its full
+    # deadline to produce a partial that is correctly discarded.
+    #
+    # **Letting `--all` opt into the tail was tried and is the reason this
+    # says `show_all=False`.** It took the `--all` run from 2.9s to 15s and
+    # removed one question mark out of 144, because the deadline cannot
+    # interrupt a single `scandir`: one call against a GPFS directory with
+    # hundreds of entries, each needing a `stat`, runs for seconds before the
+    # clock is looked at again. The bounds hold at the level they are checked
+    # and that level is coarse, so the only safe policy is not to start.
+    #
+    # What stays unmeasured in `--all` is filesystem roots and aliases (`/`,
+    # `/home`, `/project`, seven `/gpfs/*`), and other people's project
+    # directories. None of those has a per-user quota to report, so `?` there
+    # is the correct answer rather than a gap: the number does not exist, and
+    # the only way to invent one is the tree walk this package refuses.
     shown, _hidden = _visible(run, show_all=False)
     targets = [root for root in shown if root.quota is None and root.path]
     overall = time.time() + WALK_TOTAL_SECONDS
@@ -668,15 +707,17 @@ def _measure(run, budget=None):
         # given two lines earlier.
         root.quota = _single_row_snapshot(
             _WalkSource,
-            QuotaRow(
-                root.fileset or root.path, "blocks", "user", used, soft=0, hard=0, mount=root.path
-            ),
+            # **No fileset name.** It used to key on `root.path`, which gave
+            # each walked root a fileset of its own: `dirscape tree` groups by
+            # fileset, so `/tmp` and `/scratch/local/jdoe42`, two mounts of
+            # one `/dev/sda1`, became two nodes with conflicting names and the
+            # view fell back to `?` for the device. A walk measures a
+            # DIRECTORY, not a quota scope, and saying so is the honest shape.
+            QuotaRow("", "blocks", "user", used, soft=0, hard=0, mount=root.path),
         )
         root.inode_quota = _single_row_snapshot(
             _WalkSource,
-            QuotaRow(
-                root.fileset or root.path, "files", "user", files, soft=0, hard=0, mount=root.path
-            ),
+            QuotaRow("", "files", "user", files, soft=0, hard=0, mount=root.path),
         )
         root.add_note(
             "no quota system exists here, so these figures were measured by walking the "
@@ -746,7 +787,25 @@ def _walk(top, deadline, ceiling):
                 stat = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
-            total += int(getattr(stat, "st_blocks", 0)) * 512
+            # **`st_blocks`, falling back to `st_size` when it is zero.**
+            #
+            # Blocks are the right unit: it is space CHARGED, so a sparse file
+            # counts what it occupies and the figure is comparable with a
+            # quota reading. But GPFS reports `st_blocks == 0` for a file
+            # small enough to live in its inode, and with a 4 MiB block size
+            # that is most small files. Measured on this cluster: a 4096 byte
+            # file is `st_size=4096, st_blocks=0` on GPFS and
+            # `st_size=4096, st_blocks=8` on XFS.
+            #
+            # The bug that found this was a walked directory of three 4 KiB
+            # files reporting `0B used`, which is the worst failure available
+            # to this code: not an error, not a `?`, a confident zero. Zero
+            # blocks with a non-empty file means the bytes are somewhere the
+            # block count cannot see them, and `st_size` is the only other
+            # answer. Sparse files keep their block figure, because theirs is
+            # non-zero.
+            blocks = int(getattr(stat, "st_blocks", 0)) * 512
+            total += blocks if blocks else int(getattr(stat, "st_size", 0))
             files += 1
     return total, files, True
 
@@ -1002,7 +1061,13 @@ def sweep(opts, runner=None):
     _label_allocations(run)
     mark("attribute")
 
-    _attach_quota(run, budget, runner, measure=not _merge_flag(opts, "no_measure", False))
+    _attach_quota(
+        run,
+        budget,
+        runner,
+        measure=not _merge_flag(opts, "no_measure", False),
+        show_all=bool(_merge_flag(opts, "all", False)),
+    )
     _mark_stranded(run)
     mark("quota-attach")
 

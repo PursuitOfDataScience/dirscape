@@ -1087,6 +1087,52 @@ the original defect is a block occupying more rows than the repaint
 arithmetic counts, so it asserts that every repaint in the session moves up
 by fewer lines than the window has rows.
 
+### Sixteenth pass: a confident zero, and the last of the question marks
+
+**The walk reported `0B` for a directory of small files on GPFS, and that is
+the worst failure in this codebase's vocabulary: not an error, not a `?`, a
+confident wrong number.** `st_blocks` is the right unit, because it is space
+CHARGED and therefore comparable with a quota reading, but GPFS returns
+`st_blocks == 0` for a file small enough to live in its inode and with a 4 MiB
+block size that is most small files. Measured: a 4096 byte file is
+`st_size=4096, st_blocks=0` on GPFS and `st_size=4096, st_blocks=8` on XFS.
+Zero blocks against a non-empty file means the bytes are somewhere the block
+count cannot see them, so the walk falls back to `st_size` there. Sparse files
+keep their block figure, because theirs is non-zero.
+
+**Every figure on the default view was re-verified against `mmlsquota -u` on
+all five devices**, row by row, including the file counts: 867.5M / 30G /
+36,849 for home, 10.96T / 3,143,273 for `project-hpc`, 314.2G / 2,608,466 for
+`software`, 22.88T / 32,609 for `project2-reference`, 928K / 66 for
+`project2-hpc`, and the four scratch filesets. All ten rows match.
+
+- **`dirscape tree` had two defects in one node**, both from walked figures
+  being keyed on the directory's own path as a fileset name. `/tmp` and
+  `/scratch/local/jdoe42`, two mounts of one `/dev/sda1`, became two nodes
+  with conflicting names and the view fell back to `?` for the device; and the
+  figure shown was the first member's rather than the group's, so a device
+  holding 1.2G read `0B used`. A walk measures a DIRECTORY and not a quota
+  scope, so it names no fileset, walked members are summed, and an absent
+  fileset is labelled for what it is. `?` is reserved for "nobody could
+  measure it" and a filesystem with no quota scopes is not that.
+
+- **Letting `--all` walk its extra roots was tried and reverted.** It took
+  that view from 2.9s to 15s and removed one question mark out of 144, because
+  the deadline cannot interrupt a single `scandir`: one call against a GPFS
+  directory with hundreds of entries, each needing a `stat`, runs for seconds
+  before the clock is looked at again. The bounds hold only at the level they
+  are checked, and that level is coarse, so the policy is not to start.
+
+  What stays unmeasured in `--all` is filesystem roots and aliases (`/`,
+  `/home`, `/project`, seven `/gpfs/*`) and other people's project
+  directories. None has a per-user quota to report, so `?` there is the
+  correct answer rather than a gap: the number does not exist, and the only
+  way to invent one is the tree walk this package refuses.
+
+Question marks per view, on this cluster: the default table, `--summary`,
+`tree`, `stranded`, `elsewhere` and `new` have none. `matrix` has one, in the
+line that defines the symbol. `--all` keeps them, for the reason above.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

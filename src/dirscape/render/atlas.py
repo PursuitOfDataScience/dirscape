@@ -107,7 +107,7 @@ COLUMNS = (
     # name and `--json` still carries `reach`, which is the wire vocabulary.
     "access",
     "used",
-    "limit",
+    "quota",
     "files",
     "policy",
 )
@@ -238,40 +238,21 @@ def _strip(text):
 
 def _heading(index, roots):
     # type: (int, Sequence[Root]) -> str
-    """The column's heading, which for the two figures depends on the data.
+    """The column's heading.
 
-    Owner, of `limit`: "what does limit mean? does it mean there is no user
-    level limit or the dir has some ceiling but there is no restriction on the
-    user side?" A fair question with no answer on screen, and the ambiguity is
-    real rather than a wording slip: `QuotaRow.scope` is `user`, `group` or
-    `fileset`, so the same cell can be a personal allowance or the ceiling on
-    everything stored in a directory, and those are different numbers a reader
-    would act on differently.
+    `your use` and `your limit` lived here for one round. They were accurate,
+    and the owner's verdict was "it sounds cheap", which is fair: a heading
+    that has to insist whose number it is reads like a label apologising for
+    the column under it, and the frame already says `jdoe42` two lines above.
 
-    Measured on the development cluster: every row of the default view is
-    user-scoped, because the site's backend is `mmlsquota -u`. So the honest
-    heading there is `your use` and `your limit`.
-
-    **The claim is checked against the rows rather than assumed.** If any row
-    on screen is group or fileset scoped, "your" would be false for it, and
-    one wrong heading is worse than a vague one; the columns fall back to
-    `used` and `limit` and `why` names the scope per row. Deciding it here,
-    from the data, is what keeps a site nobody has an account on from being
-    told a lie about its own quotas.
+    `quota` instead of `limit`, because that is the word the site's own tool
+    prints over the same figure and the word a researcher uses for it. The
+    scope question it raised ("is there no user level limit or does the dir
+    have some ceiling") is answered where there is room to answer it: `why`
+    carries a `group quota` field when a group cap governs the fileset, which
+    is the case that made `none` look like a lie on `/project/hpc`.
     """
-    name = COLUMNS[index]
-    if index not in (_USED, _LIMIT):
-        return name
-    saw = False
-    for root in roots:
-        snap = getattr(root, "quota", None)
-        for row in getattr(snap, "rows", ()) or ():
-            saw = True
-            if (getattr(row, "scope", "") or "") != "user":
-                return name
-    if not saw:
-        return name
-    return "your use" if index == _USED else "your limit"
+    return COLUMNS[index]
 
 
 def _constant_columns(rows):

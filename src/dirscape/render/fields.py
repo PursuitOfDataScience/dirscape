@@ -676,6 +676,29 @@ def file_count_cell(root, style=None):
     return style.muted(human_count(row.used))
 
 
+def inode_limit_cell(root, style=None):
+    # type: (Root, Optional[Style]) -> str
+    """How many files you may hold: a figure, `none`, or the unknown mark.
+
+    The same three states as `limit_cell` and for the same reason. An inode
+    ceiling is the one people forget: a home directory here allows 300,000
+    files against 30G of space, so a tree of small files exhausts the count
+    long before the bytes, and the error message when it happens says nothing
+    about files.
+    """
+    style = style or Style()
+    row, _how, _why = pick_row(getattr(root, "inode_quota", None), root.path, "files")
+    if row is None:
+        if (root.policy or {}).get("no_quota_enforced"):
+            return style.dim(NO_LIMIT)
+        return UNKNOWN
+    if row.limit is not None:
+        return style.muted(human_count(row.limit))
+    if row.soft == 0 or row.hard == 0:
+        return style.dim(NO_LIMIT)
+    return UNKNOWN
+
+
 def in_doubt_of(root):
     # type: (Root) -> Optional[int]
     """Bytes the backend says are allocated but not yet accounted for."""

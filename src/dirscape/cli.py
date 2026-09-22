@@ -1921,11 +1921,26 @@ def _why(run, path, style, size=None, verbose=False):
     #    a reader who opened a row saw the figures reshuffled.
     figure, _caveat = render_fields.used_cell(match, style)
     out.extend(_field(style, room, "used", figure))
-    out.extend(_field(style, room, "limit", render_fields.limit_cell(match, style)))
+    # `quota`, matching the table and the word the site's own tool prints over
+    # the same figure. This said `limit` while the column said `quota`, which
+    # is the drift that had the two views naming one fact two ways.
+    out.extend(_field(style, room, "quota", render_fields.limit_cell(match, style)))
     out.extend(_field(style, room, "free", render_fields.free_cell(match, style)))
     inodes = render_fields.file_count_cell(match, style)
     if inodes and inodes != render_fields.UNKNOWN:
         out.extend(_field(style, room, "files", inodes))
+        # **Files have a quota too, and it is not always the one that bites
+        # last.** Owner: "does file usually have limit?" On this cluster, yes:
+        # 300,000 on a home directory against 30G of space, and a home full of
+        # small files hits the inode ceiling long before the byte one. The
+        # table has room for the count only; the ceiling belongs here.
+        ceiling = render_fields.inode_limit_cell(match, style)
+        if ceiling and ceiling != render_fields.UNKNOWN:
+            # Nine characters, which is what `_field` pads to. `file quota`
+            # is ten and pushed its value one column right of every value
+            # above it, which is the alignment complaint this view has already
+            # been through twice.
+            out.extend(_field(style, room, "max files", ceiling))
 
     # 2. What the reader can do here, and 3. whether it is kept. Both are one
     #    sentence in a labelled row, because the label is a word a researcher
@@ -2512,6 +2527,168 @@ def _still(reader=None):
     return read
 
 
+#: How many children one directory listing will show. A `/project` with 668
+#: entries is not a screen, and the reader is looking for one of them rather
+#: than reading all of them; the count of what was held back is printed.
+CHILD_LIMIT = 200
+
+
+def _children(path, limit=CHILD_LIMIT):
+    # type: (str, int) -> Tuple[List[Dict[str, object]], int]
+    """The sub-directories of one path, with what a listing can cheaply know.
+
+    **One `scandir` and one `stat` per entry, and no walking.** Size per child
+    is deliberately absent: it would mean a walk of each subtree, which for a
+    `/project/hpc` holding 11T is the operation this whole package exists to
+    avoid. What is here comes from the directory read itself, so a listing of
+    a few hundred children costs milliseconds.
+
+    Files are left out. This is a browser for places to put data, and the
+    reader is descending towards a directory; a home with 300 dotfiles in it
+    would bury the four directories that matter.
+    """
+    out = []  # type: List[Dict[str, object]]
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.name)
+    except OSError:
+        return [], 0
+    held = 0
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        if len(out) >= limit:
+            held += 1
+            continue
+        child = entry.path
+        try:
+            inner = len(os.listdir(child))
+        except OSError:
+            # Readable as an entry, not readable as a directory: that is the
+            # traverse-only case and it is a fact worth showing, not an error.
+            inner = None
+        out.append(
+            {
+                "name": entry.name,
+                "path": child,
+                "items": inner,
+                "readable": os.access(child, os.R_OK | os.X_OK),
+                "writable": os.access(child, os.W_OK),
+                "enterable": os.access(child, os.X_OK),
+            }
+        )
+    return out, held
+
+
+def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
+    # type: (str, object, Optional[int], Optional[int], int, Optional[List[Dict[str, object]]]) -> Tuple[List[str], List[Dict[str, object]], int]
+    """One directory's children, as the same framed table as the main view.
+
+    The owner's description of what opening a row should do: "there should be
+    all the sub-dirs shown just like the main ui and you can constantly zoom
+    in if there is sub dirs within these sub-dirs." What it did instead was
+    print that one root's facts as a field list, which answers a different
+    question ("tell me about this directory") from the one Enter asks ("what
+    is inside it"), and the second had no answer anywhere in the interactive
+    view: "this is weird. i don't need to know this kind of info." The field
+    list is still `dirscape why <path>`, and the footer says so.
+
+    **Returns a WINDOW of rows around the cursor, not all of them.** The first
+    version rendered every child and `/project/hpc` has 668, so the block was
+    twenty times the height of the terminal: the frame was truncated to fit,
+    which cut the rows off the bottom, which meant the selection band had
+    nothing to land on and never painted at all. A listing that cannot show
+    its own selection is not a listing. The third return value is the index of
+    the highlighted row WITHIN the returned lines, so the caller does not have
+    to guess where the rows begin.
+    """
+    cols = _window_cols(style) if cols is None else max(8, int(cols))
+    inner = max(8, cols - 4)
+    if kids is None:
+        kids, _held = _children(path)
+
+    head = [style.head(sanitize(path, limit=4096))]
+    tail_keys = "   %s open   %s back   %s quit" % (
+        style.accent("enter"),
+        style.accent("esc/left"),
+        style.accent("q"),
+    )
+    if not kids:
+        lines = head + [
+            style.dim("  nothing to open inside this directory"),
+            "",
+            style.dim("   %s back   %s quit" % (style.accent("esc/left"), style.accent("q"))),
+        ]
+        return _fit(panel(lines, style=style, size=cols, shrink=False).splitlines(), cols), [], -1
+
+    # Nine rows of chrome plus the one `select` leaves the cursor on: two
+    # borders, the path, a blank, the rule, the column heading, the "N above,
+    # N below" counter, a blank and the key hints. COUNTED against a rendered
+    # block rather than estimated, because the first guess was 8 and produced
+    # 31 lines in a 30 row terminal, and one line over is not a cosmetic
+    # error: `select` repaints by moving the cursor up by the number of lines
+    # it wrote, so a block taller than the window has scrolled by the time it
+    # is erased and takes the reader's scrollback with it.
+    room = max(1, int(window) - 10) if window else len(kids)
+    first = max(0, min(cursor - room // 2, len(kids) - room))
+    shown = kids[first : first + room]
+
+    rows = []
+    for kid in shown:
+        if kid["readable"]:
+            access = "read + write" if kid["writable"] else "read only"
+        elif kid["enterable"]:
+            access = "enter only"
+        else:
+            access = "no access"
+        items = kid["items"]
+        rows.append(
+            [
+                kid["name"] + "/",
+                access,
+                render_fields.UNKNOWN if items is None else render_fields.human_count(items),
+            ]
+        )
+
+    body, _dropped = render_style.table(
+        ["name", "access", "items"],
+        rows,
+        aligns=["left", "left", "right"],
+        style=style,
+        size=inner,
+        indent="   ",
+        gutter="    ",
+        underline=False,
+        drop_empty=False,
+        spread=True,
+    )
+    lines = list(head)
+    lines.append("")
+    lines.append(style.dim(style.g.h * max(1, inner - 2)))
+    body_at = len(lines) + 1  # the table's heading row comes first
+    lines.extend(body.splitlines())
+    above, below = first, len(kids) - (first + len(shown))
+    if above or below:
+        lines.append(
+            style.dim("   %d of %d, %d above, %d below" % (cursor + 1, len(kids), above, below))
+        )
+    lines.append("")
+    lines.append(style.dim(tail_keys))
+
+    framed = _fit(panel(lines, style=style, size=cols, shrink=False).splitlines(), cols)
+    # `panel` adds exactly one line at the top, so the row's index in the
+    # framed block is its index here plus one. Asserted by construction rather
+    # than searched for: the earlier version located rows by matching a `/`,
+    # which the path line at the top also contains and a child named without
+    # one would not.
+    band = body_at + (cursor - first) + 1
+    if not 0 <= band < len(framed):
+        band = -1
+    return framed, kids, band
+
+
 def _detail(run, root, style, cols=None, window=None):
     # type: (Run, object, object, Optional[int], Optional[int]) -> List[str]
     """One row's `why`, framed and guaranteed to fit the window it repaints in.
@@ -2646,6 +2823,70 @@ def _table_frame(
     return panel(lines, style=style, size=window, shrink=False).splitlines()
 
 
+def _descend(start, style, width):
+    # type: (str, object, Optional[int]) -> object
+    """Walk down a directory tree, one listing at a time, until the reader leaves.
+
+    A STACK rather than recursion, so depth costs nothing and "back" is a pop.
+    The reader can go as deep as the tree goes, which is what was asked for:
+    "you can constantly zoom in if there is sub dirs within these sub-dirs."
+
+    Returns `QUIT` when the reader wants out of the program entirely, and
+    anything else when they have merely come back up past the top of this
+    tree, which returns them to the table they opened it from.
+    """
+    stack = [start]
+    cursors = {}  # type: Dict[str, int]
+    while stack:
+        here = stack[-1]
+        rows = interactive.window_rows()
+        kids, _held = _children(here)
+        lines, kids, _band = _listing(here, style, cols=width, window=rows, kids=kids)
+        if not kids:
+            # Nothing to open. Show the listing (which says so) and treat any
+            # key except `q` as "back", because there is nowhere to go but up.
+            outcome = interactive.select(
+                lambda i, block=lines: block,
+                1,
+                keys=_still(),
+                initial=0,
+                escapable=True,
+                openable=False,
+            )
+            if outcome == interactive.Key.QUIT:
+                return interactive.Key.QUIT
+            stack.pop()
+            continue
+
+        def paint(index, where=here, entries=kids, height=rows):
+            # type: (int, str, List[Dict[str, object]], int) -> List[str]
+            # Rebuilt per keypress rather than painted over a fixed block,
+            # because the visible window of rows MOVES with the cursor: a
+            # directory with 668 children cannot be shown at once, and a band
+            # that can only travel as far as the first screenful is a listing
+            # the reader cannot reach the bottom of.
+            block, _kids, band = _listing(
+                where, style, cols=width, window=height, cursor=index, kids=entries
+            )
+            return interactive.highlight(block, band) if band >= 0 else block
+
+        choice = interactive.select(
+            paint,
+            len(kids),
+            initial=min(cursors.get(here, 0), len(kids) - 1),
+            escapable=True,
+        )
+        if choice == interactive.Key.QUIT:
+            return interactive.Key.QUIT
+        if choice == interactive.Key.BACK:
+            stack.pop()
+            continue
+        index = int(choice)  # type: ignore[arg-type]
+        cursors[here] = index
+        stack.append(str(kids[index]["path"]))
+    return interactive.Key.BACK
+
+
 def _browse(run, opts, style, width):
     # type: (Run, argparse.Namespace, object, Optional[int]) -> int
     """The atlas, with a highlight you can move and open.
@@ -2738,24 +2979,7 @@ def _browse(run, opts, style, width):
         if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
             return leave()
         cursor = int(chosen)  # type: ignore[arg-type]
-        lines = _detail(run, roots[cursor], style)
-        # openable=False: this is the bottom, and Right here would otherwise
-        # read as "step back" and bounce the reader into the same view again.
-        # `block` is bound as a default rather than captured: `lines` is
-        # reassigned on every pass of this loop, and a closure over it would
-        # show whichever frame the loop last reached. It happens to work today
-        # only because `select` is called immediately, which is exactly the
-        # kind of accident that survives until somebody adds a line between
-        # the two.
-        outcome = interactive.select(
-            lambda i, block=lines: block,
-            1,
-            keys=_still(),
-            initial=0,
-            escapable=True,
-            openable=False,
-        )
-        if outcome == interactive.Key.QUIT:
+        if _descend(roots[cursor].path or "/", style, width) == interactive.Key.QUIT:
             return leave()
 
 

@@ -1024,6 +1024,69 @@ explanation in `why` naming `--measure`; with `--measure` there are none.
   describes has to work out whether they are in the wrong column or reading
   stale documentation.
 
+### Fifteenth pass: opening a row shows what is inside it
+
+**Every figure on the default view was verified against the site's own tools
+before anything else changed**, because the owner asked for that first. They
+all match. `mmlsquota -u jdoe42 meadow3_cap` reports 867.2M against a 30G
+quota and 36,837 files for `home`, 10.98T and 3,135,427 files for
+`project-hpc`, 314.2G for `software`; the site wrapper agrees on all of them
+and on the four scratch filesets. The `quota` column shows the SOFT quota
+(30G) rather than the hard limit (35G), which is what the site's own tool
+puts under the same heading and what a user is actually held to.
+
+One thing the check did turn up: `none` is true of the user's cap and not of
+the directory. `/project/hpc` carries a GROUP quota of 202.34T with 77.15T
+used, which only the site wrapper reports and which the table does not show.
+Both figures are right; the ambiguity was the heading, dealt with below.
+
+- **Enter lists the directory's children, and keeps going.** Owner: "when
+  zooming into each main dir, there should be all the sub-dirs shown just
+  like the main ui and you can constantly zoom in if there is sub dirs within
+  these sub-dirs." It printed that one root's figures as a field list, which
+  answers "tell me about this directory" rather than "what is inside it":
+  "this is weird. i don't need to know this kind of info." The field list is
+  still `dirscape why <path>`, and the listing's footer says so.
+
+  Name, access and a direct-entry count, from one `scandir` plus one `stat`
+  per child. No size per child: that would mean walking each subtree, which
+  for a `/project/hpc` holding 11T is the operation this package exists to
+  avoid. Files are left out, because a home with 300 dotfiles would bury the
+  four directories a reader is descending towards.
+
+  **It scrolls.** The first version rendered every child, and `/project/hpc`
+  has 84 while `/project` has 668, so the block was many times the height of
+  the terminal: the frame was truncated to fit, which cut the rows off the
+  bottom, which left the selection band with nothing to land on so it never
+  painted at all. A listing that cannot show its own selection is not a
+  listing. It now returns a window of rows around the cursor and the index of
+  the highlighted row within it, so the caller never has to guess where the
+  rows begin. Nine rows of chrome plus the one `select` leaves the cursor on,
+  counted against a rendered block rather than estimated: the first guess was
+  eight and produced 31 lines in a 30 row terminal.
+
+- **`used` and `quota`**, replacing `your use` and `your limit`, which lasted
+  one round: "it sounds cheap". Fair. A heading that has to insist whose
+  number it is reads like a label apologising for its column, and the frame
+  says `jdoe42` two lines above. `quota` is also the word the site's own tool
+  prints over the same figure.
+
+- **`why` reports the inode ceiling.** Owner: "does file usually have limit?"
+  On this cluster, yes, and it is the one people forget: a home allows
+  300,000 files against 30G of space, so a tree of small files exhausts the
+  count long before the bytes and the error when it happens says nothing
+  about files. The table has room for the count; the ceiling is a field in
+  `why`, and `why`'s `limit` field became `quota` to stop the two views
+  naming one fact two ways.
+
+The pty repaint test changed what it measures, and the reason is worth
+keeping. It counted cursor-up sequences and required exactly three, on the
+grounds that the inner view was static so Down should repaint nothing. Down
+now moves through a listing and repainting is the point. What still signals
+the original defect is a block occupying more rows than the repaint
+arithmetic counts, so it asserts that every repaint in the session moves up
+by fewer lines than the window has rows.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

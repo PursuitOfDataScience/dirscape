@@ -719,11 +719,11 @@ def test_every_figure_column_is_right_aligned_and_one_token_per_cell():
     # The headings for these two are data-dependent (`your use` / `your limit`
     # when every row on screen is user-scoped), so the column is located by
     # the word both forms share.
-    heading = next(ln for ln in lines if "use" in ln and "limit" in ln)
+    heading = next(ln for ln in lines if "used" in ln and "quota" in ln)
     body = [ln for ln in lines if re.search(r"/[abcd]\b", ln)]
     assert len(body) == 4
 
-    for column in ("use", "limit"):
+    for column in ("used", "quota"):
         at = heading.index(column) + len(column)
         for line in body:
             cell = line[:at]
@@ -733,7 +733,7 @@ def test_every_figure_column_is_right_aligned_and_one_token_per_cell():
 
     # One token per cell: no figure cell pairs two numbers, which is what
     # `11T used`, `886G free` and `866M / 30G (3%)` each did.
-    figures_at = heading.index("use")
+    figures_at = heading.index("used")
     for line in body:
         assert " / " not in line[figures_at:], "a figure cell is pairing two numbers again"
         assert "%" not in line, "the percentage was folded into free"
@@ -1630,41 +1630,113 @@ def test_access_reads_as_words_and_the_two_views_agree():
     assert "access    read + write" in detail
 
 
-def test_the_figure_headings_only_claim_your_when_that_is_true():
-    """Owner, of `limit`: "what does limit mean? does it mean there is no user
+def test_the_quota_heading_is_the_word_the_site_itself_uses():
+    """`limit` was ambiguous and `your limit` sounded cheap.
+
+    Owner, twice. First: "what does limit mean? does it mean there is no user
     level limit or the dir has some ceiling but there is no restriction on the
-    user side?"
+    user side?" The ambiguity was real rather than a wording slip:
+    `QuotaRow.scope` is `user`, `group` or `fileset`, so the same cell can be a
+    personal allowance or the ceiling on everything in a directory. Then, of
+    the fix: "don't use `your use` / `your limit`. it sounds cheap."
 
-    A fair question with no answer on screen, and the ambiguity is real rather
-    than a wording slip: `QuotaRow.scope` is `user`, `group` or `fileset`, so
-    the same cell can be a personal allowance or the ceiling on everything
-    stored in a directory. Those are different numbers a reader would act on
-    differently.
-
-    Every row of the development cluster's default view is user-scoped, so the
-    honest heading there is `your use` and `your limit`. **The claim is
-    checked against the rows rather than assumed**, because one wrong heading
-    is worse than a vague one, and this package's whole portability story is
-    that it must not tell a site nobody has an account on a lie about its own
-    quotas.
+    `quota` is what the site's own tool prints over the same figure and the
+    word a researcher uses for it, and the scope question is answered in `why`
+    where there is room for it. Verified against the live wrapper: it heads
+    that column `quota` and the one beside it `used`.
     """
     from dirscape.render import atlas, resolve_style
 
     style = resolve_style(color="never", ascii_only=False, stream=None)
+    root = _measured(_root("/a", "fa"), used=1000, limit=2000)
+    root.role = "project"
+    text = atlas.render([root], style=style, group=True, size=110)
 
-    def rendered(scope):
-        row = QuotaRow("fs", "blocks", scope, 1000, hard=2000, mount="/a")
-        root = _root("/a", fileset="fs")
-        root.role = "project"
-        root.quota = QuotaSnapshot("mmlsquota", [row])
-        return atlas.render([root], style=style, group=True, size=110)
+    assert "used" in text and "quota" in text
+    assert "your" not in text, "a heading should not have to insist whose number it is"
+    assert "limit" not in text, "the ambiguous word is gone from the table"
 
-    mine = rendered("user")
-    assert "your use" in mine and "your limit" in mine
 
-    shared = rendered("fileset")
-    assert "your" not in shared, "a fileset quota is not yours alone"
-    assert "used" in shared and "limit" in shared, "so the heading falls back to the vague form"
+def test_opening_a_row_lists_what_is_inside_it(tmp_path):
+    """Enter asks "what is in here", and it used to answer a different question.
+
+    Owner: "when zooming into each main dir, there should be all the sub-dirs
+    shown just like the main ui and you can constantly zoom in if there is sub
+    dirs within these sub-dirs." What it did was print that one root's figures
+    as a field list, which is the answer to "tell me about this directory":
+    "this is weird. i don't need to know this kind of info." The field list is
+    still `dirscape why <path>` and the footer points at it.
+    """
+    from dirscape.render import resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    root = tmp_path / "project"
+    for name in ("alpha", "beta", "gamma"):
+        (root / name).mkdir(parents=True)
+    (root / "alpha" / "inner").mkdir()
+    (root / "a-file.txt").write_bytes(b"x")
+
+    lines, kids, band = cli._listing(str(root), style, cols=100, window=40)
+    text = "\n".join(lines)
+
+    assert [kid["name"] for kid in kids] == ["alpha", "beta", "gamma"]
+    assert "alpha/" in text and "beta/" in text
+    assert "a-file.txt" not in text, "files are not places to descend into"
+    assert "inner" not in text, "only direct children, never a walk"
+    assert band >= 0, "the selection band needs a row to land on"
+    assert "alpha/" in cli.plain(lines[band]), "the band starts on the first row"
+
+    # And the counts are the direct entries of each child, one scandir deep.
+    assert [kid["items"] for kid in kids] == [1, 0, 0]
+
+
+def test_a_listing_scrolls_instead_of_outgrowing_the_window(tmp_path):
+    """A directory with more children than the terminal has rows.
+
+    The first version rendered every child, so `/project/hpc` produced a block
+    twenty times the height of the terminal: the frame was then truncated to
+    fit, which cut the rows off the bottom, which left the selection band with
+    nothing to land on so it never painted at all. A listing that cannot show
+    its own selection is not a listing.
+
+    Two properties, and the second is the one that protects the scrollback:
+    the band tracks the cursor however far down it goes, and the block never
+    outgrows the window `select` will repaint it in.
+    """
+    from dirscape.render import resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    root = tmp_path / "many"
+    for index in range(80):
+        (root / ("child%02d" % index)).mkdir(parents=True)
+
+    window = 24
+    for cursor in (0, 40, 79):
+        lines, kids, band = cli._listing(str(root), style, cols=100, window=window, cursor=cursor)
+        assert len(kids) == 80
+        assert len(lines) < window, "a %d line block cannot be repainted in a %d row window" % (
+            len(lines),
+            window,
+        )
+        assert band >= 0, "the band vanished at cursor %d" % (cursor,)
+        assert "child%02d/" % cursor in cli.plain(lines[band]), (
+            "the band is on the wrong row at cursor %d: %r" % (cursor, cli.plain(lines[band]))
+        )
+        assert "of 80" in cli.plain("\n".join(lines)), "the reader is told what is off screen"
+
+
+def test_a_directory_with_nothing_inside_says_so(tmp_path):
+    """Rather than an empty frame the reader has to interpret."""
+    from dirscape.render import resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    lines, kids, band = cli._listing(str(empty), style, cols=100, window=40)
+    assert kids == []
+    assert band == -1, "there is no row to highlight"
+    assert "nothing to open" in cli.plain("\n".join(lines))
 
 
 def test_the_detail_view_is_fields_and_not_paragraphs():
@@ -2455,7 +2527,7 @@ def test_an_unmeasured_figure_is_not_explained_as_a_measured_one():
 
     # All three figure fields, because the split gave the mark three places to
     # soften into a blank instead of one.
-    for field in ("used", "limit", "free"):
+    for field in ("used", "quota", "free"):
         assert "%-9s ?" % (field,) in text, "an unmeasured %s is the unknown mark: %r" % (
             field,
             text,
@@ -2500,15 +2572,23 @@ def test_a_real_pty_does_not_repaint_the_detail_view():
     path stacked above it, one per repaint, because the block occupied one row
     more than the number of lines the repaint arithmetic was counting.
 
-    Two counts, and neither depends on what the views render:
+    **The measurement changed when the inner view did, and the reason is worth
+    recording.** It used to count cursor-up sequences and require exactly
+    three, on the grounds that the detail view was static so Down should
+    repaint nothing. Opening a row now lists the directory's children, where
+    Down MOVES and repainting is the point, so that count is no longer a
+    defect signal.
 
-    * **Three raw sessions.** One per `select` call, so three proves the Enter
-      opened the detail view and the Left came back out of it. Without this the
-      test would pass by having its keystrokes dropped, which is exactly what
-      an output-driven harness does once the repaint it was waiting on is gone.
-    * **Three cursor-up sequences**, which are the three erases: leaving the
-      table, leaving the detail, and leaving the table again. The four Down
-      presses in between add none. Before the fix they added one each.
+    What still is, and what actually caused the stacking, is a block occupying
+    more rows than the repaint arithmetic counts: `select` moves the cursor up
+    by the number of lines it wrote, so one line over and the erase starts in
+    the wrong place. So the assertion is now on every repaint in the session:
+    each must move up by fewer lines than the window has rows. Measured at 40
+    rows, which is where the original report came from.
+
+    Three raw sessions are still required, because without them the test would
+    pass by having its keystrokes dropped, which is what an output-driven
+    harness does the moment the output it waits on changes shape.
     """
     pty = pytest.importorskip("pty")
     import re
@@ -2566,7 +2646,11 @@ def test_a_real_pty_does_not_repaint_the_detail_view():
         pytest.skip("the browse never started here, so there is nothing to measure")
 
     assert text.count("\033[?25l") == 3, (
-        "expected three raw sessions (table, detail, table): the keystrokes did not land"
+        "expected three raw sessions (table, listing, table): the keystrokes did not land"
     )
-    ups = re.findall(r"\033\[(\d+)A", text)
-    assert len(ups) == 3, "one erase per level and no repaint per keypress, got %r" % (ups,)
+    ups = [int(n) for n in re.findall(r"\033\[(\d+)A", text)]
+    assert ups, "nothing was ever repainted, so nothing was measured"
+    assert max(ups) < 40, (
+        "a repaint moved up %d lines in a 40 row window, so the block was taller than "
+        "the terminal and the erase started in the wrong place: %r" % (max(ups), ups)
+    )

@@ -199,7 +199,13 @@ def _path_cell(root, style=None):
         # rows; what it produced was a column of two-tone paths, and the owner
         # read it as "some grey some green" and asked why. A path is one
         # identifier and it reads as one.
-        return root.path
+        #
+        # The tier is PRIMARY now. It was the terminal's default foreground,
+        # which is whatever tone the surrounding shell happens to use and so
+        # not a decision at all; the path identifies the row and is the one
+        # thing on the line a reader scans for, so it belongs in the top tier
+        # rather than inheriting one.
+        return style.text(root.path) if style is not None else root.path
     location = root.policy.get("allocation_location") if root.policy else None
     if location:
         # The trailing marker is not decoration. It is the difference between
@@ -784,7 +790,12 @@ def render(
         out.extend(tail)
 
     inner = max([measure(line) for i, line in enumerate(out) if i != rule_at] or [0])
-    out[rule_at] = style.dim(style.g.h * max(1, min(inner, budget)))
+    # The rule is CHROME, and it was the brightest chrome on screen: `dim` at
+    # 244 against a border that now sits at 61. A horizontal line across the
+    # whole view, brighter than the box containing it and nearly as bright as
+    # the figures, reads as a second heading. `track` is the tier below dim
+    # and is what a separator wants.
+    out[rule_at] = style.track(style.g.h * max(1, min(inner, budget)))
     return _finish(out, style, window, frame)
 
 

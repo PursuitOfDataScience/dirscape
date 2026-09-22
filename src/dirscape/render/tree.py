@@ -70,11 +70,23 @@ def _quota_line(roots, style):
             row, _how, _why = fields.pick_row(root.quota, root.path, "blocks")
             if row is not None and row.used is not None:
                 total += int(row.used)
-        return style.muted("%s used" % (fields.human_bytes(total),)), ""
+        return fields.figure(fields.human_bytes(total), style) + style.dim(" used"), ""
     for root in roots:
-        text, caveat = fields.quota_cell(root, style)
-        if text != fields.UNKNOWN:
-            return text, caveat
+        used, caveat = fields.used_cell(root, style)
+        if used == fields.UNKNOWN:
+            continue
+        # **Composed from the same cells the table uses.** This called
+        # `quota_cell`, the old single-cell form with a percentage baked in,
+        # which is the shape the table gave up two rounds ago: so the tree
+        # showed `868M / 30G (3%)` with the digits in the terminal's default
+        # foreground and the percentage in its own blue, beside a table that
+        # had neither. One view per fact, one rendering per fact.
+        cap = fields.limit_cell(root, style)
+        if fields.plain(cap) in (fields.NO_LIMIT, fields.UNKNOWN):
+            # "11T of none" is not a sentence. With no ceiling to divide by
+            # there is one figure, and it says what it is.
+            return "%s %s" % (used, style.dim("used")), caveat
+        return "%s %s %s" % (used, style.dim("of"), cap), caveat
     return fields.UNKNOWN, ""
 
 

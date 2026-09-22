@@ -1133,6 +1133,68 @@ Question marks per view, on this cluster: the default table, `--summary`,
 `tree`, `stranded`, `elsewhere` and `new` have none. `matrix` has one, in the
 line that defines the symbol. `--all` keeps them, for the reason above.
 
+### Seventeenth pass: a text hierarchy, and colour spent where it counts
+
+The layout was kept, as asked. What changed is the tier every element sits in,
+and the diagnosis came from reading how current TUIs are built rather than
+from taste: design the text tiers first, treat colour as a resource rather
+than a paintbrush, keep one accent plus semantic states, and never encode
+meaning in colour alone.
+
+**The view was drab for one measurable reason: everything was in the same two
+greys.** Every figure in every column was `muted` (248), the same tier as the
+labels beside them, and the palette's primary tier (`text`, 253) was reached
+for by nothing but a bold title. Ten rows of numbers with no hierarchy for the
+eye to use. The border was worse: nodetop's frame anchors sit near L* 84,
+which is BRIGHTER than this package's own primary text, so the box was the
+lightest thing on screen and the figures inside it were dimmer than the
+chrome around them.
+
+Four tiers now, and each one does a job:
+
+| tier | 256 | what is in it |
+| :- | -: | :- |
+| content | 253 / 111 | the path, and every figure's magnitude |
+| context | 248 | the access phrase, the notes |
+| chrome | 244 | column headings, the `kind` label, units, `none` |
+| structure | 237 / 61-97 | the inner rule and the border |
+
+- **A figure is two tiers in one cell**, magnitude then unit: `868` in the
+  content tier and `M` one below. Taken from nodetop's own output, which
+  renders a numerator in saturated blue and its denominator in muted grey, so
+  the two tools now read as one family rather than merely agreeing on a
+  layout. One tone across the column and no ramp: nodetop can grade its blue
+  because every row of `cores free` has a fraction to grade by, and `used`
+  has no denominator on half these rows. A grading only some rows can carry
+  is the defect this package has already been through twice.
+- **An absence is chrome.** `none` was landing in the content tier, which
+  made "there is no number here" the brightest thing in a column of numbers.
+- **The border came down about forty points of lightness** and kept its hue
+  sweep, so it reads as structure behind the content instead of a frame in
+  front of it. The inner rule went with it: `dim` at 244 across the full
+  width, brighter than the box containing it, read as a second heading.
+- **Column headings dropped a tier too.** Bold at `muted` was chosen when the
+  whole table was muted and it was the only way to separate a heading from
+  its column; with content at 253 it read as loud as the numbers it labels.
+
+Applied to every view, because four of them were still rendering in the
+terminal's default foreground, which is not a decision but whatever tone the
+surrounding shell happens to use: the `why` field list (labels were as bright
+as the figures they introduce), the directory listing, `matrix`'s path column,
+and `tree`, which was still composing figures through `quota_cell`, the
+single-cell form with a percentage baked in that the table gave up two rounds
+ago. `tree` also read `11T of none`, which is not a sentence.
+
+Two tests pin this so it cannot drift back: one asserts the magnitude and unit
+are different tiers, that an absence is chrome, and that `plain()` is
+unchanged either way; the other paints every role in the palette at 4, 8 and
+24 bits, because the depths are independent and a role added for its truecolor
+value and never checked at 4 bits is a role that vanishes on a `TERM=linux`
+console.
+
+Sources for the design guidance: the terminal-renaissance write-up on tiered
+palettes and semantic colour slots, and nodetop's measured output.
+
 ### Known limits
 
 - **Nothing can be called new on the first run**, and the tool says so instead

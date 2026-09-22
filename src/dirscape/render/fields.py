@@ -571,6 +571,58 @@ def _governing(root):
     return row, how
 
 
+def figure(text, style=None):
+    # type: (str, Optional[Style]) -> str
+    """A magnitude in the text tier and its unit one tier down.
+
+    **This is the whole of what made the table look drab, and the fix is not
+    more colour.** Every cell in every figure column was `muted`, the same grey
+    as the labels beside them, so the one thing a reader came for was the
+    least prominent thing on screen: ten rows of identical grey with no
+    hierarchy for the eye to use.
+
+    The rule taken from current TUI practice is to design the text tiers
+    first and treat colour as a resource rather than a paintbrush: primary for
+    content, muted for context, dim for chrome. A figure is content, so the
+    digits move up to `text`, and the unit suffix drops to `dim`, which gives
+    a numeric column real texture while encoding NOTHING in colour: `867M` and
+    `11T` are still the same two tiers in the same order, and `plain()` of the
+    cell is unchanged.
+
+    Splitting on the trailing letters rather than reformatting, so this stays
+    a presentation detail and `human_bytes` remains the single place that
+    decides what a figure says.
+    """
+    style = style or Style()
+    if not text or text == UNKNOWN:
+        return text
+    if not any(char.isdigit() for char in text):
+        # `none` and anything else wordlike. An absence is not content and
+        # must not take the top tier: it was the brightest thing in the quota
+        # column on five of ten rows, which is the loudest possible place to
+        # say there is no number.
+        return style.dim(text)
+    cut = len(text)
+    while cut and text[cut - 1].isalpha():
+        cut -= 1
+    if cut == len(text):
+        return style.info(text)
+    # **`info` and not `text`, which is what puts this view in `nodetop`'s
+    # family rather than merely in order.** Measured from nodetop's own
+    # output: it renders a figure's magnitude in a saturated blue and its
+    # denominator in muted grey, on every row of every numeric column. Two
+    # tiers in one cell, the same shape this function already had, with the
+    # top tier carrying a hue instead of being white.
+    #
+    # ONE tone across the column, not a ramp. nodetop can grade its blue
+    # because every row of `cores free` has a fraction to grade by; `used`
+    # has no denominator on half these rows, and a grading that only some
+    # rows can carry is the defect this package has already been through
+    # twice: the reader stops comparing numbers and starts asking why that
+    # one is a different colour.
+    return style.info(text[:cut]) + style.dim(text[cut:])
+
+
 def used_cell(root, style=None):
     # type: (Root, Optional[Style]) -> Tuple[str, str]
     """Your usage. ONE token, or the unknown mark.
@@ -615,7 +667,7 @@ def used_cell(root, style=None):
     # `free` now carries "how much room is left" as a figure on every row,
     # which is what the grading was approximating, and this package's standing
     # rule is that colour is never load bearing.
-    return style.muted(text), "; ".join(caveats)
+    return figure(text, style), "; ".join(caveats)
 
 
 def limit_cell(root, style=None):
@@ -630,7 +682,7 @@ def limit_cell(root, style=None):
             return style.dim(NO_LIMIT)
         return UNKNOWN
     if row.limit is not None:
-        return style.muted(human_bytes(row.limit))
+        return figure(human_bytes(row.limit), style)
     if row.soft == 0 or row.hard == 0:
         return style.dim(NO_LIMIT)
     return UNKNOWN
@@ -657,7 +709,7 @@ def free_cell(root, style=None):
         room = disk if room is None else min(room, disk)
     if room is None:
         return UNKNOWN
-    return style.muted(human_bytes(room))
+    return figure(human_bytes(room), style)
 
 
 def file_count_cell(root, style=None):
@@ -673,7 +725,7 @@ def file_count_cell(root, style=None):
     row, _how, _why = pick_row(getattr(root, "inode_quota", None), root.path, "files")
     if row is None:
         return UNKNOWN
-    return style.muted(human_count(row.used))
+    return figure(human_count(row.used), style)
 
 
 def inode_limit_cell(root, style=None):
@@ -693,7 +745,7 @@ def inode_limit_cell(root, style=None):
             return style.dim(NO_LIMIT)
         return UNKNOWN
     if row.limit is not None:
-        return style.muted(human_count(row.limit))
+        return figure(human_count(row.limit), style)
     if row.soft == 0 or row.hard == 0:
         return style.dim(NO_LIMIT)
     return UNKNOWN

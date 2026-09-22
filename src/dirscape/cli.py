@@ -1462,10 +1462,23 @@ def _field(style, room, label, value):
     normalises whitespace. Folding only happens where the alternative is a
     line the terminal breaks for us in the wrong place.
     """
-    head = "  %-9s " % (label,)
-    if render_style.width(head + value) <= room:
+    # The LABEL is chrome and the value is content, which is the tier split
+    # the table already uses. Both were the terminal's default foreground, so
+    # the labels were as bright as the figures they introduce and the view read
+    # as a flat block: the eye had nothing to skip. Padded before painting,
+    # because the escapes would otherwise be counted as width.
+    plain_head = "  %-9s " % (label,)
+    head = "  " + style.dim("%-9s" % (label,)) + " " if style is not None else plain_head
+    if style is not None and "\033" not in value:
+        # A value that carries no escapes of its own is a WORD value (`read +
+        # write`, `not published`), and unstyled means the terminal's default
+        # foreground: brighter in most themes than the figures two lines
+        # above, so the prose outshone the numbers. Cells that arrive
+        # pre-painted keep their own tiers.
+        value = style.muted(value)
+    if render_style.width(plain_head + value) <= room:
         return [head + value]
-    lead = render_style.width(head)
+    lead = render_style.width(plain_head)
     pieces = render_style.wrap(value, indent="", size=room - lead, style=style).splitlines()
     if not pieces:
         return [head.rstrip()]
@@ -2709,13 +2722,17 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
         else:
             access = "no access"
         items = kid["items"]
-        rows.append(
-            [
-                kid["name"] + "/",
-                access,
-                render_fields.UNKNOWN if items is None else render_fields.human_count(items),
-            ]
+        # The same three tiers the main table uses: the name identifies the
+        # row so it takes the primary tier, the access phrase is context, and
+        # the count is a figure and goes through the same magnitude-and-unit
+        # split. Without this the listing was the one view still rendering
+        # everything in the terminal's default foreground.
+        count = (
+            render_fields.UNKNOWN
+            if items is None
+            else render_fields.figure(render_fields.human_count(items), style)
         )
+        rows.append([style.text(kid["name"] + "/"), style.muted(access), count])
 
     body, _dropped = render_style.table(
         ["name", "access", "items"],
@@ -2731,7 +2748,9 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
     )
     lines = list(head)
     lines.append("")
-    lines.append(style.dim(style.g.h * max(1, inner - 2)))
+    # `track`, matching the main table's rule. `dim` is the label tier and a
+    # full-width line in it reads as a second heading above the headings.
+    lines.append(style.track(style.g.h * max(1, inner - 2)))
     body_at = len(lines) + 1  # the table's heading row comes first
     lines.extend(body.splitlines())
     above, below = first, len(kids) - (first + len(shown))
@@ -2742,16 +2761,16 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
     lines.append("")
     lines.append(style.dim(tail_keys))
 
+    # **Highlighted BEFORE framing**, which is how the main table does it and
+    # why: the band is painted on a content line and the border is drawn
+    # around the result, so the selection sits inside the box. Framing first
+    # and highlighting after inverted the two border characters along with the
+    # row, so the box appeared to break open on whichever line was selected.
+    band = body_at + (cursor - first)
+    if 0 <= band < len(lines):
+        lines = interactive.highlight(lines, band, pad_to=inner)
     framed = _fit(panel(lines, style=style, size=cols, shrink=False).splitlines(), cols)
-    # `panel` adds exactly one line at the top, so the row's index in the
-    # framed block is its index here plus one. Asserted by construction rather
-    # than searched for: the earlier version located rows by matching a `/`,
-    # which the path line at the top also contains and a child named without
-    # one would not.
-    band = body_at + (cursor - first) + 1
-    if not 0 <= band < len(framed):
-        band = -1
-    return framed, kids, band
+    return framed, kids, -1
 
 
 def _detail(run, root, style, cols=None, window=None):
@@ -2930,10 +2949,12 @@ def _descend(start, style, width):
             # directory with 668 children cannot be shown at once, and a band
             # that can only travel as far as the first screenful is a listing
             # the reader cannot reach the bottom of.
-            block, _kids, band = _listing(
+            block, _kids, _band = _listing(
                 where, style, cols=width, window=height, cursor=index, kids=entries
             )
-            return interactive.highlight(block, band) if band >= 0 else block
+            # Already highlighted: `_listing` paints the band on the content
+            # before drawing the border, so there is nothing to do here.
+            return block
 
         choice = interactive.select(
             paint,

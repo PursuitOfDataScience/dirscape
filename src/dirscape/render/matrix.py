@@ -127,7 +127,14 @@ def render(roots, site=None, style=None, size=None, extra=None):
     # atlas's. `PATH` in capitals beside `exists`, `mounted` and `quota` was
     # one table shouting at itself.
     headers = ["path"] + list(COLUMNS)
-    rows = [[root.path or fields.UNKNOWN] + _cells(root, style, site, extra) for root in roots]
+    # The path in the PRIMARY tier, as everywhere else. It was unstyled here,
+    # which means the terminal's default foreground: the one column carrying
+    # the row's identity inheriting whatever tone the surrounding shell uses,
+    # while every cell beside it was deliberately placed in a tier.
+    rows = [
+        [style.text(root.path) if root.path else fields.UNKNOWN] + _cells(root, style, site, extra)
+        for root in roots
+    ]
 
     # Drop any column that is the unknown mark on EVERY row. Three of them
     # were, on a site with no published policy: `read` by construction, since

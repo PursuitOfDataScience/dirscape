@@ -897,7 +897,11 @@ def test_the_table_draws_no_bar_and_no_percentage_either():
     for glyph in "▏▎▍▌▋▊▉█░":
         assert glyph not in text, "the bar is gone, and %r is one of its cells" % (glyph,)
     assert "%" not in text, "the percentage went with it"
-    assert "30G" in text, "the limit is a figure the backend reported, not a ratio"
+    # Compared on the PLAIN form, because a figure is now two painted runs:
+    # the magnitude in the primary tier and the unit one tier down, so `30G`
+    # is not a contiguous substring of the coloured output. `plain()` is what
+    # every assertion about content should have been using here.
+    assert "30G" in cli.plain(text), "the quota is a figure the backend reported, not a ratio"
     # The grading survives, on the used figure.
     assert "\033[38;" in text
 
@@ -1676,15 +1680,26 @@ def test_opening_a_row_lists_what_is_inside_it(tmp_path):
     (root / "alpha" / "inner").mkdir()
     (root / "a-file.txt").write_bytes(b"x")
 
-    lines, kids, band = cli._listing(str(root), style, cols=100, window=40)
-    text = "\n".join(lines)
+    lines, kids, _band = cli._listing(str(root), style, cols=100, window=40)
+    text = cli.plain("\n".join(lines))
 
     assert [kid["name"] for kid in kids] == ["alpha", "beta", "gamma"]
     assert "alpha/" in text and "beta/" in text
     assert "a-file.txt" not in text, "files are not places to descend into"
     assert "inner" not in text, "only direct children, never a walk"
-    assert band >= 0, "the selection band needs a row to land on"
-    assert "alpha/" in cli.plain(lines[band]), "the band starts on the first row"
+    # The band is asserted on the OUTPUT rather than on a returned index:
+    # `_listing` paints it before drawing the border, the way the main table
+    # does, so that the selection sits inside the box instead of inverting
+    # the border characters with the row.
+    banded = [line for line in lines if "\033[7m" in line]
+    assert len(banded) == 1, "exactly one row is selected"
+    assert "alpha/" in cli.plain(banded[0]), "the band starts on the first row"
+    # Inside the frame: the border is drawn OUTSIDE the inverse run, so the
+    # text before the escape is the border and the inverted part is content.
+    before, _, inverted = banded[0].partition("\033[7m")
+    assert "\u2502" in before, "the left border must not be inverted with the row"
+    assert cli.plain(inverted).strip().startswith("alpha/")
+    assert "\u2502" in cli.plain(banded[0])[-3:], "and the right border is still drawn"
 
     # And the counts are the direct entries of each child, one scandir deep.
     assert [kid["items"] for kid in kids] == [1, 0, 0]
@@ -1712,15 +1727,16 @@ def test_a_listing_scrolls_instead_of_outgrowing_the_window(tmp_path):
 
     window = 24
     for cursor in (0, 40, 79):
-        lines, kids, band = cli._listing(str(root), style, cols=100, window=window, cursor=cursor)
+        lines, kids, _band = cli._listing(str(root), style, cols=100, window=window, cursor=cursor)
         assert len(kids) == 80
         assert len(lines) < window, "a %d line block cannot be repainted in a %d row window" % (
             len(lines),
             window,
         )
-        assert band >= 0, "the band vanished at cursor %d" % (cursor,)
-        assert "child%02d/" % cursor in cli.plain(lines[band]), (
-            "the band is on the wrong row at cursor %d: %r" % (cursor, cli.plain(lines[band]))
+        banded = [line for line in lines if "\033[7m" in line]
+        assert len(banded) == 1, "the band vanished at cursor %d" % (cursor,)
+        assert "child%02d/" % cursor in cli.plain(banded[0]), (
+            "the band is on the wrong row at cursor %d: %r" % (cursor, cli.plain(banded[0]))
         )
         assert "of 80" in cli.plain("\n".join(lines)), "the reader is told what is off screen"
 
@@ -2700,3 +2716,58 @@ def test_a_real_pty_does_not_repaint_the_detail_view():
         "a repaint moved up %d lines in a 40 row window, so the block was taller than "
         "the terminal and the erase started in the wrong place: %r" % (max(ups), ups)
     )
+
+
+def test_a_figure_is_two_tiers_and_an_absence_is_one():
+    """The text hierarchy, asserted rather than left to each caller.
+
+    Every figure cell in every view was `muted`, the same tier as the labels
+    beside it, so ten rows of numbers had no hierarchy for the eye to use and
+    the owner read the result as drab. Current TUI practice is to design the
+    text tiers first and spend colour as a resource: content in the primary
+    tier, context below it, chrome below that.
+
+    Three properties, and the third is what keeps colour honest here:
+
+    * a figure's MAGNITUDE and its UNIT are different tiers, which gives a
+      numeric column texture at no semantic cost;
+    * an absence (`none`) is chrome, not content, so it is not the brightest
+      thing in a column of numbers;
+    * and `plain()` is identical either way, because nothing in this package
+      may depend on colour to be read.
+    """
+    from dirscape.render import fields
+    from dirscape.render.style import Style, plain
+
+    style = Style(color=True, depth=8)
+
+    painted = fields.figure("868M", style)
+    assert plain(painted) == "868M"
+    assert painted.count("\033[") >= 2, "two tiers means two escapes: %r" % (painted,)
+    assert style.info("868") in painted, "the magnitude is the content tier"
+    assert style.dim("M") in painted, "the unit is one tier down"
+
+    absent = fields.figure("none", style)
+    assert plain(absent) == "none"
+    assert absent == style.dim("none"), "an absence is chrome, not content"
+
+    off = Style(color=False)
+    assert fields.figure("868M", off) == "868M"
+    assert fields.figure("none", off) == "none"
+
+
+def test_every_colour_role_survives_all_three_depths():
+    """Usable at 16 colours, beautiful at true colour.
+
+    The three depths are independent by design, so a role added for its
+    truecolor value and never checked at 4 bits is a role that vanishes on a
+    `TERM=linux` console. Asserted for every role in the palette rather than
+    the handful a view happens to use.
+    """
+    from dirscape.render.style import _PALETTE, Style
+
+    for role in _PALETTE:
+        for depth in (4, 8, 24):
+            painted = Style(color=True, depth=depth).paint(role, "x")
+            assert painted.startswith("\033["), "%s at %d bits: %r" % (role, depth, painted)
+            assert painted.endswith("x\033[0m"), "%s at %d bits: %r" % (role, depth, painted)

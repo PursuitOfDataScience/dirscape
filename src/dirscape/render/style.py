@@ -471,6 +471,19 @@ class Style(object):
         # type: (str) -> str
         return self.paint("muted", text)
 
+    def text(self, value):
+        # type: (str) -> str
+        """The PRIMARY text tier: content, not chrome and not a label.
+
+        The palette had `text` from the start and nothing reached for it: the
+        views used `dim` and `muted` throughout and `head` for a title, so the
+        brightest tier available was spent on bold titles while every figure
+        in every table sat two tiers down in the same grey as the labels
+        beside it. Tiers only do their job if the content actually occupies
+        the top one.
+        """
+        return self.paint("text", value)
+
     def track(self, text):
         # type: (str) -> str
         return self.paint("track", text)
@@ -487,6 +500,13 @@ class Style(object):
         # type: (str) -> str
         """A column HEADING, which is a label rather than a finding.
 
+        Dropped another tier once the figures moved up to `text`. Bold at
+        `muted` was chosen when the whole table was muted, so it was the only
+        way to separate a heading from its column; with content at 253 and
+        context at 248, a bold 248 heading reads as loud as the numbers it
+        labels. `dim` and bold keeps it distinguishable from the `kind` values
+        that share its tone without competing with anything.
+
         Deliberately not `head`. Bold white on every heading of every table
         made the labels the brightest thing on screen, competing with the
         figures underneath them for the one row a reader is actually hunting
@@ -494,7 +514,7 @@ class Style(object):
         which leaves three weights in the table instead of two: findings at
         full brightness, headings muted, the rule under them dim.
         """
-        return self.paint("muted", text, bold=True)
+        return self.paint("dim", text, bold=True)
 
 
 def resolve_style(color="auto", ascii_only=None, stream=None, size=None, env=None):
@@ -707,16 +727,25 @@ def table(
 #: avoids the cyans: the ramp lives there, and a cyan frame around a cyan
 #: column is chrome competing with the content it is supposed to contain.
 #:
-#: Taken verbatim from `nodetop`, which measured them, so the two tools read as
-#: one family. Copied rather than imported, since these packages share no code
-#: by design, which is the same argument :data:`_PALETTE` carries.
-_FRAME_ANCHORS = ((195, 209, 246), (200, 194, 246), (215, 183, 234), (230, 190, 222))
+#: Taken from `nodetop`, which measured the hues, so the two tools read as one
+#: family. Copied rather than imported, since these packages share no code by
+#: design, which is the same argument :data:`_PALETTE` carries.
+#:
+#: **The lightness came DOWN, and the hue sweep is what was kept.** nodetop's
+#: anchors sit around L* 84, which is brighter than this package's own primary
+#: text tier at (217, 219, 221): the border was the lightest thing on screen
+#: and the figures inside it were dimmer than the box around them. That is
+#: most of why a reader called the view drab. Chrome recedes and content
+#: advances, so these are the same four hues at roughly L* 45, which leaves
+#: the border clearly visible on a dark terminal, clearly BEHIND the content,
+#: and still above the vanishing point the note above is about.
+_FRAME_ANCHORS = ((96, 110, 156), (112, 108, 162), (132, 104, 154), (146, 110, 146))
 
 #: The same sweep on the xterm-256 cube, held to the same rule: nothing below
 #: the bright band, or the bottom border vanishes. The cube is thin on pale
 #: violets, so this is three tones rather than ten, which is what a frame
 #: needs, the gradient being a texture and not a scale.
-_FRAME_256 = (189, 189, 189, 189, 183, 183, 182, 182, 182, 182)
+_FRAME_256 = (61, 61, 61, 61, 97, 97, 96, 96, 96, 96)
 
 #: Sixteen colours, which is what `TERM=screen` and most tmux defaults
 #: advertise, and the depth with no room to be clever. Bright variants only:

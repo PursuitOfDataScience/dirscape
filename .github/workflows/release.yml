@@ -16,11 +16,17 @@ jobs:
   # cannot be taken back: the version is burned whether or not the code works.
   gate:
     name: Lint & tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
       matrix:
-        python-version: ["3.9", "3.14"]
+        include:
+          # No setup-python 3.9 exists for Ubuntu 26.04, which ubuntu-latest
+          # becomes on 2026-10-19: see ci.yml.
+          - os: ubuntu-24.04
+            python-version: "3.9"
+          - os: ubuntu-latest
+            python-version: "3.14"
     steps:
       - uses: actions/checkout@v7
         with:

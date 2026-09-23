@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # The gate runs here, on the tagged commit, rather than being assumed from
+  # CI. GitHub cannot express `needs:` across workflow files, so without it a
+  # tag would publish with no dependency on the suite at all, and a PyPI upload
+  # cannot be taken back: the version is burned whether or not the code works.
+  gate:
+    name: Lint & tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the package and dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest "ruff>=0.15,<0.17"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m pytest
+
+  floor:
+    name: Tests on py3.6
+    runs-on: ubuntu-latest
+    container: python:3.6
+    steps:
+      - uses: actions/checkout@v7
+      - run: pip install "pytest<7.1"
+      - run: useradd --create-home tester
+      - run: runuser -u tester -- env HOME=/home/tester PYTHONPATH=src python -m pytest -p no:cacheprovider
+
+  build-and-publish:
+    name: Build & publish to PyPI
+    needs: [gate, floor]
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # setuptools-scm needs the tags to name the version
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build setuptools-scm twine
+          python -m build
+          twine check --strict dist/*
+
+      # The version comes from the tag through setuptools-scm, so a mismatch
+      # means the tag is not on the commit that was built, or is not a plain
+      # release number. Either would ship the wrong version under this tag.
+      - name: Verify the tag matches the built version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          BUILT=$(python -m setuptools_scm)
+          echo "tag=$TAG built=$BUILT"
+          test "$TAG" = "$BUILT" || {
+            echo "::error::tag $TAG does not match the built version $BUILT"; exit 1; }
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1

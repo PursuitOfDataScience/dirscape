@@ -29,11 +29,12 @@ import contextlib
 import errno
 import json
 import os
+import shlex
 import shutil
 import stat as stat_module
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, interactive
 from .discover import (
@@ -261,7 +262,10 @@ def build_parser():
         epilog=(
             "dirscape never walks a directory tree: its cost is the number of "
             "roots, not the number of files. For bytes per directory use `rdu` "
-            "or `ncdu`."
+            "or `ncdu`. "
+            "Scripts and agents: `dirscape paths --json` lists every place with "
+            "exact figures, `dirscape why PATH --json` explains one path, and "
+            "`dirscape mcp` serves the same answers as MCP tools."
         ),
     )
     parser.add_argument("-V", "--version", action="version", version="dirscape " + __version__)
@@ -309,6 +313,37 @@ def build_parser():
 
     export = sub("ncdu", "export one root as ncdu-compatible JSON")
     export.add_argument("path", help="the root to export")
+
+    # The agent's two doors. `paths` is the table's rows as data: one path per
+    # line for a shell, records with exact figures under `--json`. `mcp` is
+    # the same answers as tools an agent calls natively. Neither records a
+    # baseline, so an agent looking never moves what `dirscape new` compares
+    # against.
+    paths = sub(
+        "paths",
+        "the places you can put data, one path per line; --json for exact figures, "
+        "--all for every root",
+    )
+    paths.add_argument(
+        "--writable",
+        action="store_true",
+        default=False,
+        help="only places where writing was confirmed",
+    )
+    paths.add_argument(
+        "--kind",
+        metavar="KIND",
+        default=None,
+        help="only this kind (home, project, scratch, dataset, software, archive, local, "
+        "other); comma-separate several",
+    )
+    paths.add_argument(
+        "--min-free",
+        metavar="SIZE",
+        default=None,
+        help="only places with at least this much free, e.g. 500G or 2T (binary, as du -h)",
+    )
+    sub("mcp", "serve these answers to an agent over MCP (stdio)")
 
     return parser
 
@@ -655,8 +690,12 @@ def _place_rows(run, junction, accessible, owned, writable_only):
         # is exactly the set one user-scoped figure describes.
         if owner and owner != root.path:
             # Inside the fileset but not at its junction. Say where the figure
-            # lives rather than repeating it here.
+            # lives rather than repeating it here. Kept as data too, so the
+            # agent view can follow it instead of answering `?` for a path
+            # whose quota is one row up the table.
             root.add_note("quota is a property of fileset %s, reported on %s" % (name, owner))
+            root.policy = dict(root.policy or {})
+            root.policy["quota_on"] = owner
             continue
 
         blocks = _prefer_enforced([row for row in rows if row.kind == "blocks"])
@@ -1485,9 +1524,17 @@ def _mark_stranded(run):
     return count
 
 
-def sweep(opts, runner=None):
-    # type: (argparse.Namespace, Optional[object]) -> Run
-    """Run every probe once and return the collected facts."""
+def sweep(opts, runner=None, save_state=True):
+    # type: (argparse.Namespace, Optional[object], bool) -> Run
+    """Run every probe once and return the collected facts.
+
+    ``save_state=False`` still reads the lineage, so change labels and the
+    rows they keep in the table are the same as a person's run would show,
+    and never writes it. That is what an agent's query needs: asking where the
+    storage is must not move the baseline `dirscape new` compares against, or
+    the person who runs it next is told nothing changed because their agent
+    looked five minutes ago.
+    """
     run = Run()
     started = time.time()
 
@@ -1601,7 +1648,7 @@ def sweep(opts, runner=None):
     mark("quota-attach")
 
     if not _merge_flag(opts, "no_state", False):
-        _record_state(run, opts)
+        _record_state(run, opts, save=save_state)
         mark("state")
 
     # Real storage devices, not mount entries. Counting every line of
@@ -1659,14 +1706,16 @@ def _label_allocations(run):
         root.role = run.site.role_for("/" + str(location).lstrip("/"))
 
 
-def _record_state(run, opts):
-    # type: (Run, argparse.Namespace) -> None
+def _record_state(run, opts, save=True):
+    # type: (Run, argparse.Namespace, bool) -> None
     """Load the lineage, diff against it, then append and save.
 
     `from_roots` is called before `append`, which is load bearing: the
     snapshot takes `first_seen` from the lineage, so appending first would
     make every root's first sighting the current run and nothing would ever be
     new.
+
+    ``save=False`` stops after the diff. See `sweep`.
     """
     fingerprint = getattr(run.identity, "fingerprint", "") or ""
     try:
@@ -1701,7 +1750,12 @@ def _record_state(run, opts):
         cluster_fingerprint=fingerprint,
     )
     run.changes = diff(previous, run.snapshot)
-    run.warnings.extend(getattr(run.changes, "warnings", []) or [])
+    notes = list(getattr(run.changes, "warnings", []) or [])
+    if not save:
+        # "seeded one from this run" is a claim about the append below, which
+        # a read-only run does not make.
+        notes = [note for note in notes if not note.startswith("no baseline yet, seeded")]
+    run.warnings.extend(notes)
     # Remembered here, BEFORE the append. Afterwards the lineage's newest entry
     # is this run, so asking the lineage for a baseline returns the run being
     # recorded and the header reads `baseline ?` while a baseline plainly
@@ -1709,6 +1763,8 @@ def _record_state(run, opts):
     if previous is not None:
         run.baseline_at = getattr(previous, "taken_at", None)
 
+    if not save:
+        return
     run.lineage.append(run.snapshot)
     try:
         saved = run.lineage.save(fingerprint=fingerprint)
@@ -2550,6 +2606,177 @@ def _resolved(path):
     return value if value != path else ""
 
 
+class _Located(object):
+    """Where one typed path landed among the roots, or why it could not land.
+
+    `why`, `why --json` and the agent's `explain_path` all answer "which root
+    governs this path", and they must give the same answer, so the search is
+    done once, here, and each caller only decides how to say it.
+    """
+
+    __slots__ = ("target", "shown", "match", "resolved", "basis", "allocation", "message")
+
+    def __init__(self, target, shown):
+        # type: (str, str) -> None
+        self.target = target
+        self.shown = shown
+        # Duck typed, as every root in `Run.roots` is.
+        self.match = None  # type: Any
+        self.resolved = ""
+        self.basis = target
+        # True when the typed text was an allocation LOCATION, not a path.
+        self.allocation = False
+        # Set when no root may answer for the path. Always an EXIT_PATH.
+        self.message = ""
+
+    def fail(self, message):
+        # type: (str) -> "_Located"
+        self.message = message
+        return self
+
+
+def _locate(run, path, allow_missing=False):
+    # type: (Run, str, bool) -> _Located
+    """The root that governs ``path``, by the rules `why` has always used.
+
+    ``allow_missing`` answers for a path that does not exist YET with the root
+    it would be created in, which is the question an agent asks before writing
+    output somewhere. `why` keeps it off: a person who typed a path that is
+    not there is more likely to have mistyped it than to be planning ahead,
+    and is told so.
+    """
+    target = os.path.abspath(os.path.expanduser(path))
+    # Sanitised for DISPLAY only, and matched on the raw value. A path from
+    # argv is foreign text: `Root.path` is cleaned at construction but this
+    # string never was, so a directory whose name contains a newline forged a
+    # table row in this very view and an ESC sequence reached the terminal.
+    # That is rapiDU's RD-6 arriving through the one string the model does not
+    # own. Measured with a directory literally named
+    # "evil\n/project/FORGED  999T  100%\x1b[31m".
+    spot = _Located(target, sanitize(target, limit=4096))
+    shown = spot.shown
+    match = None
+    for root in run.roots:
+        if getattr(root, "path", "") == target:
+            match = root
+            break
+
+    if match is None:
+        # An allocation LOCATION, which is what `dirscape elsewhere` prints and
+        # what a reader will therefore paste back in. It is not a path, so the
+        # loop above cannot find it and `os.path.abspath` had already turned
+        # `cfs4/hpc-staff` into `$PWD/cfs4/hpc-staff` and reported that as
+        # missing. Matched on the raw argument, before that mangling.
+        typed = (path or "").strip().strip("/")
+        if typed:
+            for root in run.roots:
+                location = str((root.policy or {}).get("allocation_location") or "")
+                if location and location.strip("/") == typed:
+                    spot.match = root
+                    spot.allocation = True
+                    return spot
+    # **Where the path really is, when that differs from how it was typed.**
+    # ACME documents project space as `/egret/<project>`, and `/egret` is a
+    # symlink to `/lus/egret/projects`. Matched as typed, `why
+    # /egret/lanternlab-exampleu` walked up to `/`, the overlay the login node
+    # boots from, and explained that instead: `read only`, `used ?`, "holds no
+    # allocation", about the reader's 30T project. The quota that governs a
+    # path is the one where its bytes live, so the resolved path decides.
+    resolved = ""
+    if match is None:
+        resolved = _resolved(target)
+        if not resolved and allow_missing and not os.path.exists(target):
+            # A path that does not exist yet lives wherever its nearest
+            # existing ancestor really is, so `/egret/<project>/new` lands in
+            # the Lustre project and not on the `/` the symlink hangs from.
+            anchor = _nearest_existing(target)
+            real = _resolved(anchor)
+            if real:
+                resolved = os.path.normpath(os.path.join(real, os.path.relpath(target, anchor)))
+        if resolved:
+            for root in run.roots:
+                if getattr(root, "path", "") == resolved:
+                    match = root
+                    break
+    basis = resolved or target
+    if match is None:
+        best = ""
+        for root in run.roots:
+            candidate = getattr(root, "path", "")
+            if candidate and basis.startswith(candidate.rstrip("/") + "/"):
+                if len(candidate) > len(best):
+                    best, match = candidate, root
+    spot.match, spot.resolved, spot.basis = match, resolved, basis
+
+    # The directory the mount test is made from. For a path that exists that
+    # is the path; for one that does not exist yet it is the nearest ancestor
+    # that does, which is where the new path's bytes would land.
+    probe = basis
+    if allow_missing and match is not None and not os.path.exists(basis):
+        probe = _nearest_existing(basis)
+    if match is not None and match.path != basis and os.path.exists(probe):
+        # An enclosing root on ANOTHER filesystem does not govern this path.
+        # `/dev/shm` is its own tmpfs, which discovery leaves out as kernel
+        # plumbing, and the walk up from it reached `/` and printed `/`'s
+        # figures as the answer. Saying which mount it is on is the truth.
+        here = run.mounts.enclosing_mount(probe) if run.mounts is not None else None
+        there = run.mounts.enclosing_mount(match.path) if run.mounts is not None else None
+        if here is not None and there is not None and here.mountpoint != there.mountpoint:
+            if inside_snapshot_tree(here.mountpoint):
+                return spot.fail(
+                    "%s is inside a read-only snapshot mounted at %s.\n\n"
+                    "Copy out of it, never into it: `dirscape recover <path>` lists every\n"
+                    "copy of a path and the command to restore one." % (shown, here.mountpoint)
+                )
+            return spot.fail(
+                "%s is on the %s mount at %s, which dirscape does not list as storage,\n"
+                "so no root it reports covers this path." % (shown, here.fstype, here.mountpoint)
+            )
+
+    if (
+        match is not None
+        and match.path != target
+        and not os.path.exists(target)
+        and not allow_missing
+    ):
+        # Only when we FELL BACK to an enclosing root. The fallback is right
+        # for a path inside a root and wrong for one that is not there at all:
+        # `dirscape why /nope/nope` walked up, found `/`, and printed a
+        # confident explanation of `/` with exit 0, so a reader asked about one
+        # path and was answered about another.
+        #
+        # An exact root match is never second-guessed here. Discovery already
+        # settled whether it is present, and re-checking the filesystem made
+        # the tool contradict its own probe and emit "X does not exist. The
+        # enclosing root is X", naming the same path twice.
+        return spot.fail(
+            "%s does not exist.\n\n"
+            "The enclosing root is %s, if that is what you meant." % (shown, match.path or "?")
+        )
+
+    if match is None:
+        if not os.path.exists(target):
+            return spot.fail("%s does not exist." % (shown,))
+        return spot.fail(
+            "dirscape found no root at or above %s.\n\n"
+            "That is a statement about discovery and not about the path: it\n"
+            "exists and may be perfectly readable. Try `dirscape --all`." % (shown,)
+        )
+    return spot
+
+
+def _nearest_existing(path):
+    # type: (str) -> str
+    """The deepest ancestor of ``path`` that exists, which is at worst `/`."""
+    current = path
+    while current and not os.path.exists(current):
+        parent = os.path.dirname(current.rstrip("/")) or "/"
+        if parent == current:
+            break
+        current = parent
+    return current or "/"
+
+
 def _why(run, path, style, size=None, verbose=False):
     # type: (Run, str, object, Optional[int], bool) -> Tuple[str, int]
     """One path, explained in a screen you can read.
@@ -2568,105 +2795,15 @@ def _why(run, path, style, size=None, verbose=False):
     `device:fileset` with no explanation, `mounted`, `found by dir-owner`. The
     helpers above hold the rewrite; `size` is here so the caller that has to
     know the block's exact height (`_browse`) can fix the width it wraps at.
+    Which root answers is `_locate`'s decision, shared with `why --json`.
     """
-    target = os.path.abspath(os.path.expanduser(path))
-    # Sanitised for DISPLAY only, and matched on the raw value. A path from
-    # argv is foreign text: `Root.path` is cleaned at construction but this
-    # string never was, so a directory whose name contains a newline forged a
-    # table row in this very view and an ESC sequence reached the terminal.
-    # That is rapiDU's RD-6 arriving through the one string the model does not
-    # own. Measured with a directory literally named
-    # "evil\n/project/FORGED  999T  100%\x1b[31m".
-    shown = sanitize(target, limit=4096)
-    match = None
-    for root in run.roots:
-        if getattr(root, "path", "") == target:
-            match = root
-            break
-
-    if match is None:
-        # An allocation LOCATION, which is what `dirscape elsewhere` prints and
-        # what a reader will therefore paste back in. It is not a path, so the
-        # loop above cannot find it and `os.path.abspath` had already turned
-        # `cfs4/hpc-staff` into `$PWD/cfs4/hpc-staff` and reported that as
-        # missing. Matched on the raw argument, before that mangling.
-        typed = (path or "").strip().strip("/")
-        if typed:
-            for root in run.roots:
-                location = str((root.policy or {}).get("allocation_location") or "")
-                if location and location.strip("/") == typed:
-                    return _why_allocation(root, style, size), EXIT_OK
-    # **Where the path really is, when that differs from how it was typed.**
-    # ACME documents project space as `/egret/<project>`, and `/egret` is a
-    # symlink to `/lus/egret/projects`. Matched as typed, `why
-    # /egret/lanternlab-exampleu` walked up to `/`, the overlay the login node
-    # boots from, and explained that instead: `read only`, `used ?`, "holds no
-    # allocation", about the reader's 30T project. The quota that governs a
-    # path is the one where its bytes live, so the resolved path decides.
-    resolved = ""
-    if match is None:
-        resolved = _resolved(target)
-        if resolved:
-            for root in run.roots:
-                if getattr(root, "path", "") == resolved:
-                    match = root
-                    break
-    basis = resolved or target
-    if match is None:
-        best = ""
-        for root in run.roots:
-            candidate = getattr(root, "path", "")
-            if candidate and basis.startswith(candidate.rstrip("/") + "/"):
-                if len(candidate) > len(best):
-                    best, match = candidate, root
-
-    if match is not None and match.path != basis and os.path.exists(basis):
-        # An enclosing root on ANOTHER filesystem does not govern this path.
-        # `/dev/shm` is its own tmpfs, which discovery leaves out as kernel
-        # plumbing, and the walk up from it reached `/` and printed `/`'s
-        # figures as the answer. Saying which mount it is on is the truth.
-        here = run.mounts.enclosing_mount(basis) if run.mounts is not None else None
-        there = run.mounts.enclosing_mount(match.path) if run.mounts is not None else None
-        if here is not None and there is not None and here.mountpoint != there.mountpoint:
-            if inside_snapshot_tree(here.mountpoint):
-                return (
-                    "%s is inside a read-only snapshot mounted at %s.\n\n"
-                    "Copy out of it, never into it: `dirscape recover <path>` lists every\n"
-                    "copy of a path and the command to restore one." % (shown, here.mountpoint),
-                    EXIT_PATH,
-                )
-            return (
-                "%s is on the %s mount at %s, which dirscape does not list as storage,\n"
-                "so no root it reports covers this path." % (shown, here.fstype, here.mountpoint),
-                EXIT_PATH,
-            )
-
-    if match is not None and match.path != target and not os.path.exists(target):
-        # Only when we FELL BACK to an enclosing root. The fallback is right
-        # for a path inside a root and wrong for one that is not there at all:
-        # `dirscape why /nope/nope` walked up, found `/`, and printed a
-        # confident explanation of `/` with exit 0, so a reader asked about one
-        # path and was answered about another.
-        #
-        # An exact root match is never second-guessed here. Discovery already
-        # settled whether it is present, and re-checking the filesystem made
-        # the tool contradict its own probe and emit "X does not exist. The
-        # enclosing root is X", naming the same path twice.
-        return (
-            "%s does not exist.\n\n"
-            "The enclosing root is %s, if that is what you meant." % (shown, match.path or "?"),
-            EXIT_PATH,
-        )
-
-    if match is None:
-        if not os.path.exists(target):
-            return ("%s does not exist." % (shown,), EXIT_PATH)
-        return (
-            "dirscape found no root at or above %s.\n\n"
-            "That is a statement about discovery and not about the path: it\n"
-            "exists and may be perfectly readable. Try `dirscape --all`." % (shown,),
-            EXIT_PATH,
-        )
+    spot = _locate(run, path)
+    if spot.allocation:
+        return _why_allocation(spot.match, style, size), EXIT_OK
+    if spot.message:
+        return spot.message, EXIT_PATH
+    match = spot.match
+    target, shown, resolved, basis = spot.target, spot.shown, spot.resolved, spot.basis
 
     room = _room(style, size)
     out = []  # type: List[str]
@@ -2738,14 +2875,7 @@ def _why(run, path, style, size=None, verbose=False):
         # back. Without it the line copied the whole snapshot over the live
         # directory: on meadow2 the newest home snapshot is 47 days old, and
         # running it would have replaced every file edited since.
-        out.extend(
-            _field(
-                style,
-                room,
-                "restore",
-                "cp -an %s/. %s/" % (newest.path.rstrip("/"), match.path.rstrip("/")),
-            )
-        )
+        out.extend(_field(style, room, "restore", _copy_back(newest.path, match.path)))
 
     # Why `used` is a question mark, in the one case where it always is.
     #
@@ -2982,25 +3112,122 @@ def _recover(run, target, style, size=None, as_json=False):
             % (style.text(copy.name.ljust(width)), style.dim(age.rjust(12)), copy.path)
         )
     out.append("")
-    newest = copies[0].path
+    how, command = _restore_line(path, copies[0].path)
+    out.append(style.dim("  " + how))
+    out.append("  " + command)
+    return "\n".join(out), EXIT_OK
+
+
+def _copy_back(snapshot, path):
+    # type: (str, str) -> str
+    """`cp -an SNAP/. DIR/`: put back what is missing, leaving newer files alone.
+
+    Quoted for the shell, because an agent runs this line rather than reading
+    it, and a directory name with a space in it turned one copy into two
+    arguments. `shlex.quote` leaves an ordinary path exactly as it was.
+    """
+    return "cp -an %s %s" % (
+        shlex.quote(snapshot.rstrip("/") + "/."),
+        shlex.quote(path.rstrip("/") + "/"),
+    )
+
+
+def _restore_line(path, newest):
+    # type: (str, str) -> Tuple[str, str]
+    """``(what it does, the command)`` to restore ``path`` from ``newest``.
+
+    Shared by `recover` and the agent's `recover_path`, so the command a
+    person is shown and the one an agent runs cannot drift apart.
+    """
     exists = os.path.isdir(path)
     parent = path if exists else (os.path.dirname(path.rstrip("/")) or "/")
     if not os.access(parent, os.W_OK):
         # Read-only to this reader (ACME's `/soft`, say), so restoring in place
         # cannot work: the useful command copies it out to where they are.
-        out.append(style.dim("  %s is read-only to you, so copy the newest out with" % (parent,)))
-        out.append("  cp -a %s ." % (newest,))
-    elif exists:
+        return (
+            "%s is read-only to you, so copy the newest out with" % (parent,),
+            "cp -a %s ." % (shlex.quote(newest),),
+        )
+    if exists:
         # The directory is still there. `cp -a SNAP DIR` would nest the copy
         # inside it as DIR/<name>, and a plain `SNAP/. DIR/` would overwrite
         # every file changed since the snapshot; `-n` puts back only what is
         # missing, which is what a partial loss needs.
-        out.append(style.dim("  put back what is missing, leaving newer files alone, with"))
-        out.append("  cp -an %s/. %s/" % (newest.rstrip("/"), path.rstrip("/")))
-    else:
-        out.append(style.dim("  restore the newest with"))
-        out.append("  cp -a %s %s" % (newest, path))
-    return "\n".join(out), EXIT_OK
+        return "put back what is missing, leaving newer files alone, with", _copy_back(newest, path)
+    return "restore the newest with", "cp -a %s %s" % (shlex.quote(newest), shlex.quote(path))
+
+
+def _paths(run, opts):
+    # type: (Run, argparse.Namespace) -> Tuple[str, int]
+    """`dirscape paths`: the table's rows for a shell or an agent.
+
+    One path per line by default, because that is what `xargs`, a `for` loop
+    and `head -1` take, and `--json` for the records with exact figures. The
+    filters were checked in `main` before the sweep, so a typo costs a message
+    rather than a five second run; they are parsed again here because this is
+    also reachable through `_render` directly.
+    """
+    from . import agent
+
+    try:
+        kinds = agent.parse_kinds(getattr(opts, "kind", None))
+        raw = getattr(opts, "min_free", None)
+        min_free = agent.parse_size(raw) if raw not in (None, "") else None
+    except ValueError as exc:
+        return "dirscape: %s" % (exc,), EXIT_USAGE
+    payload = agent.paths_payload(
+        run,
+        show_all=bool(_merge_flag(opts, "all", False)),
+        writable=bool(getattr(opts, "writable", False)),
+        kinds=kinds,
+        min_free=min_free,
+    )
+    if _merge_flag(opts, "json", False):
+        return json.dumps(payload, indent=2), EXIT_OK
+    return "\n".join(str(item["path"]) for item in payload["paths"]), EXIT_OK
+
+
+def _why_json(run, path, changes, caveats):
+    # type: (Run, str, Sequence[object], Sequence[object]) -> Tuple[str, int]
+    """`why PATH --json`: the native record of the ONE root that answers.
+
+    It emitted every visible root, the whole table, whatever path was named,
+    so a script asking about one path had to redo `why`'s search to learn
+    which record was the answer, and the view's footer, which sends a reader
+    here for "every field", was pointing at the wrong thing.
+
+    The answer is the agent's `explain_path`, so the two machine surfaces
+    cannot disagree: `asked` says how the path was matched, `place` is the
+    record `dirscape paths --json` gives with the `why -v` layer added, and a
+    path that does not exist YET is answered for the place it would be
+    created in, with `asked.exists` false. Only the text view refuses such a
+    path, because a person who typed it more likely mistyped it.
+    """
+    from . import agent
+    from .render import jsonout
+
+    try:
+        root, answer = agent.explain(run, path)
+    except agent.PathError as exc:
+        payload = jsonout.payload([], meta=run.meta, changes=[], caveats=caveats)
+        payload["asked"] = {"path": sanitize(os.path.abspath(os.path.expanduser(path)), 4096)}
+        payload["error"] = str(exc)
+        return json.dumps(payload, indent=2, sort_keys=True), EXIT_PATH
+    about = getattr(root, "path", "")
+    mine = [c for c in changes if about and render_fields.change_fields(c)[1] == about]
+    payload = jsonout.payload([root], meta=run.meta, changes=mine, caveats=caveats)
+    payload["asked"] = {
+        "path": answer.get("path") or answer.get("asked"),
+        "exists": answer.get("exists"),
+        "nearest_existing": answer.get("nearest_existing"),
+        "resolves_to": answer.get("resolves_to"),
+        "root": answer.get("root"),
+        "allocation": "allocation" in answer,
+    }
+    for key in ("place", "allocation", "quota_from", "quota_note"):
+        if key in answer:
+            payload[key] = answer[key]
+    return json.dumps(payload, indent=2, sort_keys=True), EXIT_OK
 
 
 def _render(run, opts, command, style, width):
@@ -3023,6 +3250,9 @@ def _render(run, opts, command, style, width):
             as_json=bool(_merge_flag(opts, "json", False)),
         )
 
+    if command == "paths":
+        return _paths(run, opts)
+
     if _merge_flag(opts, "json", False):
         caveats = list(run.warnings)
         # A command that FILTERS roots must filter them here too. `--json`
@@ -3038,6 +3268,8 @@ def _render(run, opts, command, style, width):
         elif command == "new":
             changed = {c.path for c in changes if getattr(c, "path", "")}
             subject = [r for r in run.roots if r.path and r.path in changed]
+        elif command == "why":
+            return _why_json(run, opts.path, changes, caveats)
         return (
             render_json(subject, meta=run.meta, changes=changes, caveats=caveats),
             EXIT_OK,
@@ -4048,6 +4280,26 @@ def main(argv=None):
 
     command = opts.command or "atlas"
 
+    if command == "mcp":
+        # Before the sweep: the server sweeps per request, on its own cache,
+        # and nothing may reach stdout that is not a protocol message.
+        from . import mcp
+
+        return mcp.serve(opts)
+
+    if command == "paths":
+        # Checked BEFORE the sweep, so `--kind scrach` costs a message and not
+        # a five second run that ends in the same message.
+        from . import agent
+
+        try:
+            agent.parse_kinds(getattr(opts, "kind", None))
+            if getattr(opts, "min_free", None) not in (None, ""):
+                agent.parse_size(opts.min_free)
+        except ValueError as exc:
+            sys.stderr.write("dirscape: %s\n" % (exc,))
+            return EXIT_USAGE
+
     ascii_only = bool(_merge_flag(opts, "ascii", False)) or bool(os.environ.get("DIRSCAPE_ASCII"))
     style = resolve_style(
         color=str(_merge_flag(opts, "color", "auto")),
@@ -4056,7 +4308,9 @@ def main(argv=None):
     )
 
     try:
-        run = sweep(opts)
+        # The keyword only where it changes something, so a caller that
+        # replaces `sweep` with a stand-in keeps working for every other view.
+        run = sweep(opts, save_state=False) if looks_only(command) else sweep(opts)
     except KeyboardInterrupt:
         # 130 is the shell's convention for SIGINT and it matters here: a user
         # who interrupts a slow probe should not see a traceback, and a script
@@ -4085,6 +4339,10 @@ def main(argv=None):
         command == "atlas"
         and not _merge_flag(opts, "json", False)
         and not _merge_flag(opts, "replay", None)
+        # An agent harness that runs commands in a pty would otherwise get the
+        # browser, and nobody is there to press `q`: the command hangs until
+        # the harness gives up on it.
+        and not agent_driven()
         and interactive.supported()
     ):
         try:
@@ -4106,7 +4364,49 @@ def main(argv=None):
     text, code = _render(run, opts, command, style, width)
     _write(text)
     _report(run, opts, text)
+    if command == "atlas" and not _merge_flag(opts, "json", False) and agent_driven():
+        # Said on stderr and only to an agent, so the person's table and
+        # anything piped from it are untouched. The printed table rounds every
+        # figure and folds rows away, and an agent reading it is working from
+        # the lossy copy without knowing a better one exists.
+        sys.stderr.write(
+            "dirscape: for exact figures an agent can parse, run `dirscape paths --json`\n"
+        )
     return code
+
+
+#: Commands that only LOOK. They still read the lineage, so their rows match
+#: the table's, and never write it: see `sweep`.
+_LOOK_ONLY = ("paths",)
+
+
+def looks_only(command, environ=None):
+    # type: (str, Optional[Dict[str, str]]) -> bool
+    """Whether this run may read the lineage but must not write it.
+
+    `paths` never writes, and under an agent harness nothing does except
+    `snapshot`, whose whole job is to record one. Measured before this: an
+    agent's `why --json`, `--json`, `new` or `matrix` each moved the baseline,
+    so the person who ran `dirscape new` next was told nothing changed because
+    their agent had looked five minutes earlier.
+    """
+    if command in _LOOK_ONLY:
+        return True
+    return command != "snapshot" and agent_driven(environ)
+
+
+#: Environment variables an agent harness sets in the shells it runs. The
+#: first two are what Claude Code exports (`AI_AGENT` is the cross-vendor
+#: convention it follows, `CLAUDECODE` its own); `GEMINI_CLI` is Gemini CLI's.
+#: `DIRSCAPE_AGENT` is for everything else, and for testing.
+AGENT_VARIABLES = ("AI_AGENT", "CLAUDECODE", "GEMINI_CLI", "DIRSCAPE_AGENT")
+
+
+def agent_driven(environ=None):
+    # type: (Optional[Dict[str, str]]) -> bool
+    """Whether an agent harness is running this command rather than a person."""
+    env = os.environ if environ is None else environ
+    return any(str(env.get(name) or "").strip() for name in AGENT_VARIABLES)
 
 
 def _report(run, opts, text):

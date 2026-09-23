@@ -20,6 +20,22 @@ from dirscape.runner import RecordedRunner  # noqa: E402
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
+@pytest.fixture(autouse=True)
+def _a_person_at_the_keyboard(monkeypatch):
+    """Every test runs as a person unless it sets an agent variable itself.
+
+    The suite is often launched from an agent harness, which exports
+    `AI_AGENT` or `CLAUDECODE`, and under one of those `main` behaves
+    differently on purpose: no browser, a pointer on stderr, no baseline
+    written. A test written for a person would otherwise pass or fail
+    depending on where it was started.
+    """
+    from dirscape import cli
+
+    for name in cli.AGENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def recorded():
     """Build a RecordedRunner from an inline transcript.

@@ -1,93 +1,75 @@
-<h1 align="center">dirscape</h1>
+<div align="center">
 
-<p align="center">
-  <strong>Where can I put my data on this cluster, and what changed?</strong><br>
-  GPFS &middot; Lustre &middot; CephFS &middot; XFS &middot; NFS &middot; anything with a mount table
-</p>
+# 🗺️ dirscape
 
-You land on a new cluster. Where does 2 TB go? What gets purged on Friday? Nobody hands
-you that list, and `du` cannot find it because `du` needs the path you are missing.
+**Every place you can put data on a cluster, how full it is, and what changed since last time.**
 
-```
-$ ds
+GPFS · Lustre · CephFS · XFS · NFS · anything with a mount table
 
-╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ dirscape  ·  jdoe42                                                                                                        │
-│                                                                                                                            │
-│ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
-│                                                                                                                            │
-│    kind                path                               access                  used             quota             files │
-│                                                                                                                            │
-│    home                /home/jdoe42                       read + write            873M               30G               37k │
-│    project             /collie3/hpc-staff                 read + write            149G              1.0T              260k │
-│                        /project/hpc                       read + write             11T              none              3.1M │
-│                        /project2/hpc                      read + write            928K              none                60 │
-│    scratch             /scratch/collie3/jdoe42            read + write              0B              400G                 1 │
-│                        /scratch/local/jdoe42              read + write              0B              none                 0 │
-│                        /scratch/meadow2/jdoe42            read + write              0B              100G                 1 │
-│                        /scratch/meadow3/jdoe42            read + write             22G              100G              3.7k │
-│    dataset             /project2/reference                read only                23T              none               33k │
-│    software            /software                          read + write            314G              none              2.6M │
-│    local               /tmp                               read + write            1.2G              none              2.5k │
-╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-```
+<a href="https://github.com/PursuitOfDataScience/dirscape/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/dirscape/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://pypi.org/project/dirscape/"><img src="https://img.shields.io/pypi/v/dirscape.svg" alt="PyPI"></a>
+<img src="https://img.shields.io/badge/python-3.6%2B-blue.svg" alt="Python 3.6+">
 
-One box, one row per place you can put data, and nothing else. **In a terminal it is
-interactive**, like `nodetop`: arrows or `jk` move the highlight, Enter opens a row, `q`
-leaves. **Enter opens a row and lists what is inside it**, and you can keep going down as
-far as the tree goes; `esc` comes back up. Piped or redirected it prints the table above
-and stops. Counts and teasers are behind `--summary`.
+<img src="https://raw.githubusercontent.com/PursuitOfDataScience/dirscape/main/assets/demo.gif" width="900" alt="ds lists every storage root on a cluster with its usage, quota and file count, opens /software four levels deep and climbs back out, then explains one scratch directory with ds why.">
 
-Sizes come from quota backends, never a tree walk, so it finishes in seconds. For bytes
-per directory use `rdu` or `ncdu`.
+</div>
 
-## 🚀 Install
+You land on a new cluster. Where does 2 TB go? What gets purged on Friday? `du` cannot tell
+you, because `du` needs the path you are missing.
+
+## ✨ Install
 
 ```bash
-pip install dirscape          # zero dependencies, Python 3.6+
-ds                            # no flags, no config, no setup
+pip install dirscape
+ds                  # or: dscape, dirscape
 ```
 
-`ds` is the short name; `dscape` and `dirscape` run the same thing.
+No dependencies and Python 3.6+, so the system Python on a login node is enough.
 
-## 🔍 Going deeper
+## 🧰 Use
 
-| Command | Answers |
+```bash
+ds                        # the table: arrows move, enter opens a row, esc goes back, q quits
+ds why .                  # this directory: which quota it bills to, free space, file limit
+ds new                    # what changed since the last run
+ds recover results.csv    # snapshot copies of a deleted file, and how to restore one
+ds stranded               # space you hold in filesets you can no longer reach
+ds elsewhere              # allocations with no path on this node
+ds --all                  # every root, including aliases and filesystem roots
+```
+
+## 🤖 For agents
+
+| Command | Gives |
 | :- | :- |
-| `ds recover <path>` | Snapshot copies of a file you deleted, and how to restore one |
-| `ds new` | What changed since the last run |
-| `ds stranded` | Space you hold in filesets you can no longer reach |
-| `ds elsewhere` | Allocations with no path on this node |
-| `ds why <path>` | One path as a field list; add `-v` for where each figure came from |
-| `ds --all` | Every root, including aliases and filesystem roots |
-| `ds matrix` | Yes / no / **could not determine**, per capability |
-| `ds tree` | Which filesets share a device, and symlinks that cross a quota |
-| `ds --json` | The same facts, with a reason code on every unknown |
+| `ds paths --json` | One record per place with exact bytes; filter with `--writable`, `--kind scratch`, `--min-free 2T` |
+| `ds why <path> --json` | Which place a path bills to, even before the path exists |
+| `ds mcp` | The same as MCP tools: `claude mcp add --scope user dirscape -- ds mcp` |
 
-## ⚠️ What will bite you
+Piped, `ds` prints the table and exits. An agent never gets the interactive browser and never
+moves the baseline `ds new` compares against. Exit codes: `0` answered, `1` bad usage, `2` no
+place covers that path, `3` nothing found.
+
+## 📌 Good to know
 
 | | |
 | :- | :- |
-| **Nothing is "new" on the first run.** | There is no baseline yet, and it says so rather than calling everything new. Run it twice. |
-| **Rows get folded.** | If the whole of a tree is yours, one row says so and the rest are held back. `--all` lists them. |
-| **`used` and `limit` are what the filesystem reported.** | Nothing is derived. There is no free column and no percentage: take the difference yourself if you want it. |
-| **`used` and `quota` are YOUR figures.** | Your usage and your personal cap. A directory can also carry a group quota that is not shown here: `ds why <path>` names the scope of whatever governs it. |
-| **Files have a quota too.** | A home here allows 300,000 files against 30G, so a tree of small files runs out of inodes long before bytes. The table shows the count; `ds why <path>` shows the ceiling. |
-| **`read` is not `read only`.** | `read` means nobody checked whether you can write. `os.access` lies under root-squashed NFS, so pass `--probe-write` to settle it by writing a file. |
-| **A `?` is never a zero.** | It means nobody could measure it. Roots with no quota system are added up by a bounded walk instead; if the tree is too big to count quickly the `?` stays rather than being reported short. `--no-measure` skips the walk. |
-| **Snapshots are not backups.** | `ds recover` lists what the filesystem is keeping and nothing else. A `✗` in the `snapshot` column of `ds matrix` means a deleted file there is gone, which on this cluster is every `/scratch`. A `?` means no snapshot tree was found, and the site may still be writing tape. |
-| **A directory you can only read is folded away.** | If you can write to `/cfs3/hpc-staff` but not to `/cfs3`, only the first is a row: the parent's figure is every group's usage, not yours. `--all` shows both. |
-| **Mounts depend on the node.** | `/cfs3` exists on login nodes and not on compute. The header states where it ran, and it refuses to diff across node classes. |
-| **Python 3.6 installs the wheel.** | Building from a checkout needs Python 3.7+. On 3.6, run a checkout in place: `PYTHONPATH=src python3 -m dirscape`. |
+| ⚡ **Sizes come from the quota system** | Not a tree walk, so it finishes in seconds. For bytes per directory use `rdu` or `ncdu`. |
+| ❓ **A `?` is never a zero** | Nothing could measure it, and `--json` gives the reason code. |
+| 🆕 **Nothing is "new" on the first run** | There is no baseline yet: run it twice. |
+| 📁 **Files have a quota too** | A home can allow 300,000 files against 30G, so small files run out first. `ds why` shows the ceiling. |
+| 🗂️ **Rows get folded** | A tree that is all yours is one row, and a parent you can only read gives way to the child you can write. `--all` shows both. |
+| ✍️ **`read` is not `read only`** | `os.access` lies under root-squashed NFS; `--probe-write` settles it by writing a file. |
+| 📸 **Snapshots are not backups** | `ds recover` lists what the filesystem still keeps, and on scratch that is often nothing. |
+| 🖥️ **Mounts depend on the node** | Login and compute nodes see different roots, so `ds new` will not compare across them. |
+| 🐍 **3.6 installs the wheel** | Building from a checkout needs 3.8+. On 3.6, run one in place: `PYTHONPATH=src python3 -m dirscape`. |
 
 ## 🛠️ For site administrators
 
-One file gives every user on the cluster correct labels, purge warnings and quota
-backends with no flags. It grants and denies nothing: access is always measured with
-`os.access` at runtime.
+`dirscape --site-template > /etc/dirscape/site.conf` writes a commented file that gives every user
+correct labels, purge warnings and quota backends, with no flags. It grants nothing: access is
+always measured at runtime.
 
-```bash
-dirscape --site-template > /etc/dirscape/site.conf   # commented starting point
-```
+## License
 
-MIT licensed.
+MIT

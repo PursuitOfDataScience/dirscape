@@ -688,6 +688,29 @@ def limit_cell(root, style=None):
     return UNKNOWN
 
 
+def free_space(root):
+    # type: (Root) -> Tuple[Optional[int], str]
+    """``(bytes you can still write, what limits it)``, or ``(None, "")``.
+
+    The second half is ``"quota"`` when your own remaining allowance is the
+    binding figure and ``"filesystem"`` when the filesystem's headroom is,
+    which is space shared with everyone on it. `free_cell` prints the number;
+    the agent view needs the number AND whose it is, and deriving either twice
+    is how two views end up disagreeing about the one figure both are for.
+    """
+    room = None  # type: Optional[int]
+    limited_by = ""
+    row, _how = _governing(root)
+    if row is not None and row.limit is not None and row.used is not None:
+        room = max(0, int(row.limit) - int(row.used))
+        limited_by = "quota"
+    disk = (root.policy or {}).get("free_bytes")
+    if isinstance(disk, int) and not isinstance(disk, bool) and disk >= 0:
+        if room is None or disk < room:
+            room, limited_by = disk, "filesystem"
+    return room, limited_by
+
+
 def free_cell(root, style=None):
     # type: (Root, Optional[Style]) -> str
     """What you can still write here, which is the question the tool is for.
@@ -697,16 +720,10 @@ def free_cell(root, style=None):
     quota it is the filesystem's headroom, shared with everyone on the node.
     The SMALLER of the two wins where both are known, because a 40T allowance
     on a filesystem with 2T left is 2T of writes and reporting 40T would be
-    the fabrication this package exists to avoid.
+    the fabrication this package exists to avoid. `free_space` decides.
     """
     style = style or Style()
-    room = None  # type: Optional[int]
-    row, _how = _governing(root)
-    if row is not None and row.limit is not None and row.used is not None:
-        room = max(0, int(row.limit) - int(row.used))
-    disk = (root.policy or {}).get("free_bytes")
-    if isinstance(disk, int) and disk >= 0:
-        room = disk if room is None else min(room, disk)
+    room, _limited_by = free_space(root)
     if room is None:
         return UNKNOWN
     return figure(human_bytes(room), style)

@@ -24,7 +24,7 @@
    "xfs"
   ],
   "host_class": "login",
-  "note": "Real transcript from a GPFS site, 6 devices across 3 clusters. Identifying hostnames deliberately omitted; device names are kept because the parsers key on them."
+  "note": "A GPFS site's real output, 6 devices across 3 clusters, with every person, group, id and hostname replaced by a stand-in of the same length so the fixed-width tables still line up. Device names are kept because the parsers key on them."
  },
  "commands": [
   {

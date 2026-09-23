@@ -45,6 +45,7 @@ from ..model import (
     VerdictCategory,
     confirmed,
     refuted,
+    sanitize,
     unknown,
 )
 from ..runner import Budget, Runner
@@ -1184,6 +1185,7 @@ def _build_root(candidate, mounts, site, budget, allow_write):
         if root.symlink_target is None:
             root.symlink_target = candidate.crossings[0][1]
         billed = []  # type: List[str]
+        links = []  # type: List[Dict[str, str]]
         for link, target, promoted in candidate.crossings:
             root.add_note(
                 "%s resolves to %s, so its contents are billed against %s and "
@@ -1191,10 +1193,21 @@ def _build_root(candidate, mounts, site, budget, allow_write):
             )
             if promoted not in billed:
                 billed.append(promoted)
+            # The same fact as data, for `dirscape paths` and the MCP tools.
+            # Parsing it back out of the sentence above is what `why` does, and
+            # a consumer that has to parse prose is one rewording from broken.
+            links.append(
+                {
+                    "link": sanitize(link, limit=4096),
+                    "target": sanitize(target, limit=4096),
+                    "billed_to": sanitize(promoted, limit=4096),
+                }
+            )
         # The renderer joins this with the promoted root's own fileset, which
         # the attribution pass fills in later. Discovery cannot name the fileset
         # itself without running a command, and it runs none.
         root.policy["crosses_to"] = billed
+        root.policy["symlinks_out"] = links
 
     rank, rank_reason = candidate.rank, candidate.rank_reason
     fstype_lower = (fstype or "").lower()

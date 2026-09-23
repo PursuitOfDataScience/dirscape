@@ -3,4 +3,8 @@ include CHANGELOG.md
 include LICENSE
 include src/dirscape/py.typed
 recursive-include tests *.py
-recursive-include tests/fixtures *.json
+recursive-include tests/fixtures *.json *.txt
+# The demo GIF and the script that records it are for the repository page.
+prune assets
+prune tools
+prune .github

@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from dirscape import interactive
+from dirscape import cli, interactive
 from dirscape.interactive import Key, highlight, read_key, select, supported
 
 
@@ -364,6 +364,11 @@ def test_a_real_pty_paints_moves_and_exits():
     pid, fd = pty.fork()
     if pid == 0:  # pragma: no cover - the child execs
         os.environ["TERM"] = "xterm"
+        # A person at a terminal, which is what this measures: an agent
+        # harness running the suite exports variables that turn the browse
+        # off on purpose (`cli.agent_driven`), and the test would then skip.
+        for name in cli.AGENT_VARIABLES:
+            os.environ.pop(name, None)
         os.environ["PYTHONPATH"] = os.path.join(root, "src")
         os.environ["DIRSCAPE_TEST_ROWS"] = "1"
         os.execv(sys.executable, [sys.executable, "-m", "dirscape", "--no-state"])

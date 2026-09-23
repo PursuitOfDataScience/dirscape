@@ -2693,6 +2693,11 @@ def test_a_real_pty_does_not_repaint_the_detail_view():
     pid, fd = pty.fork()
     if pid == 0:  # pragma: no cover - the child execs
         os.environ["TERM"] = "xterm"
+        # A person at a terminal, which is what this measures: an agent
+        # harness running the suite exports variables that turn the browse
+        # off on purpose (`cli.agent_driven`), and the test would then skip.
+        for name in cli.AGENT_VARIABLES:
+            os.environ.pop(name, None)
         os.environ["PYTHONPATH"] = os.path.join(root, "src")
         os.execv(sys.executable, [sys.executable, "-m", "dirscape", "--no-state"])
 

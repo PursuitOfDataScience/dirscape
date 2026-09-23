@@ -135,6 +135,74 @@ All notable changes to `dirscape` are recorded here, newest first, following
 - `--site-template` prints a commented `/etc/dirscape/site.conf` so a site
   administrator can describe a cluster's layout without patching the package.
 
+### An interface for agents
+
+The table is for a person, and an agent was left two bad options: scrape a
+box of rounded figures with rows folded away, or read `--json`, which is the
+whole model. On the development node that is 87 KB for the default view's
+eleven rows and 282 KB with `--all`, most of it backend provenance from which
+the agent would have to re-derive the very cells the table already shows,
+`pick_row` and the quota placement rules included. Both doors now have a
+third beside them, and everything in it is the table's own answer.
+
+- **`dirscape paths`** prints the table's paths, one per line, in the table's
+  order, so `xargs`, a `for` loop and `head -1` take it directly. `--json`
+  gives one record per place: `used`, `quota`, `free`, `files` and
+  `max_files` exactly as the table and `why` print them, and beside each the
+  exact number (`used_bytes`, `quota_bytes`, `free_bytes`, `files_count`,
+  `max_files_count`), null exactly where the cell is `?` or `none`, so a
+  null is never ambiguous. `can_read` and `can_write` are three-state, and null is
+  "not settled", never a no. `quota_scope` says whether `used` is yours or
+  everyone's on that quota, `free_limited_by` whether `free` is your
+  allowance or the filesystem's shared headroom, and `symlinked_to` names the
+  places a home's symlinked folders are quietly filling. 10 KB for the same
+  eleven rows, 35 KB for all 61. Every record is built from the cell functions the table uses,
+  and a test compares the two cell by cell, so an agent and the person beside
+  it cannot be told different figures.
+- **`--writable`, `--kind` and `--min-free`** filter it. A misspelt kind or a
+  size that is not one fails before the sweep, and a place whose free space
+  is unknown never passes `--min-free`: "where fits 2T" is not answered with
+  a place nobody measured.
+- **`dirscape mcp`** serves the same answers as four read-only MCP tools over
+  stdio: `list_paths`, `explain_path`, `recover_path` and `list_changes`.
+  Standard library only, so it runs on the same bare `/usr/bin/python3` as
+  the rest of the package, and checked against the official MCP Python SDK
+  client (1.28.1, protocol 2025-11-25) under both 3.11 and the login node's
+  3.6.8. One sweep answers for 60 seconds, so listing the storage and then
+  asking about three paths costs one sweep, and every tool takes `refresh`.
+  A bad argument comes back as a tool error the model can read and correct,
+  not a protocol error it never sees; stdout carries protocol messages and
+  nothing else.
+- **`explain_path` answers for a path that does not exist yet**, with the
+  place it would be created in and `exists: false`, because "can I write my
+  output to `.../run42`" is asked before `run42` exists. Where a directory's
+  quota is reported one row up, as `/project/hpc/jdoe42` under
+  `/project/hpc` is, the figure is followed instead of answered with `?`.
+- **An agent never moves the baseline.** `paths`, every MCP tool, and every
+  other command run under an agent harness read the lineage, so their rows
+  and change labels match the table's, and never write it. `snapshot` is the
+  one exception, because recording is what it was asked to do. Otherwise the
+  person who runs `dirscape new` next is told nothing changed because their
+  agent looked five minutes ago.
+- **An agent harness never gets the browser.** `AI_AGENT`, `CLAUDECODE` and
+  `GEMINI_CLI` (and `DIRSCAPE_AGENT` for anything else) turn it off; in a pty
+  nobody is there to press `q` and the command would hang. Under one of those
+  the printed table is followed, on stderr only, by a pointer to `paths
+  --json`.
+
+Fixed on the way:
+
+- **`dirscape why <path> --json` ignored the path** and printed every
+  visible root, so a script asking about one directory had to redo `why`'s
+  search to learn which record was the answer, and the view's own footer
+  pointed there for "every field". It is now that root's native record plus
+  `asked` (how the path was matched) and `place`, and it shares the agent's
+  answer for a path that does not exist yet. The text view still refuses
+  such a path, since a person who typed it more likely mistyped it.
+- **Restore commands are quoted for the shell.** `cp -an SNAP/. DIR/` split
+  in two at a space in a directory name, and an agent runs that line rather
+  than reading it. An ordinary path prints exactly as before.
+
 ### Fixed by running on two other clusters
 
 Everything below was found by running this package on ACME Procyon and

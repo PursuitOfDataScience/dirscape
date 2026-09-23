@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Ruff gives the same verdict on every interpreter, so it runs once; the
+  # matrices below are for the code, not the linter.
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.15,<0.17"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # setuptools-scm derives the version from history
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Install the package and pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+      # No GPFS, Lustre or quota command exists on the runner, and that is the
+      # point: every backend test drives a recorded transcript, so a test that
+      # needs the development cluster fails here rather than on a stranger's.
+      - run: python -m pytest
+
+  # The floor is a feature: the moment this tool is most useful is the first
+  # hour on a cluster, on the bare /usr/bin/python3 of a login node, and on
+  # RHEL8 that is 3.6.8. GitHub stopped shipping these interpreters, so they
+  # run in the official images, from source, as a user who is not root:
+  # several access tests mean nothing to a user every permission check passes.
+  floor:
+    name: Test (py${{ matrix.python-version }}, from source)
+    runs-on: ubuntu-latest
+    container: python:${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.6", "3.7", "3.8"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: pip install "pytest<7.1" # 7.0 is the last line that runs on 3.6
+      - run: useradd --create-home tester
+      - run: runuser -u tester -- env HOME=/home/tester PYTHONPATH=src python -m pytest -p no:cacheprovider
+      # The README says a checkout builds from 3.8 up: setuptools-scm 8 is the
+      # floor for building, not for running.
+      - name: A checkout builds and installs
+        if: matrix.python-version == '3.8'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          pip install .
+          ds --version
+
+  # Checked on every push, not only at release: a metadata mistake is cheap to
+  # fix now and unfixable once a version is burned on PyPI.
+  package:
+    name: Build & check the distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check --strict dist/*
+
+      # `pip install -e` hides a missing entry point or package-data mistake;
+      # the built wheel in a clean environment does not.
+      - name: Install the wheel into a clean venv and run it
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install --no-index dist/*.whl
+          /tmp/fresh/bin/dirscape --version
+          /tmp/fresh/bin/dscape --version
+          /tmp/fresh/bin/ds --version
+          /tmp/fresh/bin/ds --no-state
+          /tmp/fresh/bin/ds --no-state paths --json | python -m json.tool > /dev/null
+          /tmp/fresh/bin/python -c "import dirscape, pathlib; \
+            assert (pathlib.Path(dirscape.__file__).parent / 'py.typed').is_file(), \
+            'py.typed missing from the wheel'"
+
+      # The zero-dependency promise is a packaging fact, not only a source one.
+      # The dev extra appears as `; extra == "dev"`, so only unconditional
+      # requirements fail: those are what `pip install dirscape` would pull.
+      - name: The wheel declares no runtime dependencies
+        run: |
+          python -m zipfile -e dist/*.whl /tmp/unpacked
+          runtime=$(grep '^Requires-Dist:' /tmp/unpacked/*.dist-info/METADATA | grep -v 'extra ==' || true)
+          if [ -n "$runtime" ]; then
+            echo "::error::the wheel declares runtime dependencies:"
+            echo "$runtime"
+            exit 1
+          fi
+
+      # A source release that cannot run its own suite has to be taken on
+      # trust by whoever repackages it.
+      - name: The sdist runs its own test suite
+        run: |
+          mkdir /tmp/sdist
+          tar -xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          pip install pytest
+          cd /tmp/sdist && python -m pytest -p no:cacheprovider
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  # The README says Python 3.6 installs the wheel. RHEL8's python3 comes with
+  # pip 9.0.3, so that is the pip this is checked with.
+  wheel-on-36:
+    name: The wheel installs on py3.6 with pip 9
+    needs: package
+    runs-on: ubuntu-latest
+    container: python:3.6
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - run: python -m pip install "pip==9.0.3"
+      - run: python -m pip install --no-index dist/*.whl
+      - run: ds --version
+      - run: ds --no-state paths --json | python -m json.tool > /dev/null

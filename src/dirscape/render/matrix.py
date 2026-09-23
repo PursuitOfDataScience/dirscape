@@ -1,6 +1,6 @@
 """Roots as rows, capabilities as columns. The honest-unknown rule, on screen.
 
-    exists | mounted | list | read | write | quota | purge | backup
+    exists | mounted | list | read | write | quota | snapshot | purge | backup
 
 Every cell is one character and there are THREE of them, not two: confirmed
 yes, confirmed no, and "I could not determine". That third character is the
@@ -8,8 +8,8 @@ product. A tool that renders an unanswered question as a no is `nodetop`'s
 NT-1, where 21 partitions measured as refusing came back looking merely
 unchecked, and this view is the shape that mistake cannot take.
 
-Two of the eight columns have a different provenance and the legend says so.
-`exists` through `quota` are probes. `purge` and `backup` are published site
+Two of the nine columns have a different provenance and the legend says so.
+`exists` through `snapshot` are probes. `purge` and `backup` are published site
 policy, read through `Site.policy_for`, and they go through
 `fields.policy_glyph` rather than through a `Verdict`: the contract has no
 durable category for "the site publishes no such policy", so forging one would
@@ -23,7 +23,7 @@ no field for, without this view inventing any.
 import re
 from typing import Dict, List, Optional, Sequence
 
-from ..model import Root, Verdict
+from ..model import Root, Verdict, VerdictCategory, unknown
 from . import fields
 from .style import Style, legend, table, wrap
 
@@ -31,7 +31,16 @@ __all__ = ["render", "COLUMNS", "PROBED", "FROM_POLICY", "DROP_PRIORITY"]
 
 
 #: In order. Read as a sentence: does it exist, is it here, can I look, can I
-#: read, can I write, is there a quota, will it be purged, is it backed up.
+#: read, can I write, is there a quota, can I get back what I deleted, will it
+#: be purged, is it backed up.
+#:
+#: `snapshot` sits with the probes and NOT with `backup`, one column to its
+#: right, because the two answer different questions from different evidence.
+#: `backup` is whatever the site wrote in a config file. `snapshot` is whether
+#: a readable copy of this path was opened a moment ago. On this cluster the
+#: pair reads `? y` for every home and project directory, which is exactly
+#: right: nobody published a backup policy, and eleven restorable copies are
+#: sitting there regardless.
 COLUMNS = (
     "exists",
     "mounted",
@@ -39,20 +48,41 @@ COLUMNS = (
     "read",
     "write",
     "quota",
+    "snapshot",
     "purge",
     "backup",
 )
 
 #: Columns answered by a probe.
-PROBED = COLUMNS[:6]
+PROBED = COLUMNS[:7]
 
 #: Columns answered by published site configuration.
-FROM_POLICY = COLUMNS[6:]
+FROM_POLICY = COLUMNS[7:]
 
 #: Given up first when the window is narrow: the advisory columns before the
 #: probed ones, and the least-probed probe before the core three. The path is
-#: never dropped and never truncated.
-DROP_PRIORITY = ("backup", "purge", "read", "write", "quota", "list", "mounted")
+#: never dropped and never truncated. `snapshot` goes after `read` because a
+#: column of measured answers outranks one that is unknown by construction,
+#: and before `write` because "can I put data here" is still the question the
+#: tool exists for.
+DROP_PRIORITY = (
+    "backup",
+    "purge",
+    "read",
+    "snapshot",
+    "write",
+    "quota",
+    "list",
+    "mounted",
+)
+
+
+def _recoverable(root):
+    # type: (Root) -> Verdict
+    verdict = getattr(root, "recoverable", None)
+    if isinstance(verdict, Verdict):
+        return verdict
+    return unknown(VerdictCategory.NOT_PROBED, "snapshots were not checked")
 
 
 def _verdicts(root):
@@ -64,6 +94,11 @@ def _verdicts(root):
         "read": fields.read_verdict(root),
         "write": root.writable,
         "quota": fields.quota_verdict(root),
+        # `or` would be wrong on a Verdict, which defines no truthiness, so
+        # the fallback is explicit: a root that predates this field (one
+        # replayed from an older state file) has not been asked, and
+        # NOT_PROBED renders as `?` rather than as a no.
+        "snapshot": _recoverable(root),
     }
 
 

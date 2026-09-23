@@ -997,3 +997,246 @@ def test_a_note_that_only_restates_its_source_is_recognised():
     # the root actually has.
     assert not candidates_module.restates_source("also reachable at /gpfs/x", sources)
     assert not candidates_module.restates_source("matched group hpc", [SOURCE_MOUNTS])
+
+
+# --------------------------------------------------------------------------
+# The role denylist: an unrecognised mountpoint is still storage
+# --------------------------------------------------------------------------
+
+
+def test_a_group_directory_under_an_unrecognised_mount_is_found(tmp_path):
+    """The `/collie3` bug, as a portable regression test.
+
+    `/collie3` matches none of the built-in role patterns, so it scored the
+    fallback role `other`. Both the dir-owner scan and the name templates used
+    to be gated on an ALLOWLIST of recognised roles, so neither ever looked
+    inside it, and `/collie3/hpc-staff` (`drwxrws--- root hpc-staff`, writable
+    by this user, holding 149 GiB against a 1 TiB group quota) appeared in no
+    view of this tool at all: not the table, not `--all`, not `--json`. One
+    mountpoint the heuristic had never heard of hid a whole allocation.
+
+    The gate is a denylist now, so the question a role answers is only "what
+    should this row be CALLED".
+    """
+    unknown_mount = tmp_path / "collie3"
+    (unknown_mount / "mygroup").mkdir(parents=True)
+    os.chmod(str(unknown_mount / "mygroup"), 0o750)
+    text = "cap {m} gpfs rw 0 0\n".format(m=unknown_mount)
+
+    # The role is DECLARED as `other` rather than left to the heuristic. The
+    # suite's own tmp_path lives under `/project` on this cluster, so the
+    # built-in `*/project*` pattern would label the fixture `project` and the
+    # test would pass without ever exercising the case it is named for.
+    site = Site()
+    site.role_globs = [(str(unknown_mount) + "*", "other")]
+    assert site.role_for(str(unknown_mount)) == "other"
+
+    roots = run(read_mount_table(text=text), make_identity(), None, site)
+
+    found = find(roots, unknown_mount / "mygroup")
+    assert found is not None, "a group-owned directory under an `other` mount was invisible"
+    assert SOURCE_DIR_OWNER in found.sources
+
+
+def test_the_noisy_roles_are_still_kept_out_of_the_scan():
+    """Each exclusion is a measurement and none of them may be lost.
+
+    `software`: 713 of 749 entries are group-owned by `hpc-software`, so the
+    ownership signal is meaningless there. `scratch` and `home`: 13,909 and
+    13,915 entries, and the per-user path is found by one stat instead.
+    `local`: `/tmp` is mode 1777. `dataset`: has its own unfiltered source.
+    """
+    for role in ("software", "home", "scratch", "local", "dataset"):
+        assert role not in candidates_module.PROJECT_LIKE_ROLES, role
+    for role in ("project", "other", "archive"):
+        assert role in candidates_module.PROJECT_LIKE_ROLES, role
+
+    # `scratch` keeps its templates: that IS the cheap route for a directory
+    # with fourteen thousand entries.
+    assert "scratch" in candidates_module.TEMPLATE_ROLES
+    assert "other" in candidates_module.TEMPLATE_ROLES
+    assert "software" not in candidates_module.TEMPLATE_ROLES
+
+
+def test_a_role_added_to_the_vocabulary_is_scanned_by_default():
+    """Derived from `ROLES` by subtraction, so nothing new is silently ignored.
+
+    An allowlist written out by hand would leave any future role invisible,
+    which is the exact failure `/collie3` already demonstrated once.
+    """
+    from dirscape.sitecfg import ROLES
+
+    skipped = set(ROLES) - set(candidates_module.PROJECT_LIKE_ROLES)
+    assert skipped == {"home", "scratch", "software", "dataset", "local"}
+
+
+def test_a_memory_filesystem_is_never_scanned(tmp_path):
+    """`/` on a diskless node reports `rootfs`, which scores the role `other`.
+
+    With the denylist in place that would put the whole top level of the root
+    filesystem through a scandir. Nobody holds an allocation on a tmpfs, so
+    ephemeral filesystems are dropped before the role is even consulted.
+    """
+    from dirscape.discover.candidates import _template_roots
+
+    ram = tmp_path / "ram"
+    ram.mkdir()
+    text = "rootfs {m} rootfs rw 0 0\n".format(m=ram)
+    mounts = read_mount_table(text=text)
+
+    assert _template_roots(mounts, Site()) == []
+
+
+# --------------------------------------------------------------------------
+# Shapes found on two other clusters
+# --------------------------------------------------------------------------
+
+
+def test_a_snapshot_tree_is_never_somewhere_to_put_data(tmp_path):
+    """On NetApp every retained snapshot is its own MOUNT.
+
+    Measured on an ACME login node, straight out of `/proc/mounts`:
+
+        nfs /admin_home/.snapshot/daily.2026-09-21_0010  filer-01-infra:/...
+        nfs /soft/.snapshot/daily.2026-09-22_0010        filer-01-softserv:/...
+
+    So the mount table offers them up, and because the dir-owner scan reads
+    one level of any root whose role it does not recognise, `--all` listed
+    three snapshot mounts and then all twenty frozen homes inside each of
+    them: sixty rows of other people's directories in the view that answers
+    where the reader can put 2 TB.
+    """
+    from dirscape.discover.candidates import RANK_SECONDARY, _rank_of_mount, inside_snapshot_tree
+
+    assert inside_snapshot_tree("/admin_home/.snapshot/daily.2026-09-21_0010")
+    assert inside_snapshot_tree("/gpfs/cap/.snapshots/daily-2026-09-22.05h30/home/me")
+    assert inside_snapshot_tree("/pool/.zfs/snapshot/s/data")
+    assert not inside_snapshot_tree("/lus/egret/projects/lanternlab-exampleu")
+    assert not inside_snapshot_tree("/home/jdoe42")
+
+    frozen = tmp_path / "soft" / ".snapshot" / "daily.2026-09-22_0010"
+    frozen.mkdir(parents=True)
+    text = "srv:/soft {m} nfs rw 0 0\n".format(m=frozen)
+    mounts = read_mount_table(text=text)
+
+    rank, reason = _rank_of_mount(mounts.non_pseudo()[0], mounts, Site())
+    assert rank == RANK_SECONDARY
+    assert "copy FROM" in reason
+    assert _template_roots_of(mounts) == [], "and never scanned"
+
+
+def _template_roots_of(mounts):
+    from dirscape.discover.candidates import _template_roots
+
+    return _template_roots(mounts, Site())
+
+
+def test_a_read_only_image_holds_no_allocation(tmp_path):
+    """A Cray login node mounts four squashfs images, one being the OS root.
+
+    `/root_ro/egret` is a symlink to `/lus/egret/projects`, so descending the
+    image produced a row reading `/root_ro/egret/lanternlab-exampleu` for the
+    reader's real allocation.
+    """
+    image = tmp_path / "root_ro"
+    image.mkdir()
+    mounts = read_mount_table(text="/dev/loop0 {m} squashfs ro 0 0\n".format(m=image))
+
+    assert _template_roots_of(mounts) == []
+
+
+def test_a_symlinked_alias_loses_the_dedupe_to_the_real_path(tmp_path):
+    """Shortest-path alone picks the wrong name whenever an alias is a symlink.
+
+    `/root_ro/egret` -> `/lus/egret/projects` is four characters shorter, so
+    the reader's allocation was reported inside a read-only OS image rather
+    than at the path their site documents and their jobs use.
+    """
+    from dirscape.discover.candidates import _dedupe
+    from dirscape.model import Root
+
+    real = tmp_path / "lus" / "egret" / "projects" / "lanternlab"
+    real.mkdir(parents=True)
+    link_base = tmp_path / "ro"
+    link_base.mkdir()
+    os.symlink(str(real.parent), str(link_base / "egret"))
+    alias = link_base / "egret" / "lanternlab"
+
+    identity = os.stat(str(real))
+    roots = []
+    for path in (str(alias), str(real)):
+        root = Root(path, device="egret", fstype="lustre")
+        root.identity = (identity.st_dev, identity.st_ino)
+        roots.append(root)
+
+    kept = _dedupe(roots)
+
+    assert len(kept) == 1
+    assert kept[0].path == str(real), "the path that is its own realpath wins"
+    assert any("also reachable at" in note for note in kept[0].notes)
+
+
+def test_an_allocation_two_levels_down_is_found(tmp_path):
+    """The ACME shape, where the flat template and the dir-owner scan both miss.
+
+    `/lus/egret` holds 11 entries, one of them `projects`, and the reader's
+    only writable allocation is `/lus/egret/projects/lanternlab-exampleu`:
+    29.58T against a 50T project quota, and it appeared in no view at all.
+    """
+    egret = tmp_path / "egret"
+    (egret / "projects" / "mygroup").mkdir(parents=True)
+    (egret / "logs").mkdir()
+    site = Site()
+    site.role_globs = [(str(egret) + "*", "project")]
+    mounts = read_mount_table(text="egret {m} lustre rw 0 0\n".format(m=egret))
+
+    roots = run(mounts, make_identity(groups=["mygroup"]), None, site)
+
+    assert find(roots, egret / "projects" / "mygroup") is not None
+
+
+def test_the_nested_pass_is_skipped_where_the_flat_one_hit(tmp_path):
+    """Running it only on the misses is what makes it free.
+
+    A root whose flat template already produced a directory is a root where
+    allocations live at the first level, so there is nothing below worth
+    listing: `/project` and `/project2` both hit flat, and listing them to
+    learn they hold 669 and 892 entries cost 0.2s of a three second run.
+    """
+    from dirscape.discover import candidates as mod
+
+    project = tmp_path / "project"
+    (project / "mygroup").mkdir(parents=True)
+    (project / "someone" / "mygroup").mkdir(parents=True)
+    site = Site()
+    site.role_globs = [(str(project) + "*", "project")]
+    mounts = read_mount_table(text="cap {m} gpfs rw 0 0\n".format(m=project))
+
+    listed = []
+    real = mod._names_one_level
+    try:
+        mod._names_one_level = lambda path, deadline, cap=mod.NESTED_FANOUT: (
+            listed.append(path) or real(path, deadline, cap)
+        )
+        roots = run(mounts, make_identity(groups=["mygroup"]), None, site)
+    finally:
+        mod._names_one_level = real
+
+    assert find(roots, project / "mygroup") is not None
+    assert find(roots, project / "someone" / "mygroup") is None
+    assert listed == [], "a root that hit flat is never listed"
+
+
+def test_a_wide_root_is_not_descended(tmp_path):
+    """`NESTED_FANOUT` is the second bound, for a root that misses flat and
+    is still large. A container has a handful of entries; a directory of
+    allocations has hundreds, and that is where the flat template works."""
+    from dirscape.discover.candidates import NESTED_FANOUT, _names_one_level
+
+    wide = tmp_path / "wide"
+    wide.mkdir()
+    for index in range(NESTED_FANOUT + 1):
+        (wide / ("d%03d" % (index,))).mkdir()
+
+    assert _names_one_level(str(wide), 1.0) is None
+    assert len(_names_one_level(str(wide), 1.0, cap=NESTED_FANOUT + 5) or []) == NESTED_FANOUT + 1

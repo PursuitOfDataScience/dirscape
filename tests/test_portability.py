@@ -43,6 +43,12 @@ def _cluster(tmp_path, fstype, device, mounts=("home", "work")):
 
 def _sweep(table, runner, tmp_path):
     site = load_site(paths=[])
+    # The fake mounts are project space, said explicitly. Left to the path
+    # heuristics their role depends on where pytest put `tmp_path`: under
+    # `/tmp`, as on an ACME login node, every one of them is `local`, which
+    # discovery rightly never scans for group directories, and the test of
+    # the access probe found nothing to probe.
+    site.role_globs = [(str(tmp_path) + "/*", "project")]
     me = read_identity(table, site=site)
     budget = Budget(total_s=20.0)
     roots = discover(runner, table, me, budget, site)

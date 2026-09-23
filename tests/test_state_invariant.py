@@ -18,6 +18,7 @@ never claims anything is not safe, it is useless.
 import ast
 import json
 import os
+import sys
 
 import pytest
 
@@ -362,6 +363,22 @@ def test_a_missing_identity_never_reads_as_a_replacement():
 # --------------------------------------------------------------------------
 
 
+def _string_value(node):
+    """A string literal's text, on every Python this package supports, else None.
+
+    Python 3.6 and 3.7 parse a string literal as `ast.Str` and only 3.8 made it
+    `ast.Constant`, so testing for `Constant` alone found no literals at all on
+    the RHEL 8 and SLES 15 system Pythons this package is built for, and the
+    guard below failed there while passing everywhere it was written.
+    `ast.Str` is only touched below 3.8: it warns from 3.12 and is gone in 3.14.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if sys.version_info < (3, 8) and isinstance(node, ast.Str):
+        return node.s
+    return None
+
+
 def _docstring_nodes(tree):
     """Every string constant that is a docstring, so prose is not mistaken for code."""
     out = set()
@@ -370,7 +387,7 @@ def _docstring_nodes(tree):
             body = getattr(node, "body", [])
             if body and isinstance(body[0], ast.Expr):
                 value = body[0].value
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                if _string_value(value) is not None:
                     out.add(id(value))
     return out
 
@@ -418,10 +435,7 @@ def test_the_label_closed_is_never_written_as_a_bare_string():
     literals = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and node.value in ("closed", "opened")
-        and id(node) not in docstrings
+        if _string_value(node) in ("closed", "opened") and id(node) not in docstrings
     ]
     # Exactly two: the `CLOSED = "closed"` and `OPENED = "opened"` definitions.
     assert len(literals) == 2, (

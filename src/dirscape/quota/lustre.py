@@ -1,11 +1,15 @@
 """Lustre, through ``lfs quota``. Three scopes, and one honest doubt channel.
 
-**Fixture-only.** No Lustre is mounted on the cluster this package was written
-on and ``lfs`` is not installed there, so this backend has never run live: it
-is built from the output shapes rapiDU's parser and docstrings record, and its
-tests replay recorded transcripts. Everything here is therefore a claim about
-``lfs quota``'s documented and previously observed behaviour rather than a
-measurement of this site, and it is marked as such on purpose.
+**Built from fixtures, then checked live.** No Lustre is mounted on the cluster
+this package was written on, so the parser came from the output shapes
+rapiDU records and its tests replay transcripts. It has since run on ACME's
+Procyon (SLES 15, Python 3.6) and Sylvia (RHEL 9), against a Lustre home, a
+project directory and two subdirectory mounts, and the figures matched
+``lfs quota`` and the site's own ``userquota`` to the byte. Three things only
+the live run could show are handled below: ``lfs`` echoes the PATH it was
+given in its first column, not the mount point; a user or group figure is
+filesystem-wide and has no fileset at all; and a project figure is named by
+its project id, which is what ``lfs project -d`` reports for the directory.
 
 Two things it gets right that a one-scope reader cannot:
 
@@ -24,7 +28,6 @@ reading can be fresh and wrong or stale and exact, and one "confidence" field
 cannot say which.
 """
 
-import os
 import re
 from typing import List, Optional, Sequence, Tuple
 
@@ -66,7 +69,14 @@ LUSTRE_FSTYPES = ("lustre",)
 
 # More than a handful of paths turns one backend into a fan-out of its own, and
 # `lfs quota` asks three scopes per path.
-MAX_PATHS = 3
+#
+# Raised from 3 once `cli._attach_quota` started re-asking this backend with
+# the real roots. Three was enough when the only caller passed `/`; it is not
+# enough for a reader with several project directories, and the whole point of
+# the second pass is that a project quota is per directory. Measured here:
+# each `lfs quota` call is about 15 ms, so eight paths at three scopes is
+# under half a second, and it only runs for roots nothing else could answer.
+MAX_PATHS = 8
 
 # What `lfs quota` prints when it could not reach every OST or MDT. The figures
 # it could not verify come back in brackets and this line explains them.
@@ -91,8 +101,9 @@ TIME_NOTE = (
 
 # `Disk quotas for usr foo (uid 1000):` / `... for prj 1234 (pid 1234):`. The
 # scope is read rather than assumed, so a build that answers a different scope
-# than the one asked cannot be silently relabelled.
-_SCOPE_LINE = re.compile(r"disk\s+quotas\s+for\s+(\w+)\s", re.IGNORECASE)
+# than the one asked cannot be silently relabelled, and the name after it is
+# kept because for a project it is the id the directory carries.
+_SCOPE_LINE = re.compile(r"disk\s+quotas\s+for\s+(\w+)\s+(\S+)", re.IGNORECASE)
 
 
 def unverified(text):
@@ -121,12 +132,15 @@ def parse_lfs_quota(text, scope="", mount_hint=""):
 
     Two things here produced confident wrong answers in rapiDU and are fixed:
 
-    **The mount point is ``lfs``'s own first column, not the queried path.**
+    **The mount is ``lfs``'s own first column, not the caller's idea of it.**
     Storing the queried path made "does this walk cover the whole quota'd
     tree" true by construction, so the verdict that exists to say *you walked
     a subdirectory of a much larger quota'd filesystem* became unreachable on
     Lustre and every subdirectory scan reported the rest of the filesystem as
-    an unexplained difference.
+    an unexplained difference. Measured on ACME, the column is whatever path
+    `lfs` was handed (`/lus/grove`, `/lus/egret/projects/lanternlab-exampleu`),
+    so for a user or group row it is one path on a filesystem the figure
+    covers all of, and the attach step treats it that way.
 
     **Wrapped rows are read.** ``lfs`` puts a long filesystem name on its own
     line and the eight figures on the next. Requiring nine fields on one line
@@ -136,10 +150,12 @@ def parse_lfs_quota(text, scope="", mount_hint=""):
     rows = []  # type: List[QuotaRow]
     lines = [line for line in (text or "").splitlines() if line.strip()]
     found_scope = scope
+    subject = ""
     for index, line in enumerate(lines):
         named = _SCOPE_LINE.search(line)
         if named:
             found_scope = norm_scope(named.group(1)) or scope
+            subject = named.group(2)
             continue
         if "Filesystem" not in line or "kbytes" not in line:
             continue
@@ -156,7 +172,7 @@ def parse_lfs_quota(text, scope="", mount_hint=""):
         # kernel when it does not, and to nothing at all when neither can say:
         # an unmapped row is honest, a row mounted at the walk root is not.
         mount = name if name.startswith("/") else mount_hint
-        label = os.path.basename((mount or "").rstrip("/")) or name
+        label = _fileset_label(found_scope, subject)
         rows.append(
             QuotaRow(
                 label,
@@ -190,6 +206,28 @@ def parse_lfs_quota(text, scope="", mount_hint=""):
     return [row for row in rows if row.used is not None]
 
 
+def _fileset_label(scope, subject):
+    # type: (str, str) -> str
+    """What a row's `fileset` should say, which on Lustre is usually nothing.
+
+    It was the basename of the path `lfs` was asked about, which invented a
+    fileset per mount: `home`, `acorn`, `egret`, `grove`. Those names then fed
+    discovery and the stranded check as if they were quota scopes, and on
+    Sylvia four of them came back "held with no reachable path" while every
+    one was mounted and listable. A user or group quota on Lustre covers the
+    whole FILESYSTEM, so it has no fileset, and saying so is what lets the
+    attach step treat it as one figure for the whole filesystem.
+
+    A project quota does have a scope, and its name is the project id that
+    `lfs project -d` reports for the directory, so the two sides match on the
+    same string instead of `13579` on one and `lanternlab-exampleu` on the
+    other.
+    """
+    if scope == "project" and subject.isdigit():
+        return subject
+    return ""
+
+
 def project_id(runner, path, budget=None, extra_dirs=()):
     # type: (object, str, object, Sequence[str]) -> Optional[str]
     """The Lustre project id ``path`` is charged to, if it carries one.
@@ -214,6 +252,10 @@ class LustreBackend(Backend):
     """``lfs quota`` for user, group and project scope."""
 
     name = "lfs quota"
+
+    # A project quota is a property of the directory, not the filesystem,
+    # so this backend has to be asked again once the roots are known.
+    per_path = True
 
     def __init__(
         self,
@@ -313,8 +355,19 @@ class LustreBackend(Backend):
         and an error message from a question that should not have been asked
         reads as a broken backend.
         """
+        # **Filtered first, capped second, and the order is the whole bug.**
+        # Slicing to `max_paths` before testing for Lustre meant a handful of
+        # non-Lustre paths at the front of the list starved the backend
+        # completely: on a Cray login node the caller's unanswered roots begin
+        # `/`, `/admin_home`, `/boot`, so all three slots were spent before
+        # any Lustre path was reached, `out` came back empty, and the fallback
+        # below asked about the mounts instead. The reader's 29.58T project
+        # allocation therefore reported `?` while the backend was busy
+        # re-reading figures it already had.
         out = []  # type: List[str]
-        for path in list(paths or [])[: self.max_paths]:
+        for path in paths or ():
+            if len(out) >= self.max_paths:
+                break
             if enclosing_mount_of_type(mounts, path, LUSTRE_FSTYPES):
                 out.append(path)
         if out:

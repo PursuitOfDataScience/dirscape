@@ -43,6 +43,7 @@ __all__ = [
     "Reach",
     "QuotaRow",
     "QuotaSnapshot",
+    "SnapshotCopy",
     "Root",
     "sanitize",
 ]
@@ -77,6 +78,12 @@ def sanitize(text, limit=512):
     if len(cleaned) > limit:
         cleaned = cleaned[: limit - 3] + "..."
     return cleaned
+
+
+#: How much of a device string survives `sanitize`. Generous on purpose: a
+#: truncated device is not a shorter name for the same thing, it is a key that
+#: can collide with another filesystem's.
+DEVICE_LIMIT = 1024
 
 
 # --------------------------------------------------------------------------
@@ -414,7 +421,9 @@ class QuotaRow(object):
     ):
         # type: (...) -> None
         self.fileset = sanitize(fileset, limit=128)
-        self.device = sanitize(device or fileset, limit=128)
+        # `DEVICE_LIMIT`, not 128: a Lustre device is its whole NID list and
+        # the filesystem name comes LAST. See `Root.__init__`.
+        self.device = sanitize(device or fileset, limit=DEVICE_LIMIT)
         self.kind = kind  # "blocks" | "files"
         self.scope = scope  # "user" | "group" | "fileset" | "project" | ""
         self.used = used
@@ -637,6 +646,48 @@ def unavailable_quota(
 
 
 # --------------------------------------------------------------------------
+# SnapshotCopy: one read-only copy of a path, as of some past moment
+# --------------------------------------------------------------------------
+
+
+class SnapshotCopy(object):
+    """One filesystem snapshot, and where THIS path is inside it.
+
+    Not to be confused with `state.Snapshot`, which is this tool's own
+    memory of a previous run. The collision is unfortunate and the words are
+    both correct: the one here is the filesystem's read-only copy of your
+    data, and it is the thing a user reaches for after `rm -rf`.
+
+    ``taken_at`` is parsed from the snapshot's NAME and never from its
+    metadata. Measured on GPFS here: every snapshot directory under
+    ``/gpfs/meadow3/cap/.snapshots`` stats as ``mtime 2021-08-04``, which is
+    the fileset's creation date, identical for a copy taken this morning and
+    one taken four weeks ago. Reading mtime would therefore date every
+    snapshot to the same day in 2021, so a name that does not parse leaves
+    this ``None`` rather than borrowing a number that is wrong.
+    """
+
+    __slots__ = ("name", "path", "taken_at")
+
+    def __init__(self, name, path, taken_at=None):
+        # type: (str, str, Optional[float]) -> None
+        self.name = sanitize(name, limit=256)
+        self.path = sanitize(path, limit=4096)
+        self.taken_at = taken_at
+
+    def to_json(self):
+        # type: () -> Dict[str, object]
+        out = {"name": self.name, "path": self.path}  # type: Dict[str, object]
+        if self.taken_at is not None:
+            out["taken_at"] = self.taken_at
+        return out
+
+    def __repr__(self):
+        # type: () -> str
+        return "SnapshotCopy(%r)" % (self.path,)
+
+
+# --------------------------------------------------------------------------
 # Root: the thing this tool is about
 # --------------------------------------------------------------------------
 
@@ -681,6 +732,8 @@ class Root(object):
         "labels",
         "stranded",
         "renamed_from",
+        "snapshots",
+        "recoverable",
     )
 
     def __init__(self, path, role="", device="", fstype=""):
@@ -695,7 +748,14 @@ class Root(object):
         # | "local" | "" . Advisory only, derived by heuristic plus site config,
         # and never used to decide access.
         self.role = sanitize(role, limit=32)
-        self.device = sanitize(device, limit=128)
+        # **Long enough for a Lustre device, whose identity is at the END.**
+        # Measured on ACME: `/home` is mounted from
+        # `192.0.2.185@o2ib26,192.0.2.190@o2ib26:...:192.0.2.193@o2ib26:/acorn/home`,
+        # eight NIDs and 162 characters, and `/lus/acorn` from the same list
+        # ending `:/acorn`. At 128 both were cut to one identical prefix plus
+        # `...`, so two mounts became one device key and the part saying which
+        # filesystem it was, the only part that differs, was the part lost.
+        self.device = sanitize(device, limit=DEVICE_LIMIT)
         self.fstype = sanitize(fstype, limit=32)
         self.fileset = ""
         # (st_dev, st_ino). The dedupe key, because one device here is mounted
@@ -738,6 +798,15 @@ class Root(object):
         # rather than as a loss plus an arrival, since claiming a loss for data
         # that is visible elsewhere is the false alarm the whole design avoids.
         self.renamed_from = None  # type: Optional[str]
+        # Read-only copies of THIS path that the filesystem is keeping, newest
+        # first. Empty is not the same as "no backups": see `recoverable`.
+        self.snapshots = []  # type: List[SnapshotCopy]
+        # Whether a copy of this path can be read back today. Confirmed only
+        # when a copy was opened; refuted only when the filesystem exposes a
+        # snapshot directory and it holds nothing for this path; unknown when
+        # no snapshot mechanism was found, because a site can back up to tape
+        # without exposing one and silence must not be rendered as "no".
+        self.recoverable = unknown(VerdictCategory.NOT_PROBED)
 
     @property
     def reachable(self):
@@ -806,6 +875,9 @@ class Root(object):
             out["stranded"] = True
         if self.renamed_from:
             out["renamed_from"] = self.renamed_from
+        out["recoverable"] = self.recoverable.to_json()
+        if self.snapshots:
+            out["snapshots"] = [copy.to_json() for copy in self.snapshots]
         return out
 
     def __repr__(self):

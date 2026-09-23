@@ -98,9 +98,12 @@ def cluster_fingerprint(mounts, length=10):
     # type: (MountTable, int) -> str
     """A short stable hash identifying the storage fabric.
 
-    Hashes the sorted, deduplicated set of NETWORK device names. That set is
-    identical on every node of a cluster and different on every cluster, which
-    is exactly the property a snapshot key needs.
+    Hashes `MountTable.fabric`: the network filesystems, with snapshot mounts
+    left out, an NFS export reduced to its server and a Lustre subdirectory
+    mount to its filesystem. That set is identical on every node of a cluster
+    and different on every cluster, which is exactly the property a snapshot
+    key needs. The raw device list is neither: on ACME it changed between two
+    runs a minute apart, because NetApp mounts each snapshot a reader touches.
 
     ``sha256`` rather than ``sha1``: this is not a security use, but ``sha1``
     raises on a FIPS-enabled build and a tool that cannot compute its own
@@ -118,7 +121,7 @@ def cluster_fingerprint(mounts, length=10):
 
 def _fingerprint_with_basis(mounts, length=10):
     # type: (MountTable, int) -> tuple
-    devices = mounts.network_devices()
+    devices = mounts.fabric()
     basis = "network-devices"
     if not devices:
         devices = sorted({m.mountpoint for m in mounts.non_pseudo() if m.mountpoint})
@@ -254,7 +257,7 @@ def read_identity(mounts, env=None, hostname=None, site=None):
         # exactly one helper out of it.
         from ..sitecfg import guess_cluster_name
 
-        cluster = guess_cluster_name(hostname or "", mounts.network_devices())
+        cluster = guess_cluster_name(hostname or "", mounts.fabric())
 
     return Identity(
         uid=uid,

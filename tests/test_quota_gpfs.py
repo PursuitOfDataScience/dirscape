@@ -587,3 +587,61 @@ def _parsable(runner):
 
 def _human_table(runner):
     return runner.run(["/usr/lpp/mmfs/bin/mmlsquota", DEVICE]).stdout
+
+
+# --------------------------------------------------------------------------
+# Path-sensitive backends, found by running on a Lustre cluster
+# --------------------------------------------------------------------------
+
+
+def test_mmlsquota_is_not_path_sensitive_and_lustre_is():
+    """One sweep before discovery is enough on GPFS and not on Lustre.
+
+    `mmlsquota <device>` lists every fileset the reader holds usage in
+    whatever path named it. A project quota is a property of the DIRECTORY:
+    `lfs project -d /lus/egret` returns 0 while
+    `lfs project -d /lus/egret/projects/lanternlab-exampleu` returns 13579,
+    so a sweep that asked about the mount never asks for the project scope at
+    all and a 29.58T allocation reported `?`.
+    """
+    from dirscape.quota.gpfs import GpfsBackend
+    from dirscape.quota.lustre import LustreBackend
+    from dirscape.quota.xfs import XfsBackend
+
+    assert GpfsBackend().per_path is False
+    assert LustreBackend().per_path is True
+    assert XfsBackend().per_path is True
+
+
+def test_lustre_filters_for_lustre_before_applying_its_path_cap():
+    """Slicing first meant a few non-Lustre paths starved the backend.
+
+    On a Cray login node the caller's unanswered roots begin `/`,
+    `/admin_home`, `/boot`, so all the slots were spent before any Lustre
+    path was reached, the target list came back empty, and the fallback asked
+    about the mounts instead. The reader's 29.58T allocation therefore
+    reported `?` while the backend re-read figures it already had.
+    """
+    from dirscape.discover.mounts import read_mount_table
+    from dirscape.quota.lustre import LustreBackend
+
+    mounts = read_mount_table(
+        text="rootdev / ext4 rw 0 0\n"
+        "srv:/ah /admin_home nfs rw 0 0\n"
+        "egret /lus/egret lustre rw 0 0\n"
+    )
+    asked = ["/", "/admin_home", "/boot", "/lus/egret/projects/mine"]
+
+    targets = LustreBackend(max_paths=3)._targets(mounts, asked)
+
+    assert targets == ["/lus/egret/projects/mine"]
+
+
+def test_the_lustre_path_cap_still_bounds_the_fan_out():
+    from dirscape.discover.mounts import read_mount_table
+    from dirscape.quota.lustre import LustreBackend
+
+    mounts = read_mount_table(text="egret /lus/egret lustre rw 0 0\n")
+    asked = ["/lus/egret/projects/p%d" % (i,) for i in range(20)]
+
+    assert len(LustreBackend(max_paths=3)._targets(mounts, asked)) == 3

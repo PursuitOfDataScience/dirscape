@@ -29,13 +29,20 @@ own parse to have produced something. Two independent gates, and the row stays
 ``unknown`` unless both agree.
 """
 
-from typing import Dict, List, Optional, Sequence
+import errno
+import os
+from typing import Callable, Dict, List, Optional, Sequence
 
 from ..model import Root, Verdict, VerdictCategory, confirmed, unknown
 from ..runner import Budget, Runner
+from .access import with_deadline
 from .mounts import Mount, MountTable
 
 __all__ = [
+    "CEPH_FSTYPES",
+    "attribute_ceph",
+    "ceph_quota_dir",
+    "ceph_xattr",
     "GPFS_TOOL_DIRS",
     "GPFS_ROOT_FILESET",
     "XFS_TOOL_DIRS",
@@ -190,6 +197,8 @@ def attribute(root, runner, mounts, budget=None, site=None):
         return attribute_gpfs(root, runner, budget, site)
     if fstype == "lustre":
         return attribute_lustre(root, runner, budget, site)
+    if fstype in CEPH_FSTYPES:
+        return attribute_ceph(root, mounts, budget)
     if fstype in ("xfs", "ext4", "ext3", "ext2"):
         return attribute_xfs(root, runner, mounts, budget, site)
 
@@ -287,6 +296,87 @@ def attribute_lustre(root, runner, budget=None, site=None):
     return confirmed("project %s" % (projid,), source="lfs project -d", elapsed_s=result.elapsed_s)
 
 
+# --------------------------------------------------------------------------
+# CephFS: a quota is an attribute of a directory
+# --------------------------------------------------------------------------
+
+#: The kernel client, and ceph-fuse under both names it has used.
+CEPH_FSTYPES = ("ceph", "fuse.ceph", "fuse.ceph-fuse")
+
+
+def ceph_xattr(path, name):
+    # type: (str, str) -> Optional[int]
+    """One CephFS virtual xattr as an integer, or None when it is not set.
+
+    ``ENODATA`` is the normal answer for a quota nobody set, so it is None and
+    not an error. Anything else propagates: a filesystem that does not know
+    the attribute at all is not CephFS, and the caller wants to know.
+    """
+    try:
+        raw = os.getxattr(path, name)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)):
+            return None
+        raise
+    text = raw.decode("ascii", "replace").strip().rstrip("\x00")
+    return int(text) if text.isdigit() else None
+
+
+def ceph_quota_dir(path, mountpoint, getxattr=None):
+    # type: (str, str, Optional[Callable[[str, str], Optional[int]]]) -> str
+    """The directory whose CephFS quota governs ``path``, or "" when none does.
+
+    The path itself when it carries `ceph.quota.max_bytes` or `max_files`,
+    else the nearest ancestor that does, up to and including the mountpoint.
+    O(depth) xattr reads, each answered from the metadata server's cache.
+    """
+    read = getxattr or ceph_xattr
+    top = (mountpoint or "/").rstrip("/") or "/"
+    here = (path or "").rstrip("/") or "/"
+    while True:
+        if read(here, "ceph.quota.max_bytes") or read(here, "ceph.quota.max_files"):
+            return here
+        if here == top or not here.startswith(top.rstrip("/") + "/"):
+            return ""
+        here = os.path.dirname(here)
+
+
+def attribute_ceph(root, mounts, budget=None, getxattr=None):
+    # type: (Root, Optional[MountTable], Optional[Budget], Optional[Callable[[str, str], Optional[int]]]) -> Verdict
+    """The CephFS quota directory governing this root, as its scope.
+
+    Named by its PATH, because a CephFS quota can sit on any directory and two
+    of them may share a basename; the path is the one name that cannot
+    collide. Measured on HPC's `/cfs3`: `/cfs3/kestrel-lab` and
+    `/cfs3/hpc-staff` each carry their own quota, and with no scope recorded
+    `dirscape tree` grouped them as one "no fileset" line showing the first
+    one's `155T of 165T` for both.
+    """
+    mount = mounts.enclosing_mount(root.path) if mounts is not None else None
+    top = mount.mountpoint if mount is not None else "/"
+    timeout = budget.slice_for(share=0.25, floor=0.35, ceiling=2.0) if budget else None
+    finished, value, exc, elapsed = with_deadline(
+        lambda: ceph_quota_dir(root.path, top, getxattr), timeout
+    )
+    if not finished or exc is not None:
+        reason = "the CephFS metadata server did not answer" if not finished else str(exc)
+        return unknown(VerdictCategory.BACKEND_FAILED, reason, source="ceph xattrs")
+    scope = str(value or "")
+    if not scope:
+        note = "no CephFS quota is set on this directory or any directory above it"
+        root.add_note(note)
+        return unknown(VerdictCategory.NOT_SUPPORTED, note, source="ceph xattrs", elapsed_s=elapsed)
+    root.fileset = scope
+    if scope != root.path.rstrip("/"):
+        root.add_note("under the CephFS quota set on %s" % (scope,))
+    return confirmed("CephFS quota on %s" % (scope,), source="ceph xattrs", elapsed_s=elapsed)
+
+
+# The mount options under which ext2/3/4 enforce a limit. `usrjquota=` and
+# `grpjquota=` name journalled quota files and imply the matching type.
+_EXT_QUOTA_OPTIONS = ("quota", "usrquota", "grpquota", "prjquota", "usrjquota", "grpjquota")
+
+
 def attribute_xfs(root, runner, mounts, budget=None, site=None):
     # type: (Root, Runner, MountTable, Optional[Budget], Optional[object]) -> Verdict
     """Best-effort XFS project id, refused from the mount options when possible.
@@ -296,10 +386,26 @@ def attribute_xfs(root, runner, mounts, budget=None, site=None):
     That is the cheapest correct answer available and it costs nothing to check.
     """
     mount = mounts.enclosing_mount(root.path) if mounts is not None else None
+    fstype = ((mount.fstype if mount is not None else root.fstype) or "xfs").lower()
     if mount is not None and isinstance(mount, Mount):
         has_project_quota = mount.has_option("prjquota") or mount.has_option("pquota")
-        if mount.has_option("noquota") and not has_project_quota:
-            note = "mounted noquota, so no project scope exists here"
+        # ext2/3/4 print no `noquota`; they enforce a limit only when mounted
+        # with a quota option, which the kernel then lists in the mount table
+        # (`ext4_enable_quotas` turns limits on per `usrquota`, `grpquota` and
+        # `prjquota`). So on ext* the ABSENCE of all of them is the same
+        # evidence `noquota` is on XFS. Measured on a Sylvia login node:
+        # `/tmp` is `ext4 rw,relatime,stripe=64`, and `quota -v` there lists
+        # no quota for it.
+        unquoted_ext = fstype.startswith("ext") and not any(
+            option == name or option.startswith(name + "=")
+            for option in mount.option_list
+            for name in _EXT_QUOTA_OPTIONS
+        )
+        if (mount.has_option("noquota") and not has_project_quota) or unquoted_ext:
+            if unquoted_ext:
+                note = "mounted with no quota option, so no limit is enforced here"
+            else:
+                note = "mounted noquota, so no project scope exists here"
             root.add_note(note)
             # **Recorded as KNOWLEDGE, not only as a note.** `noquota` in the
             # mount options is positive evidence that no limit is enforced
@@ -314,9 +420,10 @@ def attribute_xfs(root, runner, mounts, budget=None, site=None):
             root.policy["no_quota_enforced"] = True
             return unknown(VerdictCategory.NOT_SUPPORTED, note, source="/proc/self/mounts")
 
+    label = "XFS" if fstype == "xfs" else fstype
     tool = runner.available("xfs_io", extra_dirs=_extra_dirs(site, XFS_TOOL_DIRS))
     if not tool:
-        note = "xfs_io not found, so any XFS project id for this path is unknown"
+        note = "xfs_io not found, so any %s project id for this path is unknown" % (label,)
         root.add_note(note)
         return unknown(VerdictCategory.NOT_SUPPORTED, note, source="xfs_io")
 
@@ -332,7 +439,7 @@ def attribute_xfs(root, runner, mounts, budget=None, site=None):
 
     projid = parse_xfs_lsproj(result.stdout)
     if not projid:
-        note = "no XFS project id set on this path"
+        note = "no %s project id set on this path" % (label,)
         root.add_note(note)
         return unknown(
             VerdictCategory.NOT_SUPPORTED,
@@ -342,7 +449,7 @@ def attribute_xfs(root, runner, mounts, budget=None, site=None):
         )
 
     root.fileset = projid
-    root.add_note("XFS project id %s" % (projid,))
+    root.add_note("%s project id %s" % (label, projid))
     return confirmed("project %s" % (projid,), source="xfs_io lsproj", elapsed_s=result.elapsed_s)
 
 

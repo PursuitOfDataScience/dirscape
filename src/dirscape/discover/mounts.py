@@ -51,6 +51,9 @@ __all__ = [
     "read_mount_table",
     "unescape_field",
     "node_class",
+    "SNAPSHOT_DIRS",
+    "inside_snapshot_tree",
+    "lustre_filesystem",
 ]
 
 
@@ -82,6 +85,7 @@ NETWORK_FSTYPES = frozenset(
         "fuse.sshfs",
         "fuse.glusterfs",
         "fuse.ceph",
+        "fuse.ceph-fuse",
     ]
 )
 
@@ -196,6 +200,79 @@ def classify_fstype(fstype, mountpoint=""):
     return KIND_OTHER
 
 
+# Where a filesystem exposes its snapshots, in the order they are tried. Every
+# one of these is a real convention on a real filesystem, and a cluster is
+# quite likely to have two of them at once: this site keeps GPFS snapshots in
+# `.snapshots` and its ZFS and NetApp cost-effective storage tiers in
+# `.zfs/snapshot` and `.snap` respectively, all reachable from the same login
+# node.
+#
+# Defined here rather than in `recover`, which re-exports it, because the
+# mount table is where a snapshot first shows up: NetApp mounts every
+# retained snapshot as a mount of its own, and the cluster key in `identity`
+# has to be able to leave those out without importing the recovery layer.
+SNAPSHOT_DIRS = (
+    ".snapshots",  # GPFS / IBM Storage Scale
+    ".snapshot",  # NetApp, and NFS exports of it
+    ".zfs/snapshot",  # ZFS
+    ".snap",  # Qumulo, and this site's /cfs3 tier
+)
+
+_SNAPSHOT_COMPONENTS = frozenset(
+    piece for snapdir in SNAPSHOT_DIRS for piece in snapdir.split("/") if piece
+)
+
+
+def inside_snapshot_tree(path):
+    # type: (str) -> bool
+    """Whether this path lies inside a filesystem's snapshot tree.
+
+    **A snapshot is somewhere to copy FROM and never somewhere to put data**,
+    so nothing here is a candidate root worth recommending and nothing here
+    is worth scanning for group-owned directories.
+
+    Measured on a NetApp-backed cluster, where this is not hypothetical:
+    every retained snapshot is its own NFS MOUNT, so the mount table itself
+    offers them up.
+
+        nfs /admin_home/.snapshot/daily.2026-09-21_0010  filer-01-infra:/...
+        nfs /admin_home/.snapshot/daily.2026-09-22_0010  filer-01-infra:/...
+        nfs /soft/.snapshot/daily.2026-09-22_0010        filer-01-softserv:/...
+
+    `--all` there listed three snapshot mounts and then, because the
+    dir-owner scan reads one level of any root whose role it does not
+    recognise, every one of the twenty homes inside each of them: sixty rows
+    of other people's directories, frozen, in a view whose question is where
+    the reader can put 2 TB. `dirscape recover` is what reads these, one path
+    at a time, and it does not need them to be roots.
+    """
+    return any(part in _SNAPSHOT_COMPONENTS for part in (path or "").split("/") if part)
+
+
+def lustre_filesystem(device):
+    # type: (str) -> str
+    """``<nids>:/<fsname>`` for a Lustre device, whatever subdirectory it mounts.
+
+    A Lustre client can mount a SUBDIRECTORY of a filesystem, and ACME does it
+    on every login node. Measured on Procyon and Sylvia:
+
+        <8 NIDs>:/acorn/home        /home         lustre
+        <8 NIDs>:/acorn             /lus/acorn    lustre   (Sylvia only)
+        <2 NIDs>:/egret             /lus/egret    lustre
+        <2 NIDs>:/egret/clone/g2    /lus/grove    lustre
+
+    Four device strings, two filesystems: `/home` and `/lus/acorn` stat to one
+    `st_dev`, `/lus/grove` is the very inode `/lus/egret/clone/g2` is, and one
+    `lfs quota -u` answer covers each pair. The NIDs stay in the key because
+    the fsname alone is not unique: `lustre` is the default name and two
+    filesystems from different MGSes can both carry it.
+    """
+    head, sep, tail = (device or "").rpartition(":/")
+    if not sep:
+        return device or ""
+    return "%s:/%s" % (head, tail.split("/")[0])
+
+
 class Mount(object):
     """One line of the mount table, unescaped and classified."""
 
@@ -258,6 +335,21 @@ class Mount(object):
         # type: () -> bool
         return self.has_option("ro")
 
+    @property
+    def filesystem(self):
+        # type: () -> str
+        """Which filesystem this mount shows, where the device string cannot say.
+
+        The device for everything except Lustre, where a subdirectory mount
+        carries its path inside the device string: see `lustre_filesystem`.
+        GPFS needs nothing here, because every mountpoint of a GPFS device
+        repeats the bare device name (`meadow3_cap` at `/home`, `/project`,
+        `/software` and `/programs`).
+        """
+        if (self.fstype or "").lower() == "lustre":
+            return lustre_filesystem(self.device)
+        return self.device
+
     def to_json(self):
         # type: () -> Dict[str, object]
         return {
@@ -309,6 +401,34 @@ class MountTable(object):
     def network_devices(self):
         # type: () -> List[str]
         return sorted({m.device for m in self.mounts if m.is_network and m.device})
+
+    def fabric(self):
+        # type: () -> List[str]
+        """The network storage this node is attached to, as a set that holds still.
+
+        What the cluster key is built from, so it must read the same on every
+        run from every node of one cluster. `network_devices` does not, and
+        the failure was measured on ACME, where eight state files appeared in
+        four minutes from six runs on two login nodes:
+
+        * **A NetApp snapshot is its own NFS mount.** `/admin_home/.snapshot/
+          hourly.2026-09-22_1305` is a mount this hour and gone the next, and
+          reading a `.snapshot` directory (which `dirscape recover` does)
+          automounts more, so the tool moved its own key by running.
+        * **An NFS server exports many paths**, and which of them are mounted
+          at any moment is an automounter's decision, not a property of the
+          cluster. The SERVER is the property.
+        * **A Lustre subdirectory mount** names a directory inside the device
+          string; `lustre_filesystem` reduces it to the filesystem.
+        """
+        names = set()
+        for mount in self.mounts:
+            if not mount.is_network or not mount.device:
+                continue
+            if inside_snapshot_tree(mount.mountpoint) or inside_snapshot_tree(mount.device):
+                continue
+            names.add(_fabric_name(mount))
+        return sorted(name for name in names if name)
 
     def non_pseudo(self):
         # type: () -> List[Mount]
@@ -365,6 +485,30 @@ def _normalise(path):
     return cleaned
 
 
+# Remote filesystems whose device string is `server:/export/path` (or
+# `//server/share` for SMB), where only the server is a property of the
+# cluster and the export is whatever happened to be mounted.
+_SERVER_EXPORT_FSTYPES = frozenset(["nfs", "nfs4", "cifs", "smb3", "glusterfs", "fuse.sshfs"])
+
+
+def _fabric_name(mount):
+    # type: (Mount) -> str
+    """One mount's contribution to `MountTable.fabric`."""
+    fstype = (mount.fstype or "").lower()
+    device = mount.device or ""
+    if fstype == "lustre":
+        return "lustre " + lustre_filesystem(device)
+    if fstype in _SERVER_EXPORT_FSTYPES:
+        if device.startswith("//"):
+            return "%s //%s" % (fstype, device[2:].split("/")[0])
+        if ":" in device:
+            # `rpartition` would split an IPv6 literal; the export always
+            # starts at the first `:/`, and a bracketed address has none.
+            server = device.split(":/")[0] if ":/" in device else device.rsplit(":", 1)[0]
+            return "%s %s" % (fstype.rstrip("4"), server)
+    return device
+
+
 def read_mount_table(path=MOUNT_TABLE_PATH, text=None):
     # type: (str, Optional[str]) -> MountTable
     """Parse a mount table.
@@ -411,14 +555,35 @@ def read_mount_table(path=MOUNT_TABLE_PATH, text=None):
 # unrecognised name returns "unknown" rather than guessing, because the only
 # thing worse than not knowing the node class is being confidently wrong about
 # it and attributing a missing login-only mount to a change in the filesystem.
+#
+# The node-kind word may carry its own separator before the number, which is
+# how ACME names Sylvia's nodes (`sylvia-gpu-07`); `collie3-bigmem1` here has
+# none.
 _COMPUTE_NAME = re.compile(
-    r"^[a-z][a-z0-9]*[-_](?:\d+|bigmem\d*|gpu\d*|amd\d*|himem\d*|mem\d*)$",
+    r"^[a-z][a-z0-9]*[-_](?:\d+|(?:bigmem|gpu|amd|himem|mem)(?:[-_]?\d+)?)$",
     re.IGNORECASE,
 )
 
-# Every variable Slurm sets inside a job step. Presence of any one of them is
-# taken as proof of a compute node.
-_SLURM_JOB_VARS = ("SLURM_JOB_ID", "SLURM_NODEID", "SLURM_JOBID", "SLURM_STEP_ID")
+# An HPE Cray "xname": cabinet, chassis, slot, board, node. Every compute node
+# on Procyon and Autumn is named this way (`x1234c0s13b0n0`), and nothing but a
+# compute blade is.
+_CRAY_XNAME = re.compile(r"^x\d+c\d+s\d+b\d+n\d+$", re.IGNORECASE)
+
+# A variable every batch system sets inside a job, one or more per scheduler.
+# Presence of any one of them is taken as proof of a compute node. Slurm was
+# the only one here until the package met PBS Pro on ACME, where a job has
+# `PBS_JOBID` and no `SLURM_*` at all, so every compute node there fell
+# through to the hostname and came back "unknown".
+_JOB_VARS = (
+    "SLURM_JOB_ID",
+    "SLURM_NODEID",
+    "SLURM_JOBID",
+    "SLURM_STEP_ID",
+    "PBS_JOBID",  # PBS Pro, OpenPBS, Torque
+    "LSB_JOBID",  # IBM LSF
+    "FLUX_JOB_ID",  # Flux
+    "COBALT_JOBID",  # Cobalt, ACME's scheduler before PBS
+)
 
 
 def node_class(env=None, hostname=None):
@@ -430,8 +595,8 @@ def node_class(env=None, hostname=None):
     a compute node must record that fact or the next diff reports a whole
     filesystem as having disappeared.
 
-    Slurm's environment is the strong signal and the hostname pattern is a weak
-    fallback, in that order. Both are injectable so no test has to read the host
+    The batch system's environment is the strong signal and the hostname
+    pattern is a weak fallback, in that order. Both are injectable so no test has to read the host
     it runs on, which is rapiDU's RD-10.
 
     Measured case for keeping the fallback weak: this package was developed on
@@ -440,7 +605,7 @@ def node_class(env=None, hostname=None):
     evidence there, and it is still only evidence.
     """
     environ = os.environ if env is None else env
-    for name in _SLURM_JOB_VARS:
+    for name in _JOB_VARS:
         if str(environ.get(name) or "").strip():
             return "compute"
 
@@ -457,6 +622,6 @@ def node_class(env=None, hostname=None):
     # through to the digit-suffix rule and be called a compute node.
     if "login" in lowered or lowered.startswith(("bastion", "gateway", "jump")):
         return "login"
-    if _COMPUTE_NAME.match(short):
+    if _COMPUTE_NAME.match(short) or _CRAY_XNAME.match(short):
         return "compute"
     return "unknown"

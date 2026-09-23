@@ -1,4 +1,4 @@
-"""Quota backends: five ways to ask, one way to say "I could not".
+"""Quota backends: six ways to ask, one way to say "I could not".
 
 Ask through `read_best` for one path, or `read_all` when you want every
 backend's answer. The difference matters: `read_best` returns the one reading
@@ -42,6 +42,7 @@ from .base import (
     select_snapshot,
     snapshot,
 )
+from .ceph import CephBackend
 from .gpfs import GpfsBackend, filesets_seen, read_path_fileset
 from .lustre import LustreBackend
 from .posix import PosixQuotaBackend
@@ -61,6 +62,7 @@ __all__ = [
     "default_backends",
     "GpfsBackend",
     "LustreBackend",
+    "CephBackend",
     "XfsBackend",
     "PosixQuotaBackend",
     "SiteWrapperBackend",

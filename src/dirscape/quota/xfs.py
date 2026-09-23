@@ -284,6 +284,10 @@ class XfsBackend(Backend):
 
     name = "xfs_quota"
 
+    # A project quota is a property of the directory, not the filesystem,
+    # so this backend has to be asked again once the roots are known.
+    per_path = True
+
     def __init__(
         self,
         extra_dirs=XFS_BIN_DIRS,  # type: Sequence[str]

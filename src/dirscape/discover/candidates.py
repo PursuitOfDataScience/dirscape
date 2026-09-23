@@ -48,7 +48,7 @@ from ..model import (
     unknown,
 )
 from ..runner import Budget, Runner
-from ..sitecfg import Site
+from ..sitecfg import ROLES, Site
 from .access import (
     DEFAULT_DEADLINE_S,
     probe_present,
@@ -58,7 +58,7 @@ from .access import (
     with_deadline,
 )
 from .identity import Identity
-from .mounts import Mount, MountTable
+from .mounts import Mount, MountTable, inside_snapshot_tree
 
 __all__ = [
     "SOURCE_MOUNTS",
@@ -67,6 +67,7 @@ __all__ = [
     "SOURCE_DIR_OWNER",
     "SOURCE_QUOTA_FILESET",
     "SOURCE_DATASET_ROOT",
+    "SOURCE_SNAPSHOT_ROOT",
     "SOURCE_ALLOCATION",
     "SOURCE_LABELS",
     "SOURCE_RESTATEMENTS",
@@ -79,6 +80,7 @@ __all__ = [
     "RANK_PRIMARY",
     "RANK_SECONDARY",
     "role_for_path",
+    "inside_snapshot_tree",
     "discover",
 ]
 
@@ -91,6 +93,12 @@ SOURCE_QUOTA_FILESET = "quota-fileset"
 # Site-declared shared collections, from `Site.dataset_roots`. Empty unless a
 # site names them, so this adds nothing on a cluster with no config.
 SOURCE_DATASET_ROOT = "dataset-root"
+# A site-declared snapshot tree, from `Site.snapshot_roots`. Always ranked
+# SECONDARY: it is real, reachable storage and it is not a place to put data,
+# so it belongs in `--all` and never in the table that answers "where can my
+# 2 TB go". Owner, on the first version that omitted it entirely: "/snapshots
+# is still not shown, even when running it on the login node."
+SOURCE_SNAPSHOT_ROOT = "snapshot-root"
 # An allocation database's claim. Never derived into a path by this module.
 SOURCE_ALLOCATION = "allocation"
 
@@ -112,6 +120,7 @@ SOURCE_LABELS = {
     SOURCE_DIR_OWNER: "a group you belong to owns it",
     SOURCE_QUOTA_FILESET: "the filesystem's own records say you hold space in it",
     SOURCE_DATASET_ROOT: "it sits in a shared data collection this site publishes",
+    SOURCE_SNAPSHOT_ROOT: "this site publishes read-only snapshots here",
     SOURCE_ALLOCATION: "an allocation record names it",
 }
 
@@ -151,6 +160,7 @@ SOURCE_SHORT = {
     SOURCE_DIR_OWNER: "group ownership",
     SOURCE_QUOTA_FILESET: "the quota records",
     SOURCE_DATASET_ROOT: "a shared data collection",
+    SOURCE_SNAPSHOT_ROOT: "a published snapshot tree",
     SOURCE_ALLOCATION: "an allocation record",
 }
 
@@ -184,23 +194,71 @@ def restates_source(note, sources):
 # Reading them costs nothing and not reading them makes the tool site-specific.
 ENV_VARS = ("HOME", "SCRATCH", "TMPDIR", "PROJECT", "WORK")
 
-# Which mount roots the `dir-owner` scan is allowed to read one level of.
+# Which mount roots the `dir-owner` scan and the name templates may read.
 #
-# Restricted to project roles on measured evidence. Scanning `/software` would
-# match 713 of its 746 entries, because they are group-owned by `hpc-software`
-# and this user is a member: group ownership is a poor ownership signal exactly
-# where a group is used for software distribution rather than for storage. And
-# `/scratch/meadow3` holds 13,907 entries, which is 0.205s of stat for a
-# directory whose per-user path the template source finds in one stat.
-PROJECT_LIKE_ROLES = ("project",)
+# **Stated as what to SKIP, never as what to allow, and that inversion is the
+# whole point.** A role is an advisory label from a glob heuristic, so an
+# allowlist of recognised roles silently means "storage this heuristic has
+# never heard of does not exist". Measured, and this is the bug the inversion
+# fixes: `/collie3` matches no built-in pattern and so scored the fallback role
+# `other`, which kept it out of both sources; `/collie3/hpc-staff` is
+# `drwxrws--- root hpc-staff`, is writable by this user, and appeared nowhere
+# in `dirscape`, `dirscape --all` or `--json`. One unrecognised mountpoint hid
+# a whole writable allocation. A denylist cannot fail that way: an unknown root
+# is scanned, and the cost of being wrong is one cheap listing.
+#
+# Each exclusion below is a measurement, not a guess:
+#
+# * `software`: scanning `/software` matches 713 of its 749 entries, because
+#   they are group-owned by `hpc-software` and this user is a member. Group
+#   ownership is a poor ownership signal exactly where a group distributes
+#   software rather than storage.
+# * `scratch`: `/scratch/meadow3` holds 13,909 entries and `/scratch/meadow2`
+#   14,446, which is 0.2s of stat apiece for a directory whose per-user path
+#   the template source finds in ONE stat. The `<root>/<user>` probe in
+#   `_from_group_template` covers these instead, so `scratch` stays in
+#   TEMPLATE_ROLES and is only kept out of the scandir.
+# * `home`: 13,915 entries, and your own home arrives from `$HOME`.
+# * `local`: a memory or node-local filesystem holds no allocation, and `/tmp`
+#   here is mode 1777, so a write test on its entries says nothing about
+#   ownership.
+# * `dataset`: `_from_dataset_roots` already reads these one level deep and
+#   deliberately does NOT filter by ownership, which is the right rule for a
+#   shared collection and the wrong one here.
+#
+# Cost of the widening, measured on this node: 0.028s for every `other` and
+# `archive` mountpoint on the cluster, adding two candidates, one of which
+# (`/gpfs/meadow3/cap/software`) the `(st_dev, st_ino)` dedupe then folds onto
+# `/software`.
+_DIR_OWNER_SKIP = frozenset(["home", "scratch", "software", "dataset", "local"])
+_TEMPLATE_SKIP = frozenset(["home", "software", "dataset", "local"])
 
-# Roles worth expanding a `<root>/<name>` template against.
-TEMPLATE_ROLES = ("project", "scratch")
+#: Roles whose mountpoint gets a one-level, group-ownership-filtered scandir.
+#: Derived from `ROLES` by subtraction so a role added to the vocabulary later
+#: is scanned by default rather than silently ignored.
+PROJECT_LIKE_ROLES = tuple(role for role in ROLES if role not in _DIR_OWNER_SKIP)
+
+#: Roles worth expanding a `<root>/<name>` template against.
+TEMPLATE_ROLES = tuple(role for role in ROLES if role not in _TEMPLATE_SKIP)
 
 # Upper bound on entries read from any single directory. A one-level scandir is
 # O(entries), not O(tree), but a shared root with a hundred thousand entries
 # would still dominate the budget, and this module's promise is O(roots).
 SCANDIR_CAP = 4000
+
+# How many top-level entries a mount may have before the `<root>/<child>/<group>`
+# template is given up on. A container directory has a handful of entries; a
+# directory of allocations has hundreds, and it is the allocations themselves
+# that the plain `<root>/<group>` template already finds.
+#
+# Measured, and the two shapes are far apart enough that the bound is not a
+# close call. Under the cap: `/lus/egret` has 11 top-level entries and the
+# reader's allocation is at `/lus/egret/projects/lanternlab-exampleu`, two
+# levels down, where no other source reaches it. Over it: `/project` has 669,
+# `/project2` 892, `/scratch/meadow3` 13,909 and `/scratch/meadow2` 14,446,
+# and on all four the allocation is the FIRST level, so descending would cost
+# thousands of stats to find what one template already found.
+NESTED_FANOUT = 32
 
 
 def role_for_path(path, fstype="", site=None):
@@ -327,8 +385,8 @@ def _is_dir(path, deadline_s):
 
 
 def _scandir_one_level(path, deadline_s, cap=SCANDIR_CAP):
-    # type: (str, Optional[float], int) -> List[Tuple[str, str, Optional[int], bool]]
-    """One level of a directory as ``(name, path, gid, is_dir)`` tuples.
+    # type: (str, Optional[float], int) -> List[Tuple[str, str, Optional[int], bool, Optional[int]]]
+    """One level of a directory as ``(name, path, gid, is_dir, uid)`` tuples.
 
     Never recurses, and never follows a symlink when stat'ing an entry: a
     symlink into a wedged filesystem inside a directory being listed would
@@ -336,27 +394,52 @@ def _scandir_one_level(path, deadline_s, cap=SCANDIR_CAP):
     """
 
     def read():
-        # type: () -> List[Tuple[str, str, Optional[int], bool]]
-        found = []  # type: List[Tuple[str, str, Optional[int], bool]]
+        # type: () -> List[Tuple[str, str, Optional[int], bool, Optional[int]]]
+        found = []  # type: List[Tuple[str, str, Optional[int], bool, Optional[int]]]
         with os.scandir(path) as entries:
             for entry in entries:
                 if len(found) >= cap:
                     break
                 gid = None  # type: Optional[int]
+                uid = None  # type: Optional[int]
                 is_dir = False
                 try:
                     stat_result = entry.stat(follow_symlinks=False)
                     gid = stat_result.st_gid
+                    uid = stat_result.st_uid
                     is_dir = entry.is_dir(follow_symlinks=False)
                 except OSError:
                     # One unreadable entry must not lose the other 668.
                     pass
-                found.append((entry.name, entry.path, gid, is_dir))
+                found.append((entry.name, entry.path, gid, is_dir, uid))
         return found
 
     finished, value, exc, _elapsed = with_deadline(read, deadline_s)
     if not finished or exc is not None or value is None:
         return []
+    return value  # type: ignore[return-value]
+
+
+def _names_one_level(path, deadline_s, cap=NESTED_FANOUT):
+    # type: (str, Optional[float], int) -> Optional[List[str]]
+    """Entry names one level down, or None when there are more than ``cap``.
+
+    `os.listdir` rather than `_scandir_one_level` because this needs names
+    and not metadata: the scandir helper stats every entry, which is 0.2s on
+    a directory of 14,000 and exactly the cost the cap exists to avoid. A
+    bare listdir of the same directory is a few milliseconds, so the count
+    can be checked before anything expensive is decided.
+    """
+
+    def read():
+        # type: () -> List[str]
+        return sorted(os.listdir(path))
+
+    finished, value, exc, _elapsed = with_deadline(read, deadline_s)
+    if not finished or exc is not None or value is None:
+        return None
+    if len(value) > cap:
+        return None
     return value  # type: ignore[return-value]
 
 
@@ -387,11 +470,31 @@ def _identity_of(path, deadline_s):
 RANK_PRIMARY = "primary"
 RANK_SECONDARY = "secondary"
 
-# Memory filesystems. Real space a job can fill, and never an allocation, so
-# they are kept and ranked down rather than dropped. Measured: this node's ``/``
-# is a tmpfs (it is diskless) and ``/.nodelog/log`` is a Slurm log tmpfs, so a
-# user asking where their data can go gets two rows of noise at the top.
-_EPHEMERAL_FSTYPES = frozenset(["tmpfs", "ramfs", "rootfs", "overlay"])
+# Filesystems nobody holds an allocation on. Kept and ranked down rather than
+# dropped, because they are real and a job can fill them.
+#
+# Two kinds, both measured. Memory filesystems: this node's ``/`` is a tmpfs
+# (it is diskless) and ``/.nodelog/log`` is a Slurm log tmpfs, so a user asking
+# where their data can go got two rows of noise at the top. Read-only images:
+# a Cray login node mounts four squashfs images, one of which is ``/root_ro``,
+# the OS root. Nothing there is storage, and descending it produced a row
+# reading ``/root_ro/egret/lanternlab-exampleu`` for the reader's real
+# allocation, because ``/root_ro/egret`` is a symlink to
+# ``/lus/egret/projects`` and the shorter path won the dedupe.
+_EPHEMERAL_FSTYPES = frozenset(["tmpfs", "ramfs", "rootfs", "overlay", "squashfs", "iso9660"])
+
+# What each of those IS, for the sentence that says why the row is held back.
+# One phrase served all six and printed "a overlay memory filesystem" about a
+# Cray login node's `/`, which is an overlay on a squashfs image: neither
+# memory nor grammatical.
+_EPHEMERAL_KIND = {
+    "tmpfs": "a tmpfs memory filesystem",
+    "ramfs": "a ramfs memory filesystem",
+    "rootfs": "the node's in-memory root filesystem",
+    "overlay": "an overlay on the node's system image",
+    "squashfs": "a read-only squashfs image",
+    "iso9660": "a read-only disc image",
+}
 
 
 def _rank_of_mount(mount, mounts, site):
@@ -417,32 +520,88 @@ def _rank_of_mount(mount, mounts, site):
     ``/gpfs/collie3/cap`` (depth 3) does not, and four sibling mountpoints at
     equal depth (``/home``, ``/project``, ``/software``, ``/programs``) all stay.
     """
-    if (mount.fstype or "").lower() in _EPHEMERAL_FSTYPES:
+    fstype = (mount.fstype or "").lower()
+    if fstype in _EPHEMERAL_FSTYPES:
         return (
             RANK_SECONDARY,
-            "a %s memory filesystem, so it holds no allocation" % (mount.fstype,),
+            "%s, so it holds no allocation" % (_EPHEMERAL_KIND.get(fstype, "a " + fstype),),
+        )
+
+    if inside_snapshot_tree(mount.mountpoint):
+        return (
+            RANK_SECONDARY,
+            "a read-only snapshot of another directory, so it is somewhere to "
+            "copy FROM; `dirscape recover <path>` reads it",
+        )
+
+    # **`/` is the machine, not an allocation.** On a login node it is a real
+    # 312G disk that `statvfs` and the measuring walk will happily report on,
+    # so it arrived in the default table reading `read only 20G 312G 311k`
+    # under the heading `other`, between a user's project space and their
+    # scratch. Owner: "there is something else such as `/`. do you think these
+    # should be trimmed down and polished?"
+    #
+    # Anywhere under it that a user can actually write is its own mount and
+    # gets its own row, so nothing is lost. Conditional on another mountpoint
+    # existing, because on a single-filesystem machine `/` IS the storage and
+    # a table with no rows is worse than an imprecise one.
+    if not mount.mountpoint.rstrip("/") and len(mounts.non_pseudo()) > 1:
+        return (
+            RANK_SECONDARY,
+            "the root of the machine's own filesystem; anywhere under it you can "
+            "write is mounted separately and has its own row",
         )
 
     role = site.role_for(mount.mountpoint, mount.fstype)
     if role in ("", "other"):
         depth = mount.mountpoint.rstrip("/").count("/")
+        # `filesystem`, not `device`: a Lustre subdirectory mount names its
+        # directory inside the device string, so ACME's `/lus/acorn` and the
+        # `/home` mounted out of it read as two devices and the plumbing view
+        # stayed in the default table carrying the home directory's quota.
         for other in mounts.mounts:
-            if other.device != mount.device or other.mountpoint == mount.mountpoint:
+            if other.filesystem != mount.filesystem or other.mountpoint == mount.mountpoint:
                 continue
             if other.mountpoint.rstrip("/").count("/") < depth:
                 return (
                     RANK_SECONDARY,
                     "the filesystem root of %s, which is also mounted at %s"
-                    % (mount.device, other.mountpoint),
+                    % (_device_name(mount), other.mountpoint),
                 )
     return (RANK_PRIMARY, "")
 
 
+def _device_name(mount):
+    # type: (Mount) -> str
+    """A device as a reader can take it in: a Lustre filesystem by its name.
+
+    A Lustre device leads with every server's network id, 162 characters on
+    ACME before the part that says `acorn`, so the sentence it sat in was one
+    long address. The fsname is what `lfs df` and the site's own docs call it.
+    """
+    if (mount.fstype or "").lower() == "lustre":
+        return "the Lustre filesystem %s" % (mount.filesystem.rpartition(":/")[2] or mount.device,)
+    return mount.device
+
+
 def _from_mounts(basket, mounts, site):
     # type: (_Basket, MountTable, Site) -> None
-    """Source (a): every non-pseudo mountpoint."""
+    """Source (a): every non-pseudo mountpoint, except a mounted snapshot.
+
+    NetApp mounts every snapshot a reader touches, one per retained copy per
+    directory, and they come and go with the automounter and the hourly
+    rotation. Measured on Procyon: 30 of the 49 rows of `--all` were
+    `/admin_home/<person>/.snapshot/daily...` and its siblings, and each new
+    hour's copy would have been a `new` root in `dirscape new` and the
+    expired one a `gone`. A row per retained snapshot is eleven rows of one
+    directory at eleven dates, which `_from_snapshot_roots` already declines
+    to produce for a declared snapshot tree; `dirscape recover` reads them,
+    one path at a time, from the mount table itself.
+    """
     for mount in mounts.non_pseudo():
         if not mount.mountpoint or site.is_ignored(mount.mountpoint):
+            continue
+        if inside_snapshot_tree(mount.mountpoint):
             continue
         note = ""
         if mount.unclassified:
@@ -528,7 +687,7 @@ def _from_env(basket, mounts, identity, environ, site, deadline_s):
     home_point = home_mount.mountpoint if home_mount is not None else ""
     home_candidate = basket.get(home)
 
-    for _name, entry_path, _gid, _is_dir in _scandir_one_level(home, deadline_s):
+    for _name, entry_path, _gid, _is_dir, _uid in _scandir_one_level(home, deadline_s):
         info = symlink_info(entry_path)
         if info is None or not info.is_dir:
             continue
@@ -558,10 +717,21 @@ def _from_env(basket, mounts, identity, environ, site, deadline_s):
 
 def _template_roots(mounts, site, roles=TEMPLATE_ROLES):
     # type: (MountTable, Site, Sequence[str]) -> List[str]
-    """Mountpoints worth expanding a name template against."""
+    """Mountpoints worth expanding a name template against.
+
+    Memory filesystems are dropped here as well as ranked down in
+    `_rank_of_mount`. Both roles now arrive from a denylist, so a diskless
+    node whose `/` reports `rootfs` rather than `tmpfs` scores the fallback
+    role `other` and would otherwise have its whole top level scanned.
+    Nobody has an allocation on a tmpfs, so there is nothing to find there.
+    """
     found = []  # type: List[str]
     for mount in mounts.non_pseudo():
         if site.is_ignored(mount.mountpoint):
+            continue
+        if (mount.fstype or "").lower() in _EPHEMERAL_FSTYPES:
+            continue
+        if inside_snapshot_tree(mount.mountpoint):
             continue
         if site.role_for(mount.mountpoint, mount.fstype) in roles:
             if mount.mountpoint not in found:
@@ -579,35 +749,97 @@ def _from_group_template(basket, mounts, identity, site, deadline_s, budget):
 
     Existence-checked, because group membership on its own is a bad predictor.
     Measured on this account: 14 of 21 groups have no storage directory at all.
+
+    **And one level deeper, but only where the flat template found nothing.**
+    A second cluster puts allocations two levels down:
+    `/lus/egret/projects/lanternlab-exampleu` is 29.58T against a 50T project
+    quota, it is the reader's only writable allocation there, and it appeared
+    in no view at all. The flat template looks for
+    `/lus/egret/lanternlab-exampleu`, the dir-owner scan reads one level, and
+    neither reaches two.
+
+    Running it only on the misses is what makes it free. A root whose flat
+    template already produced a directory is a root where allocations live at
+    the first level, so there is nothing below worth listing: on the GPFS
+    cluster `/project` and `/project2` both hit flat, and listing them to
+    learn they have 669 and 892 entries was 0.2s of a run that finishes in
+    three. `NESTED_FANOUT` is the second bound, for a root that misses flat
+    and is still large.
     """
     roots = _template_roots(mounts, site)
     scratch_roots = _template_roots(mounts, site, ("scratch",))
+    # Never a scratch root: a scratch allocation is `<root>/<user>` and the
+    # single stat below already finds it. And never a SECONDARY mount, which
+    # is the plumbing view of a filesystem already visible at its junctions:
+    # descending the six `/gpfs/<cluster>/<tier>` roots here probed 2,688
+    # paths to rediscover directories the `(st_dev, st_ino)` dedupe then
+    # folds away, and cost 0.21s of a three second run to do it.
+    nestable = set()
+    for mount in mounts.non_pseudo():
+        if mount.mountpoint not in _template_roots(mounts, site, PROJECT_LIKE_ROLES):
+            continue
+        rank, _reason = _rank_of_mount(mount, mounts, site)
+        if rank == RANK_PRIMARY:
+            nestable.add(mount.mountpoint)
 
-    candidates = []  # type: List[Tuple[str, str]]
-    for root in roots:
+    def offer(path, why):
+        # type: (str, str) -> bool
+        # Checked per offer and not only per root: one root is every group
+        # alias times every child, which on meadow2 is thousands of `stat`s,
+        # so a per-root check let a single root run the allowance out.
+        if budget is not None and budget.exhausted:
+            return False
+        if site.is_ignored(path):
+            return False
+        if not _is_dir(path, deadline_s):
+            return False
+        basket.add(path, SOURCE_GROUP_TEMPLATE, "matched %s" % (why,))
+        return True
+
+    def aliases():
+        # type: () -> List[Tuple[str, str]]
+        out = []  # type: List[Tuple[str, str]]
         for group in identity.groups:
             for alias in site.group_aliases(group):
-                candidates.append((os.path.join(root, alias), "group %s" % (group,)))
+                out.append((alias, group))
+        return out
+
+    names = aliases()
+    for root in roots:
+        if budget is not None and budget.exhausted:
+            # A speculative candidate that was never established to exist is
+            # dropped rather than recorded as unknown. Recording it would put
+            # a path on the report that nothing has ever seen, which is a
+            # different and worse failure than omitting a guess.
+            return
+        hit = False
+        for alias, group in names:
+            if offer(os.path.join(root, alias), "group %s" % (group,)):
+                hit = True
+        if hit or root not in nestable:
+            continue
+        children = _names_one_level(root, deadline_s)
+        for child in children or ():
+            if budget is not None and budget.exhausted:
+                return
+            for alias, group in names:
+                offer(
+                    os.path.join(root, child, alias),
+                    "group %s, under %s" % (group, child),
+                )
+
     # A per-user directory under each scratch root. One stat, and it is how the
     # 13,907-entry scandir of /scratch/meadow3 is avoided entirely.
     for root in scratch_roots:
+        if budget is not None and budget.exhausted:
+            return
         if identity.user:
-            candidates.append((os.path.join(root, identity.user), "user %s" % (identity.user,)))
+            offer(os.path.join(root, identity.user), "user %s" % (identity.user,))
 
     for path in site.expand_templates(identity.user, identity.groups, identity.cluster):
-        candidates.append((path, "site template"))
-
-    for path, why in candidates:
         if budget is not None and budget.exhausted:
-            # A speculative candidate that was never established to exist is
-            # dropped rather than recorded as unknown. Recording it would put a
-            # path on the report that nothing has ever seen, which is a
-            # different and worse failure than omitting a guess.
             return
-        if site.is_ignored(path):
-            continue
-        if _is_dir(path, deadline_s):
-            basket.add(path, SOURCE_GROUP_TEMPLATE, "matched %s" % (why,))
+        offer(path, "site template")
 
 
 def _from_dir_owner(basket, mounts, identity, site, deadline_s, budget):
@@ -625,16 +857,52 @@ def _from_dir_owner(basket, mounts, identity, site, deadline_s, budget):
     for root in _template_roots(mounts, site, PROJECT_LIKE_ROLES):
         if budget is not None and budget.exhausted:
             return
-        for name, entry_path, gid, is_dir in _scandir_one_level(root, deadline_s):
-            if not is_dir or gid is None or gid not in gids:
-                continue
-            if site.is_ignored(entry_path):
+        matched = [
+            (name, entry_path, gid, uid)
+            for name, entry_path, gid, is_dir, uid in _scandir_one_level(root, deadline_s)
+            if is_dir and gid is not None and gid in gids and not site.is_ignored(entry_path)
+        ]
+        everyones = _default_groups(matched, identity.uid)
+        for name, entry_path, gid, uid in matched:
+            if gid in everyones and uid != identity.uid:
                 continue
             basket.add(
                 entry_path,
                 SOURCE_DIR_OWNER,
                 "directory %s is group-owned by a group you are in" % (name,),
             )
+
+
+#: How many OTHER people's directories one group may own in a single listing
+#: before it is read as their default group rather than as a grant.
+DEFAULT_GROUP_OWNERS = 4
+
+
+def _default_groups(matched, me):
+    # type: (Sequence[Tuple[str, str, int, Optional[int]]], int) -> frozenset
+    """Gids that own everybody's directories here, and so prove nothing.
+
+    Group ownership is evidence of a GRANT only when the group is not
+    everyone's. On ACME every account's primary group is `users` (gid 100),
+    so `/admin_home` there is ninety personal directories, each owned by a
+    different person and every one group-owned by a group this reader is in.
+    They all matched, and `--all` grew ninety rows of other people's homes
+    (sixty-two of them `no access`), with a caveat apiece in `--json`.
+
+    The shape tells the two apart without knowing any group's name. An
+    allocation is one directory per group, owned by root or by its PI: on the
+    GPFS cluster the largest match is two directories of `hpc-staff` under
+    `/project2`, both owned by root. A default group owns one directory per
+    PERSON. So a gid that owns the directories of `DEFAULT_GROUP_OWNERS` or
+    more different people in one listing, root and the reader not counted, is
+    set aside, and only the reader's own directories survive under it.
+    """
+    owners = {}  # type: Dict[int, set]
+    for _name, _path, gid, uid in matched:
+        if uid is None or uid in (0, me):
+            continue
+        owners.setdefault(gid, set()).add(uid)
+    return frozenset(gid for gid, people in owners.items() if len(people) >= DEFAULT_GROUP_OWNERS)
 
 
 def _from_dataset_roots(basket, site, deadline_s, budget):
@@ -647,9 +915,42 @@ def _from_dataset_roots(basket, site, deadline_s, budget):
     for root in getattr(site, "dataset_roots", ()) or ():
         if budget is not None and budget.exhausted:
             return
-        for _name, entry_path, _gid, is_dir in _scandir_one_level(root, deadline_s):
+        for _name, entry_path, _gid, is_dir, _uid in _scandir_one_level(root, deadline_s):
             if is_dir and not site.is_ignored(entry_path):
                 basket.add(entry_path, SOURCE_DATASET_ROOT, "in the shared area %s" % (root,))
+
+
+def _from_snapshot_roots(basket, site, deadline_s, budget):
+    # type: (_Basket, Site, float, Optional[Budget]) -> None
+    """Site-declared snapshot trees, as secondary roots.
+
+    They are reported and never recommended. A snapshot tree is reachable
+    storage the reader can copy out of, so leaving it off `--all` is a lie by
+    omission; it is also read-only and holds no allocation, so putting it in
+    the default table would add a row to the one view whose whole promise is
+    that every row is somewhere you can write.
+
+    Only the declared root itself is offered, not the snapshots inside it.
+    `dirscape recover` enumerates those per path, which is the question a
+    reader actually has, and a row per retained snapshot would be eleven rows
+    of the same directory at eleven dates.
+    """
+    for path in getattr(site, "snapshot_roots", ()) or ():
+        if budget is not None and budget.exhausted:
+            return
+        if not path or site.is_ignored(path):
+            continue
+        if not _is_dir(path, deadline_s):
+            continue
+        candidate = basket.add(
+            path, SOURCE_SNAPSHOT_ROOT, "read-only snapshots of other directories"
+        )
+        if candidate is not None:
+            candidate.rank = RANK_SECONDARY
+            candidate.rank_reason = (
+                "a read-only snapshot tree, so it is somewhere to copy FROM and never "
+                "somewhere to put data; `dirscape recover <path>` reads it"
+            )
 
 
 def _fileset_path_candidates(name, mounts, site):
@@ -807,6 +1108,12 @@ def _build_root(candidate, mounts, site, budget, allow_write):
     root = Root(path, role=site.role_for(path, fstype), device=device, fstype=fstype)
     root.fileset = candidate.fileset
     root.policy = dict(site.policy_for(path))
+    if mount is not None and mount.is_local:
+        # This node's own disk or memory. Recorded so the state layer can
+        # refuse to compare it with a baseline another node took: `/tmp` on
+        # `sylvia-login-01` is not the `/tmp` on `sylvia-login-02`, though the
+        # path, the device name and even `(st_dev, st_ino)` can all agree.
+        root.policy["node_local"] = True
     for source in candidate.sources:
         root.add_source(source)
     for note in candidate.notes:
@@ -889,11 +1196,24 @@ def _build_root(candidate, mounts, site, budget, allow_write):
         # itself without running a command, and it runs none.
         root.policy["crosses_to"] = billed
 
+    rank, rank_reason = candidate.rank, candidate.rank_reason
+    fstype_lower = (fstype or "").lower()
+    if not rank and fstype_lower in _EPHEMERAL_FSTYPES:
+        # A directory INSIDE a memory filesystem, not the mount itself, which
+        # only `_rank_of_mount` sees. Measured on a meadow2 login node, which
+        # is diskless: `/` is a tmpfs, `$TMPDIR` is `/tmp`, and `/tmp` is a
+        # plain directory in it, so it came in through the environment with
+        # no rank and sat in the default table as `local /tmp ? ? ?`.
+        rank = RANK_SECONDARY
+        rank_reason = "inside %s, so it holds no allocation" % (
+            _EPHEMERAL_KIND.get(fstype_lower, "a " + fstype_lower),
+        )
+
     # Always set, so a renderer can switch on it without a default of its own.
-    root.policy["rank"] = candidate.rank or RANK_PRIMARY
-    if candidate.rank_reason:
-        root.policy["rank_reason"] = candidate.rank_reason
-        root.add_note(candidate.rank_reason)
+    root.policy["rank"] = rank or RANK_PRIMARY
+    if rank_reason:
+        root.policy["rank_reason"] = rank_reason
+        root.add_note(rank_reason)
 
     result = probe_reach(path, deadline)
     root.reach = result.state
@@ -901,6 +1221,25 @@ def _build_root(candidate, mounts, site, budget, allow_write):
 
     root.writable = probe_writable(path, allow_write=allow_write, deadline_s=deadline)
     return root
+
+
+#: Of what is left when discovery starts, the share the searching sources
+#: may spend. See `discover`.
+SEARCH_SHARE = 0.5
+
+
+def _probe_priority(candidate):
+    # type: (_Candidate) -> int
+    """Which candidates to probe first when time may run out.
+
+    The environment's own paths (`$HOME`, `$SCRATCH`) and what the searches
+    found, then mountpoints, and the plumbing views of those last.
+    """
+    if SOURCE_ENV in candidate.sources:
+        return 0
+    if candidate.sources != [SOURCE_MOUNTS]:
+        return 1
+    return 3 if candidate.rank == RANK_SECONDARY else 2
 
 
 def _dedupe(roots):
@@ -911,8 +1250,20 @@ def _dedupe(roots):
     where it is not, because an unprobed path has no identity yet and two
     unprobed paths are not evidence of being the same thing.
 
-    Shortest path wins, ties broken lexicographically so the choice is stable
-    across runs. Every collapsed alias is recorded as a note: a user who typed
+    **A path that is its own realpath beats one that is not**, and only then
+    does the shortest win, with ties broken lexicographically so the choice is
+    stable across runs. The symlink test comes first because shortest-path
+    alone picks the wrong name whenever an alias is a symlink into a longer
+    tree, which is not hypothetical: a Cray login node symlinks
+    ``/root_ro/egret`` to ``/lus/egret/projects``, so the reader's allocation
+    was reported as ``/root_ro/egret/lanternlab-exampleu``, 4 characters
+    shorter and inside a read-only OS image, rather than at the path their
+    site documents and their jobs use.
+
+    `os.path.realpath` is called only inside a group that actually collided,
+    so the cost is per duplicate and not per root.
+
+    Every collapsed alias is recorded as a note: a user who typed
     ``/gpfs/meadow3/cap/home`` needs to see that it is the row called ``/home``,
     not to conclude their path is missing.
     """
@@ -923,7 +1274,8 @@ def _dedupe(roots):
 
     kept = []  # type: List[Root]
     for members in groups.values():
-        members = sorted(members, key=lambda r: (len(r.path), r.path))
+        if len(members) > 1:
+            members = sorted(members, key=lambda r: (_is_alias(r.path), len(r.path), r.path))
         keeper = members[0]
         for alias in members[1:]:
             for source in alias.sources:
@@ -937,6 +1289,19 @@ def _dedupe(roots):
                 keeper.fileset = alias.fileset
         kept.append(keeper)
     return kept
+
+
+def _is_alias(path):
+    # type: (str) -> bool
+    """Whether reaching ``path`` went through a symlink. 1 sorts after 0.
+
+    An unreadable path answers "not an alias", which keeps a probe failure
+    from silently demoting the only name a directory has.
+    """
+    try:
+        return 0 if os.path.realpath(path) == path.rstrip("/") or not path else 1
+    except OSError:
+        return 0
 
 
 def _location_matches(location, path):
@@ -1104,12 +1469,26 @@ def discover(
     basket = _Basket()
     _from_mounts(basket, mounts, site)
     _from_env(basket, mounts, identity, environ, site, deadline)
-    _from_group_template(basket, mounts, identity, site, deadline, budget)
-    _from_dir_owner(basket, mounts, identity, site, deadline, budget)
-    _from_dataset_roots(basket, site, deadline, budget)
-    unplaced = _from_quota_filesets(basket, mounts, site, filesets or (), deadline, budget)
+    # **The searching sources get a share, and the probing keeps the rest.**
+    # They are speculative, thousands of `stat`s of names that mostly do not
+    # exist, and on a cold GPFS they can run as long as they are allowed to.
+    # Measured on a meadow2 login node: a slow run spent the whole allowance
+    # searching, every root then came back unprobed, and the table was 48
+    # rows of `?`, the reader's home included.
+    looking = Budget(total_s=budget.remaining * SEARCH_SHARE) if budget is not None else None
+    _from_group_template(basket, mounts, identity, site, deadline, looking)
+    _from_dir_owner(basket, mounts, identity, site, deadline, looking)
+    _from_dataset_roots(basket, site, deadline, looking)
+    _from_snapshot_roots(basket, site, deadline, looking)
+    unplaced = _from_quota_filesets(basket, mounts, site, filesets or (), deadline, looking)
 
-    roots = [_build_root(c, mounts, site, budget, allow_write) for c in basket]
+    # Probed most-wanted first, so a run that does run short loses the
+    # plumbing mounts and not the reader's home. The order of the output is
+    # unaffected: it is sorted by path below.
+    roots = [
+        _build_root(c, mounts, site, budget, allow_write)
+        for c in sorted(basket, key=_probe_priority)
+    ]
     roots = _dedupe(roots)
     roots.extend(_from_allocations(roots, allocations or (), site))
 

@@ -240,6 +240,31 @@ class HPCPlugin(SitePlugin):
             "wrapper_paths": [p for p in _WRAPPER_PATHS if os.path.isfile(p)],
             "extra_bin_dirs": ["/usr/lpp/mmfs/bin", _SITE_BIN],
             "dataset_roots": [p for p in ("/project2/reference",) if os.path.isdir(p)],
+            # `/snapshots` is the only route to this site's GPFS snapshots
+            # that a LOGIN node offers, and nothing in the mount table leads
+            # to it: it is a plain top-level directory belonging to no device.
+            # Declared here rather than in the core because the name is this
+            # site's choice, and existence-checked because the directory is
+            # login-node only and absent on every compute node.
+            #
+            # One entry covers both shapes the site uses. Meadow3 puts the
+            # snapshots straight underneath (`/snapshots/<SNAP>/home/<user>`)
+            # and meadow2 puts one directory per filesystem in between
+            # (`/snapshots/home/<SNAP>/home/<user>`); `SnapshotIndex.containers`
+            # tells them apart by looking at the names.
+            "snapshot_roots": [p for p in ("/snapshots",) if os.path.isdir(p)],
+            # `/collie3` is project space and nothing in the built-in role
+            # heuristics says so: it matches no pattern, so it scored the
+            # fallback role `other` and sorted to the bottom of the table
+            # under that heading. The site's own `quota` command calls it
+            # ">>> Capacity Filesystem: project (Collie3 GPFS mounted at
+            # /collie3)", so `project` is the site's word and not a guess.
+            #
+            # This is a LABEL and it is the whole effect. Discovery stopped
+            # depending on the role when `candidates` moved to a denylist, so
+            # `/collie3/hpc-staff` is found either way; without this it was
+            # found and then filed under "other".
+            "role_globs": [("/collie3", "project"), ("/collie3/*", "project")],
         }
 
     # -- allocations -----------------------------------------------------

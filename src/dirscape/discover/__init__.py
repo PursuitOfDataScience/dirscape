@@ -7,6 +7,7 @@ Five modules, in dependency order:
     access      the os.access probes, each under a deadline
     attribute   which quota scope governs a path
     candidates  the five candidate sources, unioned and deduplicated
+    recover     read-only snapshot copies of a root, if the filesystem keeps any
 
 The whole package is **O(number of roots)**. Nothing here walks a tree: the
 most it ever does is read one level of a directory with `os.scandir`. That
@@ -58,6 +59,7 @@ from .candidates import (
     SOURCE_MOUNTS,
     SOURCE_QUOTA_FILESET,
     SOURCE_RESTATEMENTS,
+    SOURCE_SNAPSHOT_ROOT,
     discover,
     restates_source,
     role_for_path,
@@ -71,9 +73,19 @@ from .mounts import (
     Mount,
     MountTable,
     classify_fstype,
+    inside_snapshot_tree,
+    lustre_filesystem,
     node_class,
     read_mount_table,
     unescape_field,
+)
+from .recover import (
+    SNAPSHOT_CAP,
+    SNAPSHOT_DIRS,
+    SnapshotIndex,
+    copies_for_path,
+    find_snapshots,
+    parse_snapshot_time,
 )
 
 __all__ = [
@@ -83,6 +95,8 @@ __all__ = [
     "read_mount_table",
     "unescape_field",
     "classify_fstype",
+    "inside_snapshot_tree",
+    "lustre_filesystem",
     "node_class",
     "NETWORK_FSTYPES",
     "LOCAL_FSTYPES",
@@ -124,10 +138,18 @@ __all__ = [
     "SOURCE_DIR_OWNER",
     "SOURCE_QUOTA_FILESET",
     "SOURCE_DATASET_ROOT",
+    "SOURCE_SNAPSHOT_ROOT",
     "SOURCE_ALLOCATION",
     "SOURCE_LABELS",
     "SOURCE_RESTATEMENTS",
     "source_label",
+    # recover
+    "copies_for_path",
+    "find_snapshots",
+    "parse_snapshot_time",
+    "SnapshotIndex",
+    "SNAPSHOT_DIRS",
+    "SNAPSHOT_CAP",
     "restates_source",
     "RANK_PRIMARY",
     "RANK_SECONDARY",

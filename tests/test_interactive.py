@@ -229,8 +229,8 @@ def test_nothing_is_erased_when_erase_is_off():
 
 
 def test_the_renderer_is_called_again_on_every_keypress():
-    """Redrawing everything beats patching the changed line: a partial repaint
-    that gets one cell wrong is much harder to notice than a slower redraw.
+    """The whole block is RENDERED on every keypress, so the view cannot drift
+    from the renderer; `repaint` then decides which of its lines to send.
     """
     seen = []
 
@@ -517,3 +517,319 @@ def test_a_frame_taller_than_the_window_is_the_caller_s_problem(monkeypatch):
     assert interactive.window_rows() == 14
     # A 71 line block does not fit, and the caller is expected to notice.
     assert interactive.window_rows() < 71 + 1
+
+
+# --------------------------------------------------------------------------
+# A held arrow: the stride ramp, and the coalescing that makes it safe
+# --------------------------------------------------------------------------
+
+
+def _hold(key, seconds, hz, held=None):
+    """Press ``key`` at ``hz`` for ``seconds``. Returns rows travelled."""
+    held = held or interactive.HeldKey()
+    rows = 0
+    for tick in range(int(seconds * hz)):
+        rows += held.stride(key, tick / float(hz))
+    return rows, held
+
+
+def test_a_tap_moves_exactly_one_row():
+    """The ramp must not take away reading down a list one row at a time."""
+    held = interactive.HeldKey()
+    assert held.stride(Key.DOWN, 0.0) == 1
+    assert held.stride(Key.DOWN, 0.03) == 1
+
+
+def test_nothing_changes_until_the_key_has_been_held():
+    held = interactive.HeldKey()
+    for tick in range(int(interactive.ACCEL_AFTER * 30)):
+        assert held.stride(Key.DOWN, tick / 30.0) == 1
+    assert held.stride(Key.DOWN, interactive.ACCEL_AFTER + 0.01) == interactive.ACCEL_FIRST
+
+
+def test_a_held_key_covers_ground_and_a_tapped_one_never_does():
+    """The distinction `ACCEL_GAP` alone cannot draw.
+
+    A held key repeats at 25-33 Hz on every common setting; a reader pressing
+    deliberately manages three or four a second. Six seconds of each:
+    """
+    holding, _ = _hold(Key.DOWN, 6.0, 30)
+    tapping, _ = _hold(Key.DOWN, 6.0, 4)
+
+    assert holding > 2000, "six seconds of holding should cross a large directory"
+    assert tapping == 24, "a deliberate tapper moves one row per press, for ever"
+
+
+def test_the_ramp_is_capped():
+    """The exponent comes off the wall clock, so a minute must not overflow it."""
+    held = interactive.HeldKey()
+    for tick in range(60 * 30):
+        step = held.stride(Key.DOWN, tick / 30.0)
+    assert step == interactive.ACCEL_MAX
+
+
+def test_reversing_stops_a_run_dead():
+    """How somebody stops after overshooting.
+
+    Speed built up going down is never inherited by the arrow going up, or
+    the correction would fly past the row they were aiming at.
+    """
+    _rows, held = _hold(Key.DOWN, 4.0, 30)
+    assert held.stride(Key.DOWN, 4.0) > 1, "the run was accelerating"
+    assert held.stride(Key.UP, 4.01) == 1
+
+
+def test_letting_go_stops_a_run_dead():
+    _rows, held = _hold(Key.DOWN, 4.0, 30)
+    assert held.stride(Key.DOWN, 4.0 + interactive.ACCEL_GAP + 0.01) == 1
+
+
+def test_any_other_key_ends_the_run():
+    _rows, held = _hold(Key.DOWN, 4.0, 30)
+    assert held.stride(Key.ENTER, 4.0) == 1
+    assert held.stride(Key.DOWN, 4.01) == 1
+
+
+def test_a_tap_wraps_and_a_hold_clamps():
+    """Wrapping is a shortcut when you meant it and an accident when you did not.
+
+    One press off the top meaning "jump to the bottom" is worth keeping. The
+    same wrap arriving two seconds into a hold throws the reader back to the
+    other end of a directory they were reading down.
+    """
+    assert _run([Key.UP, Key.ENTER], count=50)[0] == 49, "a tap still wraps"
+
+    held = interactive.HeldKey()
+    cursor = 3
+    for tick in range(int((interactive.ACCEL_AFTER + 1.0) * 30)):
+        step = held.stride(Key.UP, tick / 30.0)
+        cursor = (cursor - 1) % 50 if step == 1 else max(0, cursor - step)
+    assert cursor == 0, "a held key stops at the end instead of wrapping past it"
+
+
+def test_a_key_already_waiting_is_folded_into_the_same_frame():
+    """Coalescing is what keeps the accelerator from outrunning the repaint.
+
+    This loop redraws the whole block per key. Without folding, a held arrow
+    fills the terminal's input buffer, the cursor keeps flying for a second
+    after the reader lets go, and the list stops where nobody asked.
+
+    Counted at `render`, which runs exactly once per frame. Counting writes
+    would count two per repaint, because `paint` emits the cursor-up erase
+    and the block separately.
+    """
+    drawn = []
+    waiting = [True, True, True, False]
+
+    outcome = select(
+        lambda i: drawn.append(i) or ["row %d" % (i,)],
+        10,
+        keys=_reader([Key.DOWN, Key.DOWN, Key.DOWN, Key.DOWN, Key.ENTER]),
+        write=lambda text: None,
+        raw=False,
+        pending=lambda: waiting.pop(0) if waiting else False,
+    )
+
+    assert outcome == 4, "every key still moved the cursor"
+    assert drawn == [0, 4], "the initial frame, then one for all four moves"
+
+
+def test_coalescing_is_off_when_a_test_drives_the_keys():
+    """`raw=False` means nobody is typing at a file descriptor.
+
+    Asking `select.select` about stdin there answers a question about the
+    wrong thing, so the default must be "nothing is waiting".
+    """
+    drawn = []
+    select(
+        lambda i: drawn.append(i) or ["row %d" % (i,)],
+        10,
+        keys=_reader([Key.DOWN, Key.DOWN, Key.ENTER]),
+        write=lambda text: None,
+        raw=False,
+    )
+    assert drawn == [0, 1, 2], "one frame to start and one per key"
+
+
+# --------------------------------------------------------------------------
+# Repainting without flicker
+# --------------------------------------------------------------------------
+
+
+class _Terminal(object):
+    """A minimal VT100: exactly the sequences `repaint` and `Screen` emit.
+
+    CR, LF (with the tty's ONLCR, so it returns to column 0), cursor up, erase
+    below, and SGR and private modes, which change nothing about the text.
+    Enough to check what a real terminal would SHOW after each write, without
+    a dependency. Writing the last column leaves the cursor pending a wrap, as
+    xterm does, so a frame that relies on that rule is exercised by it.
+    """
+
+    def __init__(self, width=48, height=40):
+        self.width, self.height = width, height
+        self.rows = [[" "] * width for _ in range(height)]
+        self.row = self.col = 0
+        self.pending_wrap = False
+
+    def feed(self, data):
+        import re
+
+        index = 0
+        escape = re.compile(r"\033\[(\??)([0-9;]*)([A-Za-z])")
+        while index < len(data):
+            match = escape.match(data, index)
+            if match:
+                private, params, final = match.groups()
+                if final == "A" and not private:
+                    self.row = max(0, self.row - int(params or "1"))
+                    self.pending_wrap = False
+                elif final == "J" and not private:
+                    self.rows[self.row][self.col :] = [" "] * (self.width - self.col)
+                    for below in range(self.row + 1, self.height):
+                        self.rows[below] = [" "] * self.width
+                index = match.end()
+                continue
+            char = data[index]
+            index += 1
+            if char == "\r":
+                self.col, self.pending_wrap = 0, False
+            elif char == "\n":
+                self.col, self.pending_wrap = 0, False
+                if self.row == self.height - 1:
+                    self.rows = self.rows[1:] + [[" "] * self.width]
+                else:
+                    self.row += 1
+            else:
+                if self.pending_wrap:
+                    raise AssertionError("wrote past the last column")
+                self.rows[self.row][self.col] = char
+                if self.col == self.width - 1:
+                    self.pending_wrap = True
+                else:
+                    self.col += 1
+
+    def text(self):
+        return ["".join(row).rstrip() for row in self.rows]
+
+
+def _frames(seed, width):
+    """Blocks of every shape a browse produces: longer, shorter, wider, styled."""
+    import random
+
+    rng = random.Random(seed)
+    out = []
+    for _ in range(40):
+        lines = []
+        for _row in range(rng.randint(1, 12)):
+            text = "".join(rng.choice("ab #|") for _c in range(rng.randint(0, width)))
+            if rng.random() < 0.3:
+                text = "\033[38;5;61m" + text + "\033[0m"
+            lines.append(text)
+        if out and rng.random() < 0.5:
+            # A highlight move: the same block with one line changed.
+            lines = list(out[-1])
+            lines[rng.randrange(len(lines))] = "\033[7m" + "x" * rng.randint(0, width) + "\033[0m"
+        out.append(lines)
+    return out
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_every_repaint_leaves_exactly_the_new_frame_on_screen(seed):
+    """The property the flicker fix must not trade away: correctness.
+
+    Lines are skipped, padded over and cleared rather than erased and redrawn,
+    so a mistake would leave a stale cell. Every transition between random
+    blocks, including full-width lines ending in the last column, is checked
+    against what a terminal would then display.
+    """
+    from dirscape.render.style import plain
+
+    width = 48
+    term = _Terminal(width=width)
+    term.feed("prompt$ dirscape\n")
+    start = term.row
+    previous = []
+    for frame in _frames(seed, width):
+        term.feed(interactive.repaint(previous, frame))
+        shown = term.text()
+        top = term.row - len(frame)
+        assert top >= 0
+        assert shown[top : term.row] == [plain(line).rstrip() for line in frame]
+        assert all(not line for line in shown[term.row :]), "stale rows below the block"
+        assert top == start or start > top, "the block drifted down the screen"
+        previous = frame
+
+
+def test_a_moved_highlight_rewrites_only_the_two_rows_that_changed():
+    """Measured: 465 KB for 87 arrows in the table before, 43 KB after."""
+    before = ["row %d" % i for i in range(30)]
+    after = list(before)
+    after[3], after[4] = "\033[7mrow 3\033[0m", "row 4 now"
+    data = interactive.repaint(before, after)
+    assert "row 3" in data and "row 4 now" in data
+    assert "row 2" not in data and "row 29" not in data, "unchanged rows must not be resent"
+    assert interactive.repaint(before, before).count("row") == 0
+
+
+def test_nothing_is_erased_before_it_is_replaced():
+    """The flicker: `ESC[<n>A ESC[J` went out, then the frame, in two writes.
+
+    In a 40 x 120 pty, 85 of 261 screen states during a run of arrows showed
+    the table erased. An erase now only ever follows the new content, and only
+    when the block got shorter.
+    """
+    grown = interactive.repaint(["a", "b"], ["c", "d", "e"])
+    assert "\033[J" not in grown
+    shrunk = interactive.repaint(["a", "b", "c"], ["d"])
+    assert shrunk.index("\033[J") > shrunk.index("d")
+    assert grown.startswith(interactive.SYNC_BEGIN) and grown.endswith(interactive.SYNC_END)
+
+
+def test_each_frame_is_one_write():
+    written = []
+    select(
+        lambda i: ["row %d" % n + (" <" if n == i else "") for n in range(5)],
+        5,
+        keys=_reader([Key.DOWN, Key.DOWN, Key.QUIT]),
+        write=written.append,
+        raw=False,
+    )
+    frames = [chunk for chunk in written if chunk.startswith(interactive.SYNC_BEGIN)]
+    assert len(frames) == 3, "one write per frame, first paint and two moves"
+    assert len(written) == 4, "and the erase on the way out"
+
+
+def test_a_shared_screen_is_drawn_over_rather_than_erased_between_views():
+    """Opening a row erased the table and left the screen blank while the
+    listing was read, which for a directory of ten thousand entries shows.
+    """
+    written = []
+    screen = interactive.Screen(write=written.append)
+    opened = select(
+        lambda i: ["table %d" % n for n in range(4)],
+        4,
+        keys=_reader([Key.DOWN, Key.ENTER]),
+        raw=False,
+        screen=screen,
+    )
+    assert opened == 1
+    assert screen.lines, "the table stays on screen for the next view to replace"
+    assert not any(chunk.endswith("\033[J") and "table" not in chunk for chunk in written)
+
+    back = select(
+        lambda i: ["listing"],
+        1,
+        keys=_reader([Key.BACK]),
+        raw=False,
+        screen=screen,
+    )
+    assert back == Key.BACK
+    listing = written[-1]
+    assert listing.startswith(interactive.SYNC_BEGIN + "\r\033[4A"), "drawn over the table"
+    assert listing.index("listing") < listing.index("\033[J"), "then the leftover rows cleared"
+
+    assert (
+        select(lambda i: ["x"], 1, keys=_reader([Key.QUIT]), raw=False, screen=screen) == Key.QUIT
+    )
+    assert written[-1].endswith("\033[J") and screen.lines == [], "quitting erases"

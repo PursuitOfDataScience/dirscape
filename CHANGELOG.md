@@ -7,6 +7,111 @@ All notable changes to `dirscape` are recorded here, newest first, following
 
 ### Added
 
+- **`dirscape recover <path>`: every read-only copy the filesystem still
+  keeps, newest first, with the literal path to each and a `cp` line to
+  restore from.** The path does not have to exist, which is the whole point:
+  a user reaches for this after `rm`, when the live file is gone, no root
+  describes it and no quota scope owns it. The mount table still names the
+  device, the device names the mountpoints, and the snapshot trees are under
+  those.
+- **A held arrow accelerates.** Tap it and the highlight steps one row; hold
+  it and after 1.5 seconds it starts covering ground, 4 rows per press and
+  doubling to 32. `HeldKey` is ported from `slurmpast`'s `_HeldKey`, which
+  the owner named as the reference, with the threshold shortened because the
+  longest thing here is a directory of a few hundred children rather than a
+  29,617-row job history. A deliberate tapper never accelerates: a held key
+  repeats at 25-33 Hz and a reader pressing an arrow manages three or four a
+  second, so the run has to average `ACCEL_MIN_RATE` before the ramp is
+  allowed, tested once when the threshold is crossed and latched both ways.
+  Reversing, letting go, or pressing anything else ends the run, which is how
+  somebody stops after overshooting. The whole ramp is clockless and the
+  caller passes the time, so every point on it is tested without a terminal
+  or a sleeping test.
+
+  **Wrapping now applies to a tap and not to a hold.** One press off the top
+  meaning "jump to the bottom" is a deliberate shortcut worth keeping; the
+  same wrap arriving two seconds into a hold throws the reader back to the
+  other end of a directory they were reading down.
+
+  `select` also folds a keypress that is ALREADY WAITING into the current
+  frame instead of drawing one nobody will see. That is not a refinement, it
+  is what makes the accelerator safe: this loop repaints the whole block per
+  key, so without coalescing a held arrow fills the terminal's input buffer,
+  the cursor keeps flying for a second after the reader lets go, and the list
+  stops where nobody asked. Coalescing bounds the backlog at zero by
+  construction.
+- **`/snapshots`, and any other snapshot tree a site publishes outside its
+  filesystems.** `[snapshots] roots` in `site.conf`, supplied automatically by
+  the HPC plugin where the directory exists. The hidden `.snapshots`,
+  `.snapshot`, `.zfs/snapshot` and `.snap` trees inside a filesystem still
+  need no configuration; this covers the case they cannot reach, and on this
+  site that case is the only route a LOGIN node offers. `/snapshots` is a
+  plain top-level directory belonging to no device, so nothing in the mount
+  table leads to it and `_bases_for`, which works outward from a root's own
+  device, can never arrive there. Owner: "/snapshots is still not shown, even
+  when running it on the login node."
+
+  A declared root is told where the tree is, not what shape it has, because
+  both shapes are in use here and neither is worth making an administrator
+  describe:
+
+      /snapshots/<SNAP>/home/<user>          meadow3: snapshots directly
+      /snapshots/home/<SNAP>/home/<user>     meadow2: one level per filesystem
+
+  `SnapshotIndex.containers` tells them apart by asking whether the entry
+  names parse as snapshot names, and descends exactly one level when they do
+  not, capped at 32 so a root pointed somewhere useless costs one listing.
+
+  The directory itself is a discovery source of its own and is always ranked
+  SECONDARY: it is reachable storage a reader can copy out of, so leaving it
+  off `--all` would be a lie by omission, and it is read-only and holds no
+  allocation, so a row in the default table would break that view's one
+  promise. `dirscape recover <path>` is where it does the work.
+- **Snapshots are now a measured axis on every root**, shown as a `snapshots`
+  line in `dirscape why`, a `snapshot` column in `dirscape matrix`, and
+  `recoverable` plus `snapshots` in `--json`. Three answers, kept apart
+  because conflating any two of them is how somebody loses data: copies were
+  opened (`✓`), the filesystem exposes a snapshot directory and is keeping
+  nothing in it (`✗`), or no snapshot mechanism was found at all (`?`, since a
+  site can back up to tape without exposing one).
+
+  Why this was invisible before: a snapshot directory is not a mount, is owned
+  by root, and matches no group template, so none of the five discovery
+  sources could see one. On the development cluster the documentation also
+  publishes only `/snapshots/<SNAP>/...` and says it is login-node only, while
+  `/gpfs/meadow3/cap/.snapshots/<SNAP>/home/<user>` is readable from a compute
+  node right now. A user in a batch job was being told recovery was impossible
+  when it was one `stat` away.
+
+  Four measurements shaped the implementation and each is recorded in
+  `discover/recover.py`:
+
+  - **A copy can never be a `Root`.** The live `/home/jdoe42` and its copies in
+    three different snapshots all report `dev=54 ino=212501245`, the identical
+    pair that `candidates._dedupe` keys on, so any snapshot offered as a
+    candidate root is silently folded onto the live path and vanishes. Copies
+    are an attribute of a root instead.
+  - **Two path layouts, both probed, neither guessed.** GPFS snapshots a whole
+    filesystem, so the copy of `/home/jdoe42` is at
+    `<fsroot>/.snapshots/<snap>/home/jdoe42`, keyed by absolute path even
+    though `/home` is a junction mounted elsewhere. NetApp and ZFS key
+    relative to the mountpoint. The winning layout is cached per snapshot
+    directory.
+  - **Which mountpoint is the filesystem root cannot be guessed either.**
+    `meadow3_cap` is mounted at `/home`, `/project`, `/programs`, `/software`
+    and `/gpfs/meadow3/cap`; `/home` is the shortest and its `.snapshots` is
+    empty, so a shortest-path rule reports "this filesystem keeps nothing"
+    about a filesystem with eleven snapshots. Every mountpoint of the device
+    is tried and the filesystem answers.
+  - **Timestamps come from the snapshot NAME, never its metadata.** Every
+    directory under `/gpfs/meadow3/cap/.snapshots` stats as
+    `mtime 2021-08-04 05:23:07`, which is the fileset's creation time, so
+    `st_mtime` would date this morning's snapshot and last month's to the same
+    day in 2021.
+
+  Cost: 0.049s for the whole node, because it is a directory read per
+  filesystem and the listings are cached by `(base, snapshot directory)`. Ten
+  roots on one device produce three reads, not thirty.
 - First release. `dirscape` discovers every storage root you can actually reach
   on a cluster and reports what changed since the last run.
 - **Four independent axes per root** rather than one access bit: `allocated`,
@@ -29,6 +134,365 @@ All notable changes to `dirscape` are recorded here, newest first, following
   `gdu` and `ncdu-compare` can consume the output.
 - `--site-template` prints a commented `/etc/dirscape/site.conf` so a site
   administrator can describe a cluster's layout without patching the package.
+
+### Fixed by running on two other clusters
+
+Everything below was found by running this package on ACME Procyon and
+Sylvia, which are Lustre and NetApp where the development cluster is GPFS,
+and whose login nodes run Python 3.6.15 and 3.9.25. **Procyon is the floor
+this package claims**, so it is now a tested claim rather than a stated one.
+On a first run there the reader's only writable allocation was missing, their
+home read `? ? ?`, and `--all` listed sixty frozen copies of other people's
+directories.
+
+- **A user-scoped figure never reached the directory that was the reader's.**
+  `lfs quota` reports against the MOUNT, so the row reads `mount=/home
+  scope=user used=35.7G hard=373G`, while the root a reader cares about is
+  `/home/jdoe42`. Lustre has no fileset and sets no project id on a home
+  directory, so every matching clause came up empty and a home with 35.7 GB
+  in it rendered `? ? ?` beside a `free` figure for the whole 157T
+  filesystem. A user-scoped row now carries down, under two conditions that
+  keep it from being prefix inheritance: USER scope only, and only onto a
+  directory the reader owns or can write. Somebody else's home under the same
+  mount still gets nothing.
+- **An allocation two levels down was invisible.**
+  `/lus/egret/projects/lanternlab-exampleu` is 29.58T against a 50T project
+  quota and is the reader's only writable allocation on that cluster; the
+  flat template looks for `/lus/egret/lanternlab-exampleu` and the dir-owner
+  scan reads one level, so neither reached two. The group template now also
+  tries `<root>/<child>/<group>`, but **only where the flat pass found
+  nothing**, which is what makes it free: a root whose flat template already
+  produced a directory keeps its allocations at the first level, and listing
+  `/project` and `/project2` to learn they hold 669 and 892 entries cost 0.2s
+  of a three second run. Bounded again by `NESTED_FANOUT`, and never run on a
+  scratch root or on a secondary plumbing mount.
+- **A project quota was never asked for.** The quota sweep runs before
+  discovery, because its fileset enumeration is itself a discovery source,
+  and it asks about `/`. That is enough for `mmlsquota`, which lists every
+  fileset the reader holds on a device whatever path named it, and it is not
+  enough for a project quota, which is a property of the DIRECTORY: `lfs
+  project -d /lus/egret` returns 0 while the same command on the allocation
+  returns 13579. Backends now declare `per_path`, and the ones that do are
+  re-asked once with the roots that came back empty.
+- **`lfs quota` capped its path list before filtering it.** Slicing to
+  `MAX_PATHS` first meant a few non-Lustre paths at the front starved the
+  backend completely: the unanswered roots begin `/`, `/admin_home`,
+  `/boot`, so every slot was spent before a Lustre path was reached and the
+  fallback asked about the mounts instead. Filtered first, capped second, and
+  the cap is 8 rather than 3 now that the caller passes real roots.
+- **An exact mount match now outranks a fileset name that disagrees.** Lustre
+  identifies an allocation with a NUMBER and labels its rows with a name:
+  `root.fileset` is `13579` and `row.fileset` is `lanternlab-exampleu`, both
+  correct, and comparing them finds nothing. Guarded by `row.guessed`, which
+  is not optional: a row's mount is sometimes inferred from its fileset name
+  rather than measured, and without the guard this clause handed `/project`
+  the 11T belonging to `/project/hpc`. Caught by a before-and-after control
+  on the GPFS cluster before it shipped.
+- **The wrong scope was displayed when several described one directory.**
+  Three scopes name a Lustre project directory and only one is the
+  allocation: `user 4.1T no limit`, `group 2.7P no limit`, `project 29.5T of
+  55T`. Taking the first row printed `4.1T of none` against a directory whose
+  answer is `30T of 50T`. A row carrying an enforced limit now sorts first,
+  stably, so where nothing is enforced the user-scoped row still leads. And
+  the file count is taken from the SAME scope as the byte figure, which it
+  was not: the row read `30T of 50T` beside `216k`, this reader's file count
+  across the whole filesystem rather than the allocation's 8.2M.
+- **A snapshot could win the quota selection and then govern nothing.**
+  `select_snapshot` chooses on a path prefix while `_rows_governing` is far
+  stricter, so a root fell back to `?` with a better answer unread in the
+  next attempt. That gap is what made the per-path re-ask useless: the
+  sweep's snapshot holds a row for the mount `/lus/egret`, a prefix of the
+  project path, so it won and governed none of it.
+- **Snapshot trees were being offered as places to put data.** On NetApp
+  every retained snapshot is its own NFS mount, so the mount table itself
+  offers them up, and the dir-owner scan then read one level of each. `--all`
+  listed three snapshot mounts and all twenty frozen homes inside each of
+  them: sixty rows of other people's directories, in the view that answers
+  where the reader can put 2 TB. Anything inside a `.snapshot`,
+  `.snapshots`, `.zfs/snapshot` or `.snap` component is ranked secondary and
+  never scanned. The mounts themselves remain in `--all`, correctly labelled,
+  because they are real mounts and `--all` means all.
+- **`dirscape recover` listed every NetApp snapshot twice**, once from the
+  mountpoint and once from the path's own base, because NetApp exposes
+  `.snapshot` inside every directory. Deduplicated by NAME and deliberately
+  not by `(st_dev, st_ino)`, which would collapse eleven genuinely different
+  GPFS dates into one, since GPFS gives every snapshot of a directory the
+  same inode as the live path.
+- **A read-only OS image was searched for allocations, and won the dedupe.**
+  A Cray login node mounts four squashfs images, one of them `/root_ro`, and
+  `/root_ro/egret` is a symlink to `/lus/egret/projects`. So the reader's
+  allocation was reported as `/root_ro/egret/lanternlab-exampleu`: four
+  characters shorter than the real path, which is all "shortest path wins"
+  needed. Two fixes, because either alone leaves the other bug: `squashfs`
+  and `iso9660` join the filesystems nobody holds an allocation on, and the
+  dedupe now prefers a path that is its own `realpath` before it prefers a
+  short one.
+
+### The interactive view stops flickering
+
+- **An arrow no longer blanks the screen.** Every keypress sent
+  `ESC[<n>A ESC[J`, up to the top of the table and erase everything below,
+  and then the new frame, as two separately flushed writes. Whenever the
+  terminal rendered between them, which over ssh and through tmux it often
+  does, the table vanished and came back. Measured in a 40 x 120 pty with a
+  terminal emulator fed every chunk the program wrote, over 12 taps and a
+  2.5 second held arrow, five runs each: before, 172 to 174 of about 260
+  screen states showed a partial table and 83 to 87 showed it gone entirely;
+  after, none of either, in the table and in a listing. `interactive.repaint`
+  now draws each frame over the last in place, rewrites only the lines that
+  changed (a moved highlight is two lines, not thirty: 43 KB instead of
+  465 KB for the same keys), pads a narrower line over its predecessor
+  rather than erasing it, clears rows only after the new frame is drawn, and
+  sends the frame as one write inside a synchronized update (DEC mode 2026),
+  which terminals that support it show atomically and the rest ignore.
+- **Opening a row or stepping back draws over the view instead of after a
+  blank one.** One `interactive.Screen` is shared by the table and every
+  listing, so only quitting erases; the table used to disappear the moment a
+  row was opened and stay gone while the directory was read.
+- **Warnings reach the terminal.** `main` returned straight out of the
+  interactive view, so in a terminal, where somebody is reading, a run that
+  ran out of time showed a table of `?` and never said why. Measured on a
+  meadow2 login node: 48 rows of `?`.
+- **A slow search cannot starve the probes.** The searching sources (name
+  templates, group ownership) may spend half of what is left when discovery
+  starts, checked per `stat` rather than per mount, and roots are probed
+  most-wanted first, so a run that does run short loses plumbing mounts and
+  not the reader's home. That meadow2 run had spent the whole allowance
+  searching and probed nothing.
+
+### Fixed on a second pass across Procyon, Sylvia and meadow2
+
+Run again on ACME Procyon (SLES 15, Python 3.6.15) and Sylvia (RHEL 9,
+Python 3.9.25), and for the first time on HPC meadow2 (RHEL 7, Python 3.6.8,
+pip 9.0.3). The interactive view was driven at a real terminal on both ACME
+machines, and `new` was run from a second Sylvia login node. The suite now
+passes on all three system Pythons and on 3.13, and the wheel installs with
+pip 9, 20, 21 and 26.
+
+- **A figure for a whole filesystem sat on directories that were not the
+  reader's.** `lfs quota -u` covers the filesystem and is printed against
+  whichever path it was asked about, so Procyon showed `/lus/grove read only
+  4.1T none 216k` (the reader's usage across all of Egret, on a clone holding
+  nothing of theirs), Sylvia repeated the home's `36G of 342G` on `/lus/acorn`,
+  and `dirscape map` reported 34T across two roots. User and group rows now
+  carry no fileset, and a filesystem-wide row only lands on a directory the
+  reader owns or can write. The mount basenames that used to label them
+  (`home`, `grove`, `acorn`, `egret`) fed discovery and the stranded check as
+  if they were quota scopes; a project row is now named by its id, the same
+  string `lfs project -d` gives the directory.
+- **Storage in the table was reported as "held with no reachable path".**
+  Sylvia's `--json` listed four such filesets, every one mounted and
+  listable. A fileset whose published row names a reachable root is now
+  reachable, whatever the two tools call it.
+- **Lustre subdirectory mounts are one filesystem.** `/home` is
+  `<nids>:/acorn/home` and `/lus/acorn` is `<nids>:/acorn`; ranking compares
+  `Mount.filesystem`, so `/lus/acorn` is held back as the filesystem root.
+  Device strings are also no longer cut at 128 characters: an eight-NID
+  device lost its `:/acorn` suffix, which merged two mounts into one key.
+- **The cluster key moved every time the tool ran.** Eight state files
+  appeared in four minutes from six runs, because NetApp mounts each snapshot
+  a reader touches and `recover` touches them. The key now hashes
+  `MountTable.fabric()`: no snapshot mounts, an NFS export reduced to its
+  server, a Lustre mount to its filesystem. A GPFS-only cluster keeps the key
+  it had.
+- **Everyone's primary group made everyone's directory a candidate.** Every
+  ACME account's primary group is `users`, so `/admin_home` contributed 75
+  rows to Sylvia's `--all`, most of them `no access`. A gid that owns the
+  directories of four or more other people in one listing is read as a
+  default group; only the reader's own directories survive under it. The
+  largest real match on meadow3 is two root-owned directories.
+- **Mounted snapshots are no longer roots.** This reverses the entry above
+  that kept them in `--all`: they were 30 of 49 rows on Procyon, and with the
+  hourly rotation each would have been `new` in one run and `gone` in the
+  next. `recover` reads them from the mount table, and `why` on a path inside
+  one points there.
+- **A run that ran out of time printed wrong figures, not unknown ones.** The
+  first run of a session on meadow2 needed about 8.5s of budgeted work
+  against an 8s allowance and printed `/project 851M 30G`, a home quota from
+  another cluster, on a directory nobody had probed. Nothing is placed on an
+  unprobed root now, the quota sweep may spend only 60% of the allowance
+  before discovery starts, a cut-short run says so, and the default is 20s.
+- **A walk no longer claims there is no limit.** With the sweep cut short, a
+  walked `/scratch/meadow3/jdoe42` read `22G of none` while GPFS enforces
+  100G. A walked figure says `none` only where the mount table does.
+- **A shared drop like `/tmp` is walked for the reader's files only.**
+  Sylvia's `/tmp` holds 2.0 million entries from every account (`find` needs
+  17.7s) and 159 of the reader's, so the walk gave up and the table showed
+  `? ? ?`; on meadow3 it finished and reported the whole node's `1.2G` under
+  `used`. World-writable is the test, since meadow3-0200's `/tmp` is `777`
+  with no sticky bit. The walk also stops spending its time on other
+  people's group trees (2.5s per meadow2 run on a 149G fileset and a 155T
+  CephFS tree, neither finished) and does local disks first. A meadow2 run
+  went from 5 to 8.6s to 3.6s.
+- **CephFS figures come from CephFS.** A new backend reads `ceph.dir.rbytes`,
+  `ceph.dir.rfiles` and `ceph.quota.*`, with no command at all:
+  `/cfs3/kestrel-lab 155T of 165T` and `/cfs3/hpc-staff 59M of 10G` on
+  meadow2, where both read `? ? ?`. Each quota directory is its own scope, so
+  `tree` no longer groups them under one line with the first one's quota.
+- **A directory inside a memory filesystem is held back.** meadow2 login
+  nodes are diskless: `$TMPDIR` is `/tmp`, a plain directory in a tmpfs `/`,
+  and it sat in the default table as `local /tmp ? ? ?`.
+- **ext2/3/4 mounted without a quota option enforce no limit**, and saying
+  so turned Sylvia's `/tmp` quota from `?` into `none`. Notes on ext4 say
+  `ext4` rather than `XFS`.
+- **`why` follows the path to where it lives.** ACME documents
+  `/egret/<project>`, a symlink, and `why` walked up to `/` and explained the
+  node's system image instead of the reader's 30T project. It also refuses to
+  explain a path on a mount it does not report (`/dev/shm` explained `/`).
+- **`dirscape new` across round-robin login nodes.** NFS and tmpfs number
+  `st_dev` per client, so the second Sylvia login node reported four network
+  roots as "replaced", and node-local roots were compared across two
+  different disks. Across hosts, identity is now the inode alone and a
+  node-local root is not compared (with one line only when it would have
+  differed). `new` also printed an empty box when every change was `gone`.
+- **PBS, LSF and Flux jobs are compute nodes**, as are HPE Cray xnames
+  (`x1234c0s13b0n0`) and `sylvia-gpu-07`. The cluster reads `procyon`, not
+  `procyon-login`.
+- **Restore hints that work.** `recover` suggested `cp -a SNAP DIR` onto a
+  directory that still exists, which nests the copy as `DIR/DIR`; it now
+  suggests `cp -an SNAP/. DIR/`, and copying out to `.` where the tree is
+  read-only. `why` stopped offering to copy a snapshot over ACME's read-only
+  `/soft`, and uses `-n` so a 47-day-old snapshot cannot roll a home back. A
+  declared snapshot tree no longer vouches for `/` (meadow2's `/` claimed 18
+  copies out of `/snapshots/home`).
+- Smaller: `1 copy` in the singular, an overlay is no longer "a memory
+  filesystem", a listing says how many entries it left out and its rule
+  reaches the border, and a warning `new` already printed is not repeated on
+  stderr.
+
+Known: building from the sdist needs Python 3.7 or newer (`setuptools>=64`),
+so Python 3.6 installs from the wheel, which pip prefers anyway.
+
+### Fixed
+
+- **One row of the table could not be reached with the arrow keys.** Owner:
+  "when the highlightor is on the gpfs row and when i press the down arrow,
+  it will skip /software and jump directly to /cfs."
+
+      software   /gpfs/meadow2/perf2/software   read + write   14G   none
+                 /software                      read + write     ?      ?   <- unreachable
+      archive    /cfs/hpc-staff                 read + write     ?      ?
+
+  Nothing was being skipped and the cursor was always right. `_table_frame`
+  locates the band by finding the cursor's path in the rendered text, and it
+  did so with a plain substring search: `/software` occurs inside
+  `/gpfs/meadow2/perf2/software`, which renders one row ABOVE it, so the band
+  was repainted exactly where it already was. To a reader that is a key that
+  did nothing, and the next press moved on.
+
+  Matched on a whole table cell now, which means whitespace or an edge on
+  both sides of the path: the `2` in front of `perf2/software` rejects it,
+  and the real row has a gutter on each side. Locating by text rather than by
+  counting chrome is still right, because the chrome changes with the window;
+  the search just has to be as precise as the thing it is searching for. The
+  path column is `atomic` in this renderer and is never ellipsised, so a
+  whole match is always there to find.
+- **The highlight would not travel to the bottom of a listing.** Owner, ten
+  rows from the end of an 84 item directory: "the highlightor isn't at the
+  bottom when scrolling down, it's somewhere in the middle." The counter said
+  `64 of 84, 52 above, 10 below`, so ten rows were on screen below a band
+  that would not move onto them.
+
+  `_listing` is called afresh on every keypress and handed only the cursor,
+  and it computed the visible slice as `cursor - room // 2`, which pins the
+  highlight to the middle of the window for ever. The window's position is
+  now remembered across repaints by the caller and moved only when the cursor
+  reaches an edge, which is what every list a reader has ever used does: the
+  band walks down to the last visible row, and only then does the list scroll
+  under it. So the bottom row is reachable, the top row is reachable, and a
+  list that fits never scrolls at all.
+- **Six of the eight `?` rows on a login node were figures the tool had
+  already read.** Owner: "why so many `?`? i told you not to have them. why
+  can't you retrieve the numbers?"
+
+      /cfs3/kestrel-lab   read + write   ?   ?   ?        <- what was shown
+      mount=/cfs3  scope=kestrel-lab  used=155T  limit=165T   <- what was read
+
+  `mmlsattr` is a GPFS tool, so every non-GPFS root arrives with no fileset
+  at all, which on a login node is the whole cost-effective storage tier. The
+  only remaining clause then required a row's mount to equal the path
+  exactly, and a row describing `<mount>/<scope>` does not describe
+  `<mount>`. Rows are now also matched when `<row mount>/<row scope>` is
+  exactly the root's path, which names one directory and no other. This
+  replaces the fileset-prefix-stripping clause added earlier in this release:
+  the same join covers `collie3-hpc-staff` against the wrapper's `hpc-staff`
+  without any site needing to configure prefixes, so that code is gone.
+
+  The bare-mount clause is kept, because the wrapper also prints
+  `scratch/meadow3` as the scope of the row whose mount IS
+  `/scratch/meadow3`, where joining the two names nothing. `stat` is what
+  tells the two apart, since the strings cannot: a row whose
+  `<mount>/<scope>` is a real directory is about that directory and must not
+  also be handed to the mount. Without that test `/cfs3` claimed the `155T of
+  165T` belonging to a different group entirely.
+- **The table had no air in it.** Owner: "the vertical spacing is too narrow,
+  especially the column row and the first row." Title, blank, rule, headings,
+  data: five lines of chrome with a gap in only one place, so
+  `kind path access used quota files` sat directly on the rule above it and
+  directly on `/home/jdoe42` below it and the eye had nothing to separate the
+  labels from the figures. One blank line on each side of the heading row.
+  Safe for the interactive view because `_table_frame` locates the highlight
+  by matching the row's path in the rendered text rather than by counting
+  chrome.
+- **A directory you can only read is folded away when its writable subtree is
+  already on screen.** The login node printed 22 rows of which most were
+  unusable, including this:
+
+      archive   /cfs3               read only    155T   165T      ?
+                /cfs3/kestrel-lab   read + write    ?      ?       ?
+                /cfs3/hpc-staff     read + write    ?      ?       ?
+
+  Owner: "/cfs3 i only have 2 dirs that i can access and both of them are
+  listed but why /cfs3 should be shown here?" The parent is a fileset root
+  nobody can write to and its `155T of 165T` is every group's usage on the
+  cluster, not the reader's. `_fold_covered_parents` is the mirror of
+  `_collapse_families`: that one says "if the whole tree is yours, one row
+  says so", this one says "if the tree is not yours but part of it is, the
+  part that is, is the answer". Narrow by three conditions: same device only
+  (`/scratch` holds three clusters' filesystems and folding on path alone
+  would hide two of them), a strict descendant, and never a row carrying a
+  delta or a stranded flag. Folded rows are counted and stay in `--all`.
+  Measured on the login node's root set: 12 rows become 8, and every one that
+  remains is somewhere the reader can write.
+- **`/` was being offered as a place to put data.** On a login node it is a
+  real 312G disk, so `statvfs` and the measuring walk reported on it happily
+  and it landed in the default table as `other  read only  20G  312G  311k`,
+  between a user's project space and their scratch. It is the machine's own
+  filesystem; anywhere under it a user can write is mounted separately and
+  has its own row. Ranked secondary now, but only when another mountpoint
+  exists, because on a single-filesystem machine `/` IS the storage and an
+  empty table is worse than an imprecise one.
+- **An unrecognised mountpoint hid a whole writable allocation.** The
+  dir-owner scan and the name templates were gated on an ALLOWLIST of
+  recognised roles, and a role is an advisory label from a glob heuristic, so
+  the gate quietly meant "storage this heuristic has never heard of does not
+  exist". `/collie3` matches no built-in pattern and scored the fallback role
+  `other`, so nothing ever looked inside it and `/collie3/hpc-staff`
+  (`drwxrws--- root hpc-staff`, writable by this user, 149 GiB against a 1 TiB
+  group quota) appeared in no view at all: not the table, not `--all`, not
+  `--json`.
+
+  The gate is a denylist now, derived from `ROLES` by subtraction so a role
+  added later is scanned by default rather than silently ignored. Every
+  exclusion that remains is a measurement, not a guess: `software` because 713
+  of its 749 entries are group-owned by `hpc-software`; `scratch` and `home`
+  because they hold 13,909 and 13,915 entries and the per-user path is found
+  by one stat instead; `local` because `/tmp` is mode 1777; `dataset` because
+  it has its own unfiltered source. Memory filesystems are dropped before the
+  role is consulted, so a diskless node whose `/` reports `rootfs` does not
+  get its whole top level scanned. Cost of the widening: 0.028s.
+- **One fileset spelled two ways reported `? ? ?` and then spent 1.5s proving
+  it.** `mmlsattr -L /collie3/hpc-staff` names the fileset
+  `collie3-hpc-staff`; the site's own `quota` wrapper prints the same
+  allocation as `hpc-staff`. Exact matching found nothing, so the row showed
+  no figures and the measuring walk burned its whole deadline failing to add
+  up a 149 GiB tree the wrapper had already reported to the byte. Fixed by
+  the `<mount>/<scope>` join described below, which gets there without any
+  site configuring anything.
+- `/collie3` is labelled `project` rather than `other` by the HPC plugin,
+  which is the site's own word for it: its `quota` command prints "Capacity
+  Filesystem: project (Collie3 GPFS mounted at /collie3)". A label only;
+  discovery no longer depends on the role.
 
 ### Fixed during integration
 

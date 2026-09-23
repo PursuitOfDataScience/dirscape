@@ -1476,6 +1476,9 @@ def test_measure_walks_only_the_rows_the_view_shows(tmp_path):
     root.role = "home"
     root.quota = None
     root.writable = confirmed()
+    # The mount table's evidence that no limit exists, as `attribute_xfs` sets
+    # it for a `noquota` mount. The walk does not supply that fact itself.
+    root.policy = {"no_quota_enforced": True}
     secondary = _root(str(other))
     secondary.role = "dataset"
     secondary.quota = None
@@ -1496,6 +1499,34 @@ def test_measure_walks_only_the_rows_the_view_shows(tmp_path):
     # Uncapped, not unmeasured: walking says how much is there and there is no
     # ceiling on a filesystem with no quota system.
     assert render_fields.plain(render_fields.limit_cell(root, Style())) == "none"
+
+
+def test_a_walk_never_claims_there_is_no_limit_on_its_own(tmp_path):
+    """Measured with the quota sweep cut short by `--timeout 1`.
+
+    `/scratch/meadow3/jdoe42` reached the walk because no backend had spoken
+    for it YET, was added up, and rendered `22G of none` while GPFS enforces
+    100G on it. A walk says how much is there; whether a ceiling exists is a
+    different question and, without the mount table's word, stays unknown.
+    """
+    home = tmp_path / "scratch" / "me"
+    home.mkdir(parents=True)
+    (home / "a").write_bytes(b"x" * 4096)
+
+    run = cli.Run()
+    root = _root(str(home))
+    root.role = "scratch"
+    root.quota = None
+    root.writable = confirmed()
+    run.roots = [root]
+
+    cli._measure(run)
+
+    assert root.quota is not None, "the usage is still measured"
+    assert "?" not in render_fields.used_cell(root, Style())[0]
+    assert render_fields.plain(render_fields.limit_cell(root, Style())) == "?", (
+        "no evidence of a missing quota, so the limit must stay unknown"
+    )
 
 
 def test_a_walk_that_runs_out_of_time_leaves_the_unknown_alone(tmp_path):
@@ -2771,3 +2802,584 @@ def test_every_colour_role_survives_all_three_depths():
             painted = Style(color=True, depth=depth).paint(role, "x")
             assert painted.startswith("\033["), "%s at %d bits: %r" % (role, depth, painted)
             assert painted.endswith("x\033[0m"), "%s at %d bits: %r" % (role, depth, painted)
+
+
+# --------------------------------------------------------------------------
+# Snapshots: the recovery answer, in the three views that carry it
+# --------------------------------------------------------------------------
+
+
+def _with_copies(root, names=("daily-2026-09-22.05h30", "daily-2026-09-21.05h30")):
+    from dirscape.discover.recover import parse_snapshot_time
+    from dirscape.model import SnapshotCopy
+
+    root.snapshots = [
+        SnapshotCopy(name, "/fs/.snapshots/%s%s" % (name, root.path), parse_snapshot_time(name))
+        for name in names
+    ]
+    root.recoverable = confirmed("copies found", source="snapshots")
+    return root
+
+
+def test_why_names_the_literal_path_to_the_newest_copy():
+    """A command a reader can paste, not a pointer to another command.
+
+    This is the line the whole feature exists for, and an instruction to "see
+    the snapshot documentation" would be worth nothing at the moment somebody
+    needs it.
+    """
+    run = cli.Run()
+    root = _with_copies(_measured(_root("/project/lab", "project-lab"), inodes=5))
+    root.writable = confirmed()
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
+
+    assert "snapshots" in text
+    assert "2 copies kept" in text
+    assert "/fs/.snapshots/daily-2026-09-22.05h30/project/lab" in text
+    assert "cp -a" in text
+
+
+def test_why_says_gone_rather_than_going_quiet_when_nothing_is_kept():
+    """The scratch case. A durable no is louder than an unknown, not quieter."""
+    run = cli.Run()
+    root = _measured(_root("/scratch/me", "scratch"))
+    root.writable = confirmed()
+    root.recoverable = refuted(
+        VerdictCategory.NOT_PRESENT,
+        "this filesystem exposes a snapshot directory and is keeping nothing "
+        "in it, so a deleted file here is gone",
+        source="snapshots",
+    )
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, _ = cli._why(run, "/scratch/me", resolve_style(color="never", stream=None))
+
+    assert "gone" in text
+    assert "cp -a" not in text, "there is nothing to copy and no command to offer"
+
+
+def test_why_omits_the_snapshot_line_when_snapshots_were_never_checked():
+    """Same rule as every other probe on this screen: silence, not `?`.
+
+    A root replayed from a state file written before this field existed has
+    not been asked, and `snapshots ? (not probed)` is a line of chrome that
+    teaches a reader the marks on this view mean nothing.
+    """
+    run = cli.Run()
+    root = _measured(_root("/project/lab", "project-lab"))
+    root.writable = confirmed()
+    run.roots = [root]
+
+    from dirscape.render import resolve_style
+
+    text, _ = cli._why(run, "/project/lab", resolve_style(color="never", stream=None))
+
+    assert "snapshots" not in text
+    assert "not probed" not in text
+
+
+def test_the_matrix_carries_a_snapshot_column_beside_the_policy_one():
+    """Measured recovery and published policy are different columns.
+
+    On this cluster every home and project row reads `?` for `backup` and a
+    measured `y` for `snapshot`, which is exactly right: nobody wrote a
+    backup policy into a config file, and eleven restorable copies exist
+    regardless. Folding the measurement into the policy column would have
+    made the tool assert a site policy it had never read.
+    """
+    from dirscape.render.matrix import COLUMNS, FROM_POLICY, PROBED, render
+
+    assert "snapshot" in COLUMNS
+    assert "snapshot" in PROBED
+    assert "snapshot" not in FROM_POLICY
+
+    kept = _with_copies(_measured(_root("/project/lab", "project-lab", writable=True)))
+    lost = _measured(_root("/scratch/me", "scratch", writable=True))
+    lost.recoverable = refuted(VerdictCategory.NOT_PRESENT, "nothing kept", source="snapshots")
+
+    style = Style(color=False)
+    text = render([kept, lost], style=style, size=140)
+    lines = {line.split()[0]: line for line in text.splitlines() if line.startswith("/")}
+
+    header = [line for line in text.splitlines() if "snapshot" in line][0]
+    column = header.index("snapshot")
+    assert lines["/project/lab"][column : column + 8].strip() == style.g.ok
+    assert lines["/scratch/me"][column : column + 8].strip() == style.g.bad
+
+
+def test_recover_is_not_spelled_snapshot():
+    """`dirscape snapshot` already records a baseline, and a collision here
+    would let `dirscape snapshot ~/thesis.tex` overwrite one while a user
+    was trying to find a deleted file."""
+    parser = cli.build_parser()
+    args = parser.parse_args(["recover", "/home/me/thesis.tex"])
+    assert args.command == "recover"
+    assert args.path == "/home/me/thesis.tex"
+
+    baseline = parser.parse_args(["snapshot"])
+    assert baseline.command == "snapshot"
+    assert not hasattr(baseline, "path")
+
+
+# --------------------------------------------------------------------------
+# The two spellings of one fileset
+# --------------------------------------------------------------------------
+
+
+def _wrapper_snapshot(fileset, mount, used=100, hard=200):
+    rows = [
+        QuotaRow(fileset, "blocks", "group", used, hard=hard, mount=mount),
+        QuotaRow(fileset, "files", "group", 5, hard=10, mount=mount),
+    ]
+    return QuotaSnapshot("site quota wrapper", rows)
+
+
+def test_a_fileset_spelled_two_ways_is_still_matched():
+    """`mmlsattr` says `collie3-hpc-staff`; the site wrapper says `hpc-staff`.
+
+    Two sources, one allocation, and exact matching found nothing: the row
+    rendered `? ? ?` while the wrapper had already reported 149 GiB against a
+    1 TiB limit, and the measuring walk then burned its whole 1.5s deadline
+    failing to add up the tree by hand. Joining the row's mount to its scope
+    name identifies the directory without anyone configuring a prefix.
+    """
+    root = _root("/collie3/hpc-staff", "collie3-hpc-staff", device="collie3_cap")
+    snap = _wrapper_snapshot("hpc-staff", "/collie3")
+
+    rows = cli._rows_governing(snap, root)
+
+    assert [row.kind for row in rows] == ["blocks", "files"]
+
+
+def test_a_root_with_no_fileset_at_all_is_matched_the_same_way():
+    """`mmlsattr` is a GPFS tool, so every other filesystem arrives blank.
+
+    On a login node that is the whole cost-effective storage tier, and it was
+    six of the eight `?` rows on screen. Owner: "why so many `?`? i told you
+    not to have them. why can't you retrieve the numbers?"
+    """
+    root = _root("/cfs3/kestrel-lab", fileset="", device="cfs3")
+    snap = _wrapper_snapshot("kestrel-lab", "/cfs3", used=170556243700613)
+
+    rows = cli._rows_governing(snap, root)
+
+    assert [row.used for row in rows] == [170556243700613, 5]
+
+
+def test_the_scope_name_cannot_claim_a_sibling_directory():
+    """The exact-path guard, which is what keeps the clause narrow.
+
+    Without it a scope name is a prefix match, and a prefix match is how an
+    integration run once reported five different PIs' directories as each
+    holding 11T.
+    """
+    sibling = _root("/collie3/someone-else", "collie3-someone-else", device="collie3_cap")
+    snap = _wrapper_snapshot("hpc-staff", "/collie3")
+
+    assert cli._rows_governing(snap, sibling) == []
+
+
+def test_a_row_about_a_subdirectory_does_not_also_claim_its_mount(tmp_path):
+    """`/cfs3` was printing `155T of 165T`, which belongs to another group.
+
+    The row says `mount=/cfs3 scope=kestrel-lab`, so it is about
+    `/cfs3/kestrel-lab`. Handing it to `/cfs3` as well is the same
+    misattribution one level up. Settled by a `stat`, because the strings
+    cannot: the wrapper also prints `mount=/scratch/meadow3
+    scope=scratch/meadow3`, where joining the two names nothing and the row
+    really is about the mount.
+    """
+    tier = tmp_path / "cfs3"
+    (tier / "kestrel-lab").mkdir(parents=True)
+
+    parent = _root(str(tier), fileset="", device="cfs3")
+    snap = _wrapper_snapshot("kestrel-lab", str(tier))
+    assert cli._rows_governing(snap, parent) == []
+
+    # The other shape, where the scope is not a directory: the row IS about
+    # the mount and must still be handed to it.
+    scratch = _root(str(tmp_path / "scratch"), fileset="", device="perf")
+    (tmp_path / "scratch").mkdir()
+    mount_row = _wrapper_snapshot("scratch/meadow3", str(tmp_path / "scratch"), used=22)
+    assert [row.used for row in cli._rows_governing(mount_row, scratch)] == [22, 5]
+
+
+def test_an_exact_fileset_match_still_wins_outright():
+    root = _root("/project/hpc", "project-hpc")
+    exact = _wrapper_snapshot("project-hpc", "/project", used=7, hard=8)
+
+    rows = cli._rows_governing(exact, root)
+
+    assert [row.used for row in rows] == [7, 5]
+
+
+# --------------------------------------------------------------------------
+# Trimming: the login node's table was 22 rows, most of them unusable
+# --------------------------------------------------------------------------
+
+
+def _readable(path, device="cfs3"):
+    root = _root(path, device=device)
+    root.writable = refuted(VerdictCategory.ACCESS_DENIED, "no write bit")
+    return root
+
+
+def test_a_read_only_parent_folds_behind_its_writable_children():
+    """`/cfs3` printed `155T of 165T`, which is every group's usage, not yours.
+
+    Owner, looking at it beside the two directories they can actually write
+    to: "/cfs3 i only have 2 dirs that i can access and both of them are
+    listed but why /cfs3 should be shown here?"
+    """
+    parent = _readable("/cfs3")
+    mine = _root("/cfs3/hpc-staff", device="cfs3", writable=True)
+    theirs = _root("/cfs3/kestrel-lab", device="cfs3", writable=True)
+
+    kept, folded = cli._fold_covered_parents([parent, mine, theirs])
+
+    assert [r.path for r in kept] == ["/cfs3/hpc-staff", "/cfs3/kestrel-lab"]
+    assert folded == 1
+
+
+def test_a_read_only_parent_with_no_writable_child_stays():
+    """`/project2/reference` is the answer for a shared collection.
+
+    Nothing inside it is writable, so folding it would remove the only row
+    that names 23T of reference data.
+    """
+    parent = _readable("/project2/reference", device="meadow2_cap")
+    child = _readable("/project2/reference/pdb", device="meadow2_cap")
+
+    kept, folded = cli._fold_covered_parents([parent, child])
+
+    assert [r.path for r in kept] == ["/project2/reference", "/project2/reference/pdb"]
+    assert folded == 0
+
+
+def test_folding_never_crosses_a_device():
+    """`/scratch` is a plain directory holding three clusters' filesystems.
+
+    Folding on the path alone would hide two of them behind the first, which
+    is the trap `_collapse_families` already records.
+    """
+    parent = _readable("/scratch", device="plain")
+    child = _root("/scratch/meadow3/jdoe42", device="meadow3_perf", writable=True)
+
+    kept, folded = cli._fold_covered_parents([parent, child])
+
+    assert len(kept) == 2
+    assert folded == 0
+
+
+def test_a_parent_carrying_its_own_news_is_never_folded():
+    parent = _readable("/cfs3")
+    parent.labels = ["new"]
+    mine = _root("/cfs3/hpc-staff", device="cfs3", writable=True)
+
+    kept, _folded = cli._fold_covered_parents([parent, mine])
+
+    assert "/cfs3" in [r.path for r in kept]
+
+
+def test_the_machine_root_is_not_an_allocation():
+    """`/` came out `other  read only  20G  312G  311k` on a login node.
+
+    It is the OS disk. Anywhere under it a user can write is its own mount
+    with its own row, so nothing is lost by ranking it down.
+    """
+    from dirscape.discover.candidates import RANK_PRIMARY, RANK_SECONDARY, _rank_of_mount
+    from dirscape.discover.mounts import read_mount_table
+    from dirscape.sitecfg import Site
+
+    mounts = read_mount_table(text="rootdev / xfs rw 0 0\ncap /project gpfs rw 0 0\n")
+    slash = [m for m in mounts.non_pseudo() if m.mountpoint == "/"][0]
+    rank, reason = _rank_of_mount(slash, mounts, Site())
+    assert rank == RANK_SECONDARY
+    assert "root of the machine" in reason
+
+    # ...unless it is the only storage there is. An empty table is worse than
+    # an imprecise row.
+    alone = read_mount_table(text="rootdev / xfs rw 0 0\n")
+    only = [m for m in alone.non_pseudo() if m.mountpoint == "/"][0]
+    rank, _reason = _rank_of_mount(only, alone, Site())
+    assert rank == RANK_PRIMARY
+
+
+def test_the_heading_row_has_air_above_and_below_it():
+    """Owner: "the vertical spacing is too narrow, especially the column row
+    and the first row." Five lines of chrome with no gap anywhere in them."""
+    from dirscape.render.atlas import render
+
+    root = _measured(_root("/project/lab", "project-lab", writable=True), inodes=5)
+    text = render([root], style=Style(color=False), size=120, frame=False)
+    lines = [line.rstrip() for line in text.splitlines()]
+
+    heading = next(i for i, line in enumerate(lines) if "kind" in line and "path" in line)
+    first = next(i for i, line in enumerate(lines) if "/project/lab" in line)
+    assert lines[heading - 1] == "", "the heading sits directly on the rule"
+    assert lines[heading + 1] == "", "the heading sits directly on the first row"
+    assert first == heading + 2
+
+
+# --------------------------------------------------------------------------
+# The listing window: the band travels, the list holds
+# --------------------------------------------------------------------------
+
+
+def _walk(count, room, start=0):
+    """Where the window sits as the cursor walks the whole list."""
+    top = cli._window_top(start, count, room, None)
+    seen = []
+    for cursor in range(count):
+        top = cli._window_top(cursor, count, room, top)
+        seen.append((top, cursor - top))
+    return seen
+
+
+def test_the_band_reaches_the_bottom_row():
+    """The bug, in the owner's words: "the highlightor isn't at the bottom
+    when scrolling down, it's somewhere in the middle."
+
+    The counter read `64 of 84, 52 above, 10 below`: ten rows the reader
+    could see, below a band that would not move onto them. The window was
+    recomputed as `cursor - room // 2` on every repaint, which pins the
+    highlight to the middle for ever.
+    """
+    seen = _walk(84, 22)
+
+    assert seen[0] == (0, 0), "the first row is the top row"
+    assert seen[21] == (0, 21), "the band walks down to the last visible row"
+    assert seen[22] == (1, 21), "only then does the list scroll under it"
+    assert seen[83] == (62, 21), "the last row is reachable and is the bottom row"
+    assert all(offset == 21 for _top, offset in seen[21:]), (
+        "the band stays pinned to the bottom edge while the list moves"
+    )
+
+
+def test_the_band_walks_back_up_to_the_top_row():
+    top = 62
+    for cursor in range(83, -1, -1):
+        top = cli._window_top(cursor, 84, 22, top)
+    assert top == 0, "scrolling back up reaches the first row"
+
+
+def test_a_list_that_fits_never_scrolls():
+    assert all(top == 0 for top, _offset in _walk(8, 22))
+
+
+def test_the_first_paint_centres_because_there_is_nothing_to_remember():
+    """`None` means "no remembered position", which is a first paint or a
+    caller with no state. Centring is the right answer there: it shows the
+    rows on both sides of wherever the reader is resuming.
+    """
+    assert cli._window_top(50, 84, 22, None) == 39
+    assert cli._window_top(0, 84, 22, None) == 0
+    assert cli._window_top(83, 84, 22, None) == 62
+
+
+def test_a_remembered_position_out_of_range_is_clamped():
+    """The window shrinks when the terminal does, and the old top survives."""
+    assert cli._window_top(3, 20, 10, 999) == 3
+    assert cli._window_top(3, 20, 10, -5) == 0
+
+
+# --------------------------------------------------------------------------
+# One path is a suffix of another, and the band went to the wrong line
+# --------------------------------------------------------------------------
+
+
+def test_every_row_can_be_highlighted_when_one_path_suffixes_another():
+    """Owner: "when the highlightor is on the gpfs row and when i press the
+    down arrow, it will skip /software and jump directly to /cfs."
+
+    Nothing was being skipped. `/software` is a substring of
+    `/gpfs/meadow2/perf2/software`, which renders one row above it, so a
+    substring search for the cursor's path found the wrong line first and
+    repainted the band where it already was. One row of the table was
+    unreachable with the arrow keys.
+    """
+    from dirscape.render.style import plain
+
+    run = cli.Run()
+    shadowed = _measured(_root("/software", "software", writable=True))
+    shadowing = _measured(_root("/gpfs/meadow2/perf2/software", "sw2", writable=True))
+    other = _measured(_root("/cfs/hpc-staff", "cfs", writable=True))
+    roots = [shadowing, shadowed, other]
+    run.roots = roots
+
+    style = Style(color=False)
+    seen = []
+    for cursor in range(len(roots)):
+        block = cli._table_frame(roots, cursor, run=run, style=style, width=110)
+        banded = [i for i, line in enumerate(block) if "\033[7m" in line]
+        assert len(banded) == 1, "exactly one line is highlighted"
+        seen.append(plain(block[banded[0]]))
+
+    assert cli._whole_path_at(seen[0], "/gpfs/meadow2/perf2/software")
+    assert cli._whole_path_at(seen[1], "/software")
+    assert cli._whole_path_at(seen[2], "/cfs/hpc-staff")
+    assert len(set(seen)) == 3, "three cursor positions must land on three rows"
+
+
+def test_a_shorter_path_never_matches_a_longer_one():
+    assert cli._whole_path_at("   /software   read + write", "/software")
+    assert not cli._whole_path_at("   /gpfs/meadow2/perf2/software   read", "/software")
+    assert not cli._whole_path_at("   /cfs3/kestrel-lab   read", "/cfs")
+    assert not cli._whole_path_at("   /cfs3   read only", "/cfs3/kestrel-lab")
+    assert not cli._whole_path_at("   /software   read", "")
+
+
+# --------------------------------------------------------------------------
+# Found on two other clusters: Lustre, NetApp and a Cray read-only root
+# --------------------------------------------------------------------------
+
+
+def _lustre_rows(mount, path_fileset="lanternlab-exampleu"):
+    """The three scopes `lfs quota` returns for one project directory.
+
+    Measured on an ACME login node. Only the project scope carries a limit;
+    the other two are accounting totals for this reader and this group across
+    the whole filesystem.
+    """
+    return QuotaSnapshot(
+        "lfs quota",
+        [
+            QuotaRow(path_fileset, "blocks", "user", 4480696360960, mount=mount),
+            QuotaRow(path_fileset, "files", "user", 216137, mount=mount),
+            QuotaRow(path_fileset, "blocks", "group", 2723414250631168, mount=mount),
+            QuotaRow(path_fileset, "files", "group", 429696207, mount=mount),
+            QuotaRow(
+                path_fileset, "blocks", "project", 32481673543680, hard=60473139527680, mount=mount
+            ),
+            QuotaRow(path_fileset, "files", "project", 8214545, mount=mount),
+        ],
+    )
+
+
+def test_an_exact_mount_beats_a_fileset_name_that_disagrees():
+    """Lustre names an allocation with a NUMBER and its rows with a name.
+
+        root.fileset = "13579"                  (lfs project -d)
+        row.fileset  = "lanternlab-exampleu"    (lfs quota -p 13579)
+
+    Both identify the same directory, neither is wrong, and comparing them
+    finds nothing. A row whose mount IS this exact path is about this exact
+    path whatever either side calls it.
+    """
+    path = "/lus/egret/projects/lanternlab-exampleu"
+    root = _root(path, fileset="13579", device="egret")
+    rows = cli._rows_governing(_lustre_rows(path), root)
+
+    assert [row.scope for row in rows] == ["user", "user", "group", "group", "project", "project"]
+
+
+def test_a_guessed_mount_may_not_use_that_shortcut():
+    """The guard that keeps the clause above from being RD-3 again.
+
+    A row's mount is sometimes INFERRED from its fileset name rather than
+    measured, and an inferred mount is not evidence of anything. Measured on
+    both sides, which is why the flag is the discriminator and a path
+    comparison is not:
+
+        mmlsquota  fileset='project-hpc'  mount='/project'  guessed=True
+        lfs quota  fileset='lanternlab-'  mount='/lus/.../lanternlab-exampleu'  guessed=False
+
+    Without it, `/project` claimed the 11T belonging to `/project/hpc`.
+    """
+    row = QuotaRow("project-hpc", "blocks", "user", 11 * 1024**4, mount="/project", guessed=True)
+    snap = QuotaSnapshot("mmlsquota", [row])
+    junction = _root("/project", fileset="root", device="meadow3_cap")
+
+    assert cli._rows_governing(snap, junction) == []
+
+
+def test_an_enforced_limit_outranks_an_accounting_total():
+    """Three scopes name one directory and only one of them is the allocation.
+
+    Taking the first row produced `4.1T of none` against a directory whose
+    real answer is `30T of 50T`: a true figure about something else.
+    """
+    rows = _lustre_rows("/lus/egret/projects/lanternlab-exampleu")
+    blocks = [row for row in rows.rows if row.kind == "blocks"]
+
+    ordered = cli._prefer_enforced(blocks)
+
+    assert ordered[0].scope == "project"
+    assert ordered[0].hard == 60473139527680
+
+
+def test_ordering_is_stable_when_nothing_is_enforced():
+    """Then the backend's order survives and the user row stays first, which
+    is the right default: it is the only figure about this reader alone."""
+    rows = [
+        QuotaRow("fs", "blocks", "user", 10, mount="/m"),
+        QuotaRow("fs", "blocks", "group", 20, mount="/m"),
+    ]
+    assert [row.scope for row in cli._prefer_enforced(rows)] == ["user", "group"]
+
+
+def test_bytes_and_files_come_from_one_scope():
+    """A row describes one scope or it describes nothing coherent.
+
+    Bytes came from the project scope and files from the user scope, so the
+    row read `30T of 50T` beside `216k`, which is this reader's file count
+    across the whole filesystem rather than the allocation's 8.2M.
+    """
+    path = "/lus/egret/projects/lanternlab-exampleu"
+    run = cli.Run()
+    root = _root(path, fileset="13579", device="egret", writable=True)
+    run.roots = [root]
+    run.quota_attempts = [_lustre_rows(path)]
+
+    cli._place_rows(run, {}, {}, {}, {})
+
+    assert root.quota.rows[0].scope == "project"
+    assert root.inode_quota.rows[0].scope == "project"
+    assert root.inode_quota.rows[0].used == 8214545
+
+
+def test_the_snapshot_chosen_is_one_that_actually_governs():
+    """`select_snapshot` chooses on a path PREFIX and `_rows_governing` is far
+    stricter, so a snapshot could win the selection and govern nothing.
+
+    That gap made the per-path re-ask useless on Lustre: the sweep's snapshot
+    holds a row for the mount `/lus/egret`, which is a prefix of the project
+    path, so it won and governed none of it while the re-asked snapshot with
+    the project row was never looked at.
+    """
+    path = "/lus/egret/projects/lanternlab-exampleu"
+    root = _root(path, fileset="13579", device="egret")
+    prefix_only = QuotaSnapshot(
+        "lfs quota", [QuotaRow("egret", "blocks", "user", 7, mount="/lus/egret")]
+    )
+
+    snap, rows = cli._governing_snapshot([prefix_only, _lustre_rows(path)], root)
+
+    assert rows, "the second attempt is the one that governs"
+    assert rows[0].mount == path
+
+
+def test_a_user_scoped_row_reaches_the_directory_that_is_yours():
+    """On Lustre nothing else connects the two.
+
+    `lfs quota` reports against the MOUNT, so the row reads `mount=/home
+    scope=user`, while the root a reader cares about is `/home/jdoe42`.
+    There is no fileset and no project id on a home directory, so every other
+    clause came up empty and a home with 35.7 GB in it rendered `? ? ?`.
+    """
+    row = QuotaRow("home", "blocks", "user", 38310621184, hard=400865761280, mount="/home")
+    snap = QuotaSnapshot("lfs quota", [row])
+
+    mine = _root("/home/jdoe42", fileset="", device="acorn", writable=True)
+    assert cli._rows_governing(snap, mine) == [row]
+
+    # ...and only to a directory that IS yours. Somebody else's home under
+    # the same mount must stay `?` rather than inherit this reader's figure.
+    theirs = _root("/home/someone", fileset="", device="acorn")
+    assert cli._rows_governing(snap, theirs) == []

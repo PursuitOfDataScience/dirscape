@@ -27,22 +27,29 @@ Exit codes, so a script can branch on them:
 import argparse
 import contextlib
 import errno
+import json
 import os
 import shutil
+import stat as stat_module
 import sys
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, interactive
 from .discover import (
+    DEFAULT_DEADLINE_S,
     RANK_PRIMARY,
     attribute_all,
+    copies_for_path,
     discover,
+    find_snapshots,
+    inside_snapshot_tree,
     node_class,
     read_identity,
     read_mount_table,
     restates_source,
     source_label,
+    with_deadline,
 )
 from .model import Reach, VerdictCategory, confirmed, refuted, sanitize, unknown
 from .plugins import detect_plugins
@@ -69,11 +76,24 @@ EXIT_USAGE = 1
 EXIT_PATH = 2
 EXIT_NOTHING = 3
 
-#: Total wall-clock allowance for one run. Eight seconds is generous for a tool
-#: that stats tens of paths; it exists so one wedged mount cannot make the
-#: command hang, not as a performance target. Measured on a six-device GPFS
-#: login node: 46 roots in about two seconds including every quota backend.
-DEFAULT_TIMEOUT_S = 8.0
+#: Total wall-clock allowance for one run. It exists so one wedged mount cannot
+#: make the command hang, not as a performance target: a healthy run finishes
+#: in one to four seconds and stops there.
+#:
+#: Eight was not enough, and the way it failed is why this is twenty. Measured
+#: on a meadow2 login node, the first run of a session needed about 8.5s of
+#: budgeted work with cold GPFS caches (4.2s warm), ran out part-way through
+#: discovery, and printed `/project 851M 30G`: a home quota from another
+#: cluster, on a directory nobody had probed. A backstop the healthy case can
+#: reach is not a backstop.
+DEFAULT_TIMEOUT_S = 20.0
+
+#: Of that allowance, the share the quota sweep may spend before discovery
+#: starts. The sweep runs first because its fileset list feeds discovery, and
+#: with no ceiling one slow wrapper could spend the whole run, leaving every
+#: root unprobed. Probing roots is the cheap part and the part everything else
+#: stands on, so it keeps the rest.
+QUOTA_SHARE = 0.6
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
@@ -272,6 +292,13 @@ def build_parser():
 
     why = sub("why", "every probe run on one path, and what each said")
     why.add_argument("path", help="the path to explain")
+
+    # Named `recover` and not `snapshot`, which this tool already spends on
+    # recording its own baseline. Two meanings of one word on one command line
+    # is how `dirscape snapshot ~/thesis.tex` would quietly overwrite a
+    # baseline instead of finding a file.
+    recover = sub("recover", "read-only copies of one path the filesystem still keeps")
+    recover.add_argument("path", help="the path to look for copies of; it need not still exist")
 
     sub("matrix", "roots by capability, as confirmed / refused / could not determine")
     sub("tree", "device, then fileset, then paths, with quota-crossing symlinks marked")
@@ -474,43 +501,181 @@ def _attach_quota(run, budget, runner, measure=False, show_all=False):
             if best is None or len(path) < len(best):
                 bucket[key] = path
 
-    for root in run.roots:
-        if not getattr(root, "path", ""):
-            continue
-        snap = select_snapshot(run.quota_attempts, root.path)
-        if snap is None:
-            continue
-        rows = _rows_governing(snap, root)
-        if not rows:
-            continue
+    _place_rows(run, junction, accessible, owned, writable_only)
 
-        name = getattr(root, "fileset", "") or ""
-        key = (getattr(root, "device", "") or "", name)
-        scopes = {row.scope for row in rows}
-        if name and scopes and scopes <= {"user"}:
-            owner = (
-                accessible.get(key) or owned.get(key) or writable_only.get(key) or junction.get(key)
-            )
-        else:
-            owner = junction.get(key)
-        if name and owner and owner != root.path:
-            # Inside the fileset but not at its junction. Say where the figure
-            # lives rather than repeating it here.
-            root.add_note("quota is a property of fileset %s, reported on %s" % (name, owner))
-            continue
-
-        blocks = [row for row in rows if row.kind == "blocks"]
-        files = [row for row in rows if row.kind == "files"]
-        if blocks:
-            root.quota = _single_row_snapshot(snap, blocks[0])
-        if files:
-            root.inode_quota = _single_row_snapshot(snap, files[0])
+    # **Ask the path-sensitive backends again, now that the roots are known.**
+    #
+    # The sweep above runs BEFORE discovery, because its fileset enumeration
+    # is itself a discovery source, and it asks about `/`. That is enough for
+    # `mmlsquota`, which lists every fileset the reader holds on a device
+    # whatever path named it, and it is not enough for a project quota, which
+    # is a property of the DIRECTORY. Measured: `lfs project -d /lus/egret`
+    # returns 0 and `lfs project -d /lus/egret/projects/lanternlab-exampleu`
+    # returns 13579, so the project scope was never asked and a 29.58T
+    # allocation against a 50T quota rendered `? ? ?`.
+    #
+    # Only backends that declare `per_path`, only the paths that came back
+    # empty, and only once. A root that already has a figure is not re-asked,
+    # so on a GPFS cluster this list is empty and nothing runs.
+    # Skipping a path the sweep already asked about by name. On Lustre that is
+    # every mountpoint, and after `_may_carry` a read-only mount keeps no
+    # figure, so without this each run asked `lfs` the same three questions
+    # about `/home`, `/lus/egret` and `/lus/grove` a second time and threw the
+    # identical answers away again.
+    asked = set()
+    for snap in run.quota_attempts or ():
+        for row in getattr(snap, "rows", None) or ():
+            if getattr(row, "mount", None) and not getattr(row, "guessed", False):
+                asked.add(row.mount.rstrip("/") or "/")
+    unanswered = [
+        r.path
+        for r in run.roots
+        if r.path and r.quota is None and r.reachable and (r.path.rstrip("/") or "/") not in asked
+    ]
+    if unanswered:
+        extra = [b for b in default_backends(run.site) if getattr(b, "per_path", False)]
+        for backend in extra:
+            if budget is not None and getattr(budget, "exhausted", False):
+                break
+            try:
+                snap = backend.read(runner, run.mounts, budget, unanswered)
+            except Exception as exc:
+                run.warnings.append("%s could not be re-asked: %s" % (backend.name, exc))
+                continue
+            if snap is not None and getattr(snap, "rows", None):
+                run.quota_attempts.append(snap)
+        _place_rows(run, junction, accessible, owned, writable_only)
 
     _attach_capacity(run)
     if measure:
         # After the backends and the capacity fallback, so it only ever walks
         # what nothing else could answer for.
         _measure(run, budget, show_all=show_all)
+
+
+def _prefer_enforced(rows):
+    # type: (Sequence[object]) -> List[object]
+    """Rows reordered so one carrying an enforced LIMIT comes first.
+
+    When several scopes all describe the same directory, the one with a limit
+    is the one the reader needs, because it is the one that will stop their
+    job. Measured on a Lustre project directory, where three scopes all name
+    the same path and only one of them is the allocation:
+
+        user     used 4.1T    limit none    <- this reader across the whole filesystem
+        group    used 2.7P    limit none    <- every member of the group, everywhere
+        project  used 29.5T   limit 55T     <- the allocation this directory IS
+
+    Taking the first row produced `4.1T of none` against a directory whose
+    real answer is `29.5T of 55T`: a true figure about something else, which
+    is the failure this module is most careful about everywhere else.
+
+    Stable, so where nothing is enforced the backend's own order survives and
+    the user-scoped row stays first, which is the right default when no
+    figure is a limit: it is the only one that is about this reader alone.
+    """
+    return sorted(rows, key=lambda row: 0 if (row.hard or row.soft) else 1)
+
+
+def _governing_snapshot(attempts, root):
+    # type: (Sequence[object], object) -> Tuple[object, List[object]]
+    """The first attempt that actually GOVERNS this root, and its rows.
+
+    `select_snapshot` chooses on `rows_for_path`, which is a path-prefix
+    test, while `_rows_governing` is far stricter. So a snapshot could win
+    the selection and then govern nothing, and the root fell back to `?` with
+    a better answer sitting unread in the next attempt.
+
+    That gap is what made the per-path re-ask useless on Lustre. The sweep's
+    `lfs quota` snapshot holds a row for the mount `/lus/egret`, which is a
+    prefix of `/lus/egret/projects/lanternlab-exampleu`, so it won the
+    selection for that path and governed none of it; the re-asked snapshot,
+    which had the project row, was never looked at.
+
+    Attempt order is still precision of attribution, and a snapshot that
+    measured something outranks one that merely could not say no, so the
+    OK-category pass runs first.
+    """
+    fallback = (None, [])  # type: Tuple[object, List[object]]
+    for snap in attempts or ():
+        if not getattr(snap, "available", False) or not getattr(snap, "rows", None):
+            continue
+        rows = _rows_governing(snap, root)
+        if not rows:
+            continue
+        if snap.category == VerdictCategory.OK:
+            return snap, rows
+        if fallback[0] is None:
+            fallback = (snap, rows)
+    return fallback
+
+
+def _place_rows(run, junction, accessible, owned, writable_only):
+    # type: (Run, Dict[Tuple[str, str], str], Dict[Tuple[str, str], str], Dict[Tuple[str, str], str], Dict[Tuple[str, str], str]) -> None
+    """Give each root the rows that govern it, on the one root that shows them.
+
+    Split out of `_attach_quota` so it can run a second time after the
+    path-sensitive backends have been re-asked. Idempotent: a root that
+    already carries a figure is left alone.
+    """
+    for root in run.roots:
+        if not getattr(root, "path", ""):
+            continue
+        if root.quota is not None and root.inode_quota is not None:
+            continue
+        present = getattr(root, "present", None)
+        if present is not None and present.category == VerdictCategory.NOT_PROBED:
+            # **Nothing is placed on a directory nobody probed.** Placement
+            # reads ownership and write access, and an unprobed root has
+            # neither, so every rule below falls through to the junction: on a
+            # meadow2 login node whose run ran out of time, `/project` showed
+            # `851M of 30G`, which is a home quota from another cluster, and
+            # `/home` showed the reader's own home figure. Unknown is the
+            # truthful state for a root the run never reached.
+            continue
+        snap, rows = _governing_snapshot(run.quota_attempts, root)
+        if snap is None or not rows:
+            continue
+
+        name = getattr(root, "fileset", "") or ""
+        key = (getattr(root, "device", "") or "", name)
+        scopes = {row.scope for row in rows}
+        if scopes and scopes <= {"user"}:
+            owner = (
+                accessible.get(key) or owned.get(key) or writable_only.get(key) or junction.get(key)
+            )
+        else:
+            owner = junction.get(key)
+        # `name` is no longer required here, and dropping it is what makes a
+        # filesystem with NO fileset concept work at all. On Lustre every root
+        # arrives with `fileset == ""`, so the old guard skipped this whole
+        # step and a user-scoped row would have been repeated on `/home` and
+        # on `/home/jdoe42` alike. The key is still `(device, fileset)`, which
+        # with an empty fileset groups the roots of one filesystem, and that
+        # is exactly the set one user-scoped figure describes.
+        if owner and owner != root.path:
+            # Inside the fileset but not at its junction. Say where the figure
+            # lives rather than repeating it here.
+            root.add_note("quota is a property of fileset %s, reported on %s" % (name, owner))
+            continue
+
+        blocks = _prefer_enforced([row for row in rows if row.kind == "blocks"])
+        files = _prefer_enforced([row for row in rows if row.kind == "files"])
+        # **One row describes ONE scope.** Having chosen a scope for the byte
+        # figure, the file count comes from the same scope or not at all.
+        # Measured on a Lustre project directory where the file counts carry
+        # no limit and the bytes do: bytes came from the project scope and
+        # files from the user scope, so the row read `30T of 50T` beside
+        # `216k`, which is this reader's file count across the whole
+        # filesystem and not the allocation's 8.2M.
+        if blocks:
+            scoped = [row for row in files if row.scope == blocks[0].scope]
+            if scoped:
+                files = scoped
+        if blocks and root.quota is None:
+            root.quota = _single_row_snapshot(snap, blocks[0])
+        if files and root.inode_quota is None:
+            root.inode_quota = _single_row_snapshot(snap, files[0])
 
 
 def _attach_capacity(run):
@@ -668,7 +833,21 @@ def _measure(run, budget=None, show_all=False):
     # is the correct answer rather than a gap: the number does not exist, and
     # the only way to invent one is the tree walk this package refuses.
     shown, _hidden = _visible(run, show_all=False)
-    targets = [root for root in shown if root.quota is None and root.path]
+    targets = []  # type: List[object]
+    for root in shown:
+        if root.quota is not None or not root.path:
+            continue
+        if _worth_walking(root):
+            targets.append(root)
+        else:
+            root.add_note(
+                "not added up: it is a shared directory someone else owns, so a walk would "
+                "count their files, and its filesystem's own records could not be tied to it"
+            )
+    # This node's own disks first: they are the cheapest to read and the roots
+    # most likely to have no quota system at all, so they are the ones a
+    # shortage of time should never cost.
+    targets.sort(key=lambda r: 0 if (r.policy or {}).get("node_local") else 1)
     overall = time.time() + WALK_TOTAL_SECONDS
 
     for root in targets:
@@ -688,7 +867,8 @@ def _measure(run, budget=None, show_all=False):
         # request for work the tool otherwise refuses to do, so it is paid for
         # separately; the per-root ceiling is what stops it running away.
         deadline = min(time.time() + WALK_SECONDS, overall)
-        used, files, complete = _walk(root.path, deadline, WALK_ENTRIES)
+        owner = os.getuid() if _shared_by_everyone(root.path) else None
+        used, files, complete = _walk(root.path, deadline, WALK_ENTRIES, owner=owner)
         root.policy = dict(root.policy or {})
         if not complete:
             root.add_note(
@@ -700,11 +880,17 @@ def _measure(run, budget=None, show_all=False):
         root.policy["walked"] = True
         # `soft=0, hard=0` is the model's way of saying no limit is enforced,
         # as opposed to a limit nobody measured. Walking answers how much is
-        # THERE and says nothing about a ceiling, and on these mounts there is
-        # no ceiling to find: they are the ones with no quota system, which is
-        # why they are being walked. Leaving the limits unset made the cell
-        # fall back to `?` and undid the answer the mount table had already
-        # given two lines earlier.
+        # THERE and says nothing about a ceiling, so "none" is only written
+        # where the mount table has already said no limit exists
+        # (`no_quota_enforced`); leaving it unset there made the cell fall
+        # back to `?` and undid that answer.
+        #
+        # **Everywhere else the limit stays unknown.** A root reaches this walk
+        # when no backend spoke for it, which is not the same as there being
+        # no quota: measured with the quota sweep cut short by `--timeout 1`,
+        # `/scratch/meadow3/jdoe42` was walked and shown as `22G of none`
+        # while GPFS enforces 100G on it.
+        cap = 0 if (root.policy or {}).get("no_quota_enforced") else None
         root.quota = _single_row_snapshot(
             _WalkSource,
             # **No fileset name.** It used to key on `root.path`, which gave
@@ -713,16 +899,73 @@ def _measure(run, budget=None, show_all=False):
             # one `/dev/sda1`, became two nodes with conflicting names and the
             # view fell back to `?` for the device. A walk measures a
             # DIRECTORY, not a quota scope, and saying so is the honest shape.
-            QuotaRow("", "blocks", "user", used, soft=0, hard=0, mount=root.path),
+            QuotaRow("", "blocks", "user", used, soft=cap, hard=cap, mount=root.path),
         )
         root.inode_quota = _single_row_snapshot(
             _WalkSource,
-            QuotaRow("", "files", "user", files, soft=0, hard=0, mount=root.path),
+            QuotaRow("", "files", "user", files, soft=cap, hard=cap, mount=root.path),
         )
-        root.add_note(
-            "no quota system exists here, so these figures were measured by walking the "
-            "directory (%s files), which is what du does" % (render_fields.human_count(files),)
-        )
+        if owner is not None:
+            root.policy["walked_own"] = True
+            root.add_note(
+                "no quota system exists here and everyone on this node shares the directory, "
+                "so these figures count only what you own in it (%s), added up as du "
+                "would" % (_files_phrase(files),)
+            )
+        else:
+            root.add_note(
+                "no quota system exists here, so these figures were measured by walking the "
+                "directory (%s), which is what du does" % (_files_phrase(files),)
+            )
+
+
+def _files_phrase(count):
+    # type: (int) -> str
+    """`1 file`, `12 files`, `3.1k files`: a count with its noun agreeing."""
+    return "%s %s" % (render_fields.human_count(count), "file" if count == 1 else "files")
+
+
+def _worth_walking(root):
+    # type: (object) -> bool
+    """Whether adding a directory up could produce the reader's own figure.
+
+    Three kinds qualify: a directory on this node's own disks, one the reader
+    owns, and a shared drop like `/tmp`, which is walked for the reader's
+    files only. Anything else is somebody else's directory, usually a group
+    allocation on a parallel filesystem, and walking it is both slow and
+    beside the point: measured on a meadow2 login node, the walk spent its
+    whole 2.5s on `/collie3/hpc-staff` and `/cfs3/kestrel-lab`, a 149G GPFS
+    fileset and a 155T CephFS tree, finished neither, and left no time for
+    `/tmp`.
+    """
+    if (root.policy or {}).get("node_local"):
+        return True
+    path = getattr(root, "path", "") or ""
+    return _owned_by_caller(path) or _shared_by_everyone(path)
+
+
+def _shared_by_everyone(path):
+    # type: (str) -> bool
+    """Whether a directory is a shared drop like `/tmp`: anyone may write in it.
+
+    Walking one of these adds up every user's files, which is neither this
+    reader's usage nor, usually, possible. Measured on a Sylvia login node:
+    `/tmp` holds 2.0 million entries from every account on the node and `find`
+    needs 17.7s to count them, so the bounded walk gave up and the default
+    table showed `? ? ?`, while the reader's own share was 159 entries. On the
+    GPFS cluster the same walk finished and reported `1.2G`, which was the
+    whole node's `/tmp` presented under the heading `used`, a column the
+    README promises is YOUR figure.
+
+    World-writable is the test, and the sticky bit is not part of it: this
+    development node's `/tmp` is `drwxrwxrwx`, mode 777 with no sticky bit,
+    and it is every bit as shared as a 1777 one.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    return bool(mode & stat_module.S_IWOTH)
 
 
 class _WalkSource(object):
@@ -744,8 +987,8 @@ class _WalkSource(object):
     figure_note = ""
 
 
-def _walk(top, deadline, ceiling):
-    # type: (str, float, int) -> Tuple[int, int, bool]
+def _walk(top, deadline, ceiling, owner=None):
+    # type: (str, float, int, Optional[int]) -> Tuple[int, int, bool]
     """Bytes charged and files counted under ``top``, or as far as time allowed.
 
     Iterative rather than recursive, so a pathological depth cannot blow the
@@ -754,6 +997,11 @@ def _walk(top, deadline, ceiling):
     followed: they are counted where they point, by whichever root owns that
     storage, and following them here would double-count a home directory whose
     dotfiles live in `/project`.
+
+    ``owner`` narrows the walk to one uid's files, and to directories that uid
+    owns, which is how a shared `/tmp` is measured: see `_shared_by_everyone`.
+    Other people's directories are not entered at all, so the cost is the top
+    level plus the reader's own subtrees rather than the whole node's.
     """
     total = 0
     files = 0
@@ -782,10 +1030,13 @@ def _walk(top, deadline, ceiling):
         for entry in entries:
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    stack.append(entry.path)
+                    if owner is None or entry.stat(follow_symlinks=False).st_uid == owner:
+                        stack.append(entry.path)
                     continue
                 stat = entry.stat(follow_symlinks=False)
             except OSError:
+                continue
+            if owner is not None and stat.st_uid != owner:
                 continue
             # **`st_blocks`, falling back to `st_size` when it is zero.**
             #
@@ -830,28 +1081,263 @@ def _rows_governing(snap, root):
     So the rule is narrow, and it prefers reporting nothing to reporting
     somebody else's bytes:
 
-    * the root's fileset is known and a row names the same fileset  -> use it;
-    * the root's fileset is known and no row names it               -> nothing;
+    * a row names the root's own fileset                            -> use it;
+    * a row names a mount and a scope, and `<mount>/<scope>` is EXACTLY this
+      root's path                                                   -> use it;
+    * the root's fileset is known and no row does either            -> nothing;
     * the root's fileset is unknown and a row's mount is EXACTLY the root's
-      path                                                          -> use it;
+      path, and that row is not really about a directory inside it  -> use it;
     * anything else                                                 -> nothing.
 
     "Nothing" renders as `?`, which is the honest answer for a path whose
     quota this tool could not attribute.
+
+    **The `<mount>/<scope>` clause is what fills in the question marks**, and
+    it needs no configuration at all. A wrapper row says "in the tree mounted
+    HERE, the scope called THIS uses that much", and joining the two names
+    exactly one directory, which is the whole reason it is safe.
+
+    It fixes two shapes that exact fileset matching could not reach, and both
+    were live:
+
+    * **One fileset spelled two ways.** `mmlsattr -L /collie3/hpc-staff` says
+      the fileset is `collie3-hpc-staff` while the wrapper prints the same
+      allocation as `hpc-staff`, under the heading "Capacity Filesystem:
+      project (Collie3 GPFS mounted at /collie3)". The row read `? ? ?` and
+      the measuring walk then spent its whole 1.5s deadline failing to add up
+      a 149 GiB tree the wrapper had already reported to the byte. An earlier
+      fix stripped the site's configured fileset prefixes to match the two
+      names up; this rule gets there without being told any prefixes, so that
+      one is gone.
+    * **No fileset at all.** `mmlsattr` is a GPFS tool, so every non-GPFS
+      root arrives with `fileset == ""`, which on a login node is the entire
+      cost-effective storage tier. Measured, with the wrapper holding every
+      figure the whole time:
+
+          /cfs3/kestrel-lab   read + write   ?   ?   ?     <- what was shown
+          mount=/cfs3  scope=kestrel-lab  used=155T  limit=165T  <- what was read
+
+      Owner: "why so many `?`? i told you not to have them. why can't you
+      retrieve the numbers?" Six of the eight `?` rows on that screen.
+
+    The bare-mount clause below is kept for the rows where the scope is not a
+    directory name: the wrapper prints `scratch/meadow3` as the scope of the
+    row whose mount IS `/scratch/meadow3`, so joining the two gives
+    `/scratch/meadow3/scratch/meadow3`, which is nothing. `_names_a_subdirectory`
+    is what keeps those two cases apart, and it does it with a `stat` because
+    the strings cannot.
     """
     rows = snap.rows_for_path(root.path)
     if not rows:
         return []
 
+    target = root.path.rstrip("/") or "/"
     fileset = getattr(root, "fileset", "") or ""
     if fileset:
         named = [row for row in rows if row.fileset and row.fileset == fileset]
         if named:
             return named
+        named = _named_by_mount_and_scope(rows, root)
+        if named:
+            return named
+        # **An exact mount match outranks a fileset name that did not
+        # agree.** Two filesystems name one allocation two different ways
+        # and neither is wrong: `mmlsattr` and `lfs project` both identify
+        # the directory, but Lustre's identifier is a NUMBER and the row
+        # `lfs quota` prints alongside it carries a name.
+        #
+        #     root.fileset  = "13579"                  (lfs project -d)
+        #     row.fileset   = "lanternlab-exampleu"    (lfs quota -p 13579)
+        #     row.mount     = "/lus/egret/projects/lanternlab-exampleu"
+        #
+        # So the fileset clauses above both miss, and a 29.58T project
+        # allocation against a 50T quota fell through to `_device_wide` and
+        # rendered `? ? ?`. A row whose mount IS this exact path is about
+        # this exact path whatever either side calls it, which is a stronger
+        # signal than a name comparison, not a weaker one.
+        #
+        # **`guessed` is what makes this safe, and leaving it out was a live
+        # regression.** A row's mount is sometimes INFERRED from its fileset
+        # name rather than measured, and an inferred mount is not evidence of
+        # anything. Measured on both sides, which is why the flag is the
+        # right discriminator and a path comparison is not:
+        #
+        #     mmlsquota  fileset='project-hpc'  mount='/project'  guessed=True
+        #     lfs quota  fileset='lanternlab-'  mount='/lus/.../lanternlab-exampleu'  guessed=False
+        #
+        # Without the flag this clause handed `/project` the 11T belonging to
+        # `/project/hpc`, which is rapiDU's RD-3 arriving through a door this
+        # module had already locked twice.
+        exact = [
+            row
+            for row in rows
+            if not row.guessed
+            and (row.mount or "").rstrip("/") == target
+            and not _names_a_subdirectory(row)
+            and _may_carry(row, root)
+        ]
+        if exact:
+            return exact
         return _device_wide(rows, root)
 
-    target = root.path.rstrip("/") or "/"
-    return [row for row in rows if (row.mount or "").rstrip("/") == target]
+    named = _named_by_mount_and_scope(rows, root)
+    if named:
+        return named
+
+    exact = [
+        row
+        for row in rows
+        if (row.mount or "").rstrip("/") == target
+        and not _names_a_subdirectory(row)
+        and _may_carry(row, root)
+    ]
+    if exact:
+        return exact
+
+    # **A user-scoped figure is yours wherever you stand in that filesystem.**
+    # Measured on a Lustre cluster, where nothing else connects the two: `lfs
+    # quota` reports against the MOUNT, so the row reads `mount=/home
+    # scope=user used=35.7G hard=373G`, while the root a reader cares about is
+    # `/home/jdoe42`. Lustre has no fileset to match on and no project id is
+    # set on a home directory, so every clause above came up empty and a home
+    # with 35.7 GB in it rendered `? ? ?` next to a `free` figure for the whole
+    # 157T filesystem.
+    #
+    # **Two conditions, and the second is what keeps this from being prefix
+    # inheritance again.**
+    #
+    # USER scope only: a group or project row describes a shared allocation
+    # and belongs at the top of it, which the clauses above already place. A
+    # user row describes this reader and nobody else.
+    #
+    # And the root has to be THEIRS, by ownership or a confirmed write. That
+    # is the measurable difference between the two cases, and both are live:
+    # `/home/jdoe42` on Lustre is owned by the caller and is where their
+    # 35.7 GB belongs, while `/project/anything` under a `/project` row is
+    # somebody else's directory and must stay `?` rather than inherit a
+    # figure that is true of a different tree. Without the second condition
+    # this is exactly the RD-3 leak the fileset clauses above exist to
+    # prevent, arriving through the one branch that has no fileset to check.
+    #
+    # `_attach_quota` still chooses the single root that displays it, so
+    # `/home` and `/home/jdoe42` cannot both print the same number.
+    if not (_mine(root) and _owned_or_writable(root)):
+        return []
+    return [row for row in rows if row.scope == "user" and _under(target, row.mount)]
+
+
+def _mine(root):
+    # type: (object) -> bool
+    """Whether a write here was confirmed."""
+    verdict = getattr(root, "writable", None)
+    return verdict is not None and verdict.confirmed
+
+
+def _filesystem_wide(row):
+    # type: (object) -> bool
+    """A user or group figure that covers a whole filesystem and no directory.
+
+    Lustre's `lfs quota -u` and `-g` are this shape: one number for the whole
+    filesystem, printed against whichever path it was asked about. The backend
+    marks them by leaving the fileset empty, which no other backend does.
+    """
+    return not (getattr(row, "fileset", "") or "") and getattr(row, "scope", "") in (
+        "user",
+        "group",
+    )
+
+
+def _may_carry(row, root):
+    # type: (object, object) -> bool
+    """Whether a row asked about exactly this path may be shown on it.
+
+    Always, except for a filesystem-wide figure on a directory that is not the
+    reader's. Measured on ACME, where `lfs quota -u` is asked once per Lustre
+    mount and so answers "at" each of them: `/lus/grove`, a read-only clone
+    holding nothing of this reader's, showed `4.1T used` and `216k` files,
+    which is their usage across the whole of Egret, and on Sylvia `/lus/acorn`
+    repeated the home directory's `36G of 342G` in a second row because
+    `/home` is mounted out of it. `dirscape map` then added the 4.1T to the
+    project's 30T and reported 34T across two roots.
+
+    The same figure is right on a directory the reader owns or can write,
+    which is where `_rows_governing` puts it, so nothing is lost: it lands on
+    `/home/jdoe42` instead of on `/home` and `/lus/acorn`.
+    """
+    if not _filesystem_wide(row):
+        return True
+    return _mine(root) and _owned_or_writable(root)
+
+
+def _owned_or_writable(root):
+    # type: (object) -> bool
+    """Confirmed writable AND on the reader's own side of the filesystem.
+
+    Ownership is checked as well as the write bit because a group directory
+    can be writable by everyone in the group, and a user-scoped figure is not
+    theirs collectively. A directory the caller owns outright, or one they
+    can write that nobody else owns either, is as close as this gets.
+    """
+    path = getattr(root, "path", "") or ""
+    return _owned_by_caller(path) or _mine(root)
+
+
+def _under(path, mount):
+    # type: (str, Optional[str]) -> bool
+    """Whether ``path`` sits inside ``mount``. Both may be the same directory."""
+    if not mount:
+        return False
+    mount = mount.rstrip("/")
+    if not mount:
+        return True
+    return path == mount or path.startswith(mount + "/")
+
+
+def _named_by_mount_and_scope(rows, root):
+    # type: (Sequence[object], object) -> List[object]
+    """Rows whose `<mount>/<scope name>` is exactly this root's path.
+
+    A wrapper row says "in the tree mounted HERE, the scope called THIS uses
+    that much", and on this site the scope is very often the name of a
+    directory one level down. Joining the two identifies one path and no
+    other, which is the only reason this is safe to do at all.
+    """
+    target = (getattr(root, "path", "") or "").rstrip("/")
+    if not target:
+        return []
+    out = []  # type: List[object]
+    for row in rows:
+        if not row.mount or not row.fileset:
+            continue
+        if os.path.join(row.mount.rstrip("/"), row.fileset) == target:
+            out.append(row)
+    return out
+
+
+def _names_a_subdirectory(row):
+    # type: (object) -> bool
+    """Whether this row is really about `<mount>/<scope>` rather than `<mount>`.
+
+    Settled by a `stat`, because the strings cannot settle it. Two wrapper
+    rows on one login node, identical in shape and opposite in meaning:
+
+        mount=/cfs3             scope=kestrel-lab     -> /cfs3/kestrel-lab exists
+        mount=/scratch/meadow3  scope=scratch/meadow3 -> that path does not
+
+    So the first row describes a directory inside the mount and must not also
+    be handed to the mount itself, and the second describes the mount and
+    must be. Without the test `/cfs3` claimed the `155T of 165T` belonging to
+    a different group entirely, which is the RD-3 shape one level up.
+    """
+    if not row.mount or not row.fileset:
+        return False
+    joined = os.path.join(row.mount.rstrip("/"), row.fileset)
+    if joined.rstrip("/") == row.mount.rstrip("/"):
+        return False
+    try:
+        return os.path.isdir(joined)
+    except OSError:
+        return False
 
 
 def _device_wide(rows, root):
@@ -942,9 +1428,14 @@ def _mark_stranded(run):
     `project-*` filesets holding about 19 GB with no group to reach them.
     """
     reachable = set()
+    reachable_paths = set()
     for root in run.roots:
-        if getattr(root, "fileset", "") and root.reach in (Reach.LISTABLE, Reach.TRAVERSE):
+        if root.reach not in (Reach.LISTABLE, Reach.TRAVERSE):
+            continue
+        if getattr(root, "fileset", ""):
             reachable.add(root.fileset)
+        if getattr(root, "path", ""):
+            reachable_paths.add(root.path.rstrip("/") or "/")
 
     held = []  # type: List[str]
     for snap in run.quota_attempts:
@@ -952,6 +1443,18 @@ def _mark_stranded(run):
             held.extend(filesets_seen(snap))
         except Exception:
             continue
+        # **A fileset whose own row names a reachable directory is reachable**,
+        # whatever the directory's fileset is called. Two tools can name one
+        # allocation two ways: on ACME `lfs project -d` gives the directory
+        # project `13579` and the quota row is filed under the directory's
+        # name, so the reader's only project was reported as held with no
+        # reachable path while it was the second row of the table. The mount
+        # has to be one the backend PUBLISHED; an inferred one proves nothing.
+        for row in getattr(snap, "rows", None) or ():
+            mount = getattr(row, "mount", None)
+            if row.fileset and mount and not row.guessed:
+                if (mount.rstrip("/") or "/") in reachable_paths:
+                    reachable.add(row.fileset)
 
     stranded = [name for name in held if name and name not in reachable]
     if not stranded:
@@ -1024,9 +1527,11 @@ def sweep(opts, runner=None):
             run.warnings.append("plugin %s could not list allocations: %s" % (plugin.name, exc))
     mark("allocations")
 
-    # Quota FIRST, because its fileset enumeration is a discovery source.
+    # Quota FIRST, because its fileset enumeration is a discovery source, on a
+    # budget of its own so it cannot starve the probes. See `QUOTA_SHARE`.
     backends = default_backends(run.site)
-    run.quota_attempts = read_all(backends, runner, run.mounts, budget, ["/"])
+    quota_budget = Budget(total_s=budget.remaining * QUOTA_SHARE)
+    run.quota_attempts = read_all(backends, runner, run.mounts, quota_budget, ["/"])
     held = []  # type: List[str]
     for snap in run.quota_attempts:
         try:
@@ -1053,6 +1558,17 @@ def sweep(opts, runner=None):
             VerdictCategory.PROBE_TIMEOUT,
             "the run's time allowance ran out before discovery finished",
         )
+        unprobed = sum(
+            1 for r in run.roots if r.path and r.present.category == VerdictCategory.NOT_PROBED
+        )
+        # Said out loud. The table that follows is built from what WAS probed
+        # and is correct as far as it goes, but a reader who is not told it is
+        # partial will take a missing row for a missing directory.
+        run.warnings.append(
+            "the %gs time allowance ran out before every directory was checked, so %d "
+            "went unprobed and are left out; run again, or pass --timeout %d"
+            % (budget.total_s, unprobed, int(budget.total_s * 2))
+        )
     else:
         run.discovery = confirmed("discovery swept every candidate", source="discover")
     mark("discover")
@@ -1060,6 +1576,19 @@ def sweep(opts, runner=None):
     attribute_all(run.roots, runner, run.mounts, budget, run.site)
     _label_allocations(run)
     mark("attribute")
+
+    # After attribution, because `_bases_for` picks the filesystem root out of
+    # the mount table by DEVICE and the device is set by then, and before the
+    # quota sweep, because this costs a directory read per filesystem (0.028s
+    # for every snapshot tree on this node) while the quota backends are the
+    # part that can actually exhaust the budget.
+    find_snapshots(
+        run.roots,
+        run.mounts,
+        budget,
+        snapshot_roots=getattr(run.site, "snapshot_roots", ()) or (),
+    )
+    mark("snapshots")
 
     _attach_quota(
         run,
@@ -1366,6 +1895,68 @@ def _ancestors(path):
         current = parent
 
 
+def _fold_covered_parents(roots):
+    # type: (List[object]) -> Tuple[List[object], int]
+    """Drop a read-only root whose writable subtree is already on screen.
+
+    The mirror of `_collapse_families`, which folds the other way. That one
+    says "if the whole tree is yours, one row says so"; this one says "if the
+    tree is NOT yours but part of it is, the part that is, is the answer".
+    Measured on a login node, where the omission was loud:
+
+        archive   /cfs3               read only    155T   165T      ?
+                  /cfs3/kestrel-lab   read + write    ?      ?       ?
+                  /cfs3/hpc-staff     read + write    ?      ?       ?
+
+    Owner: "/cfs3 i only have 2 dirs that i can access and both of them are
+    listed but why /cfs3 should be shown here?" The parent is a fileset root
+    nobody can write to, and its `155T of 165T` is the whole tier's usage
+    across every group on the cluster, not this reader's. Same shape on
+    `/cfs4`, `/shared`, `/collie3`, `/home` and `/project`.
+
+    Three things keep it narrow:
+
+    * **Same device only.** `/scratch` is a plain directory holding three
+      clusters' filesystems, so a rule folding on path alone would hide two of
+      them behind the first. That is the trap `_collapse_families` records and
+      it applies identically here.
+    * **A descendant, strictly.** The parent is only silent because something
+      inside it speaks.
+    * **Nothing that carries a delta or a stranded flag is folded**, because
+      those are facts about the parent that no child restates.
+
+    A folded row is counted and stays in `--all`, like every other row this
+    view holds back. Nothing is discarded.
+    """
+    paths = [(root, (getattr(root, "path", "") or "").rstrip("/")) for root in roots]
+
+    def writable(root):
+        # type: (object) -> bool
+        verdict = getattr(root, "writable", None)
+        return verdict is not None and verdict.confirmed
+
+    kept = []  # type: List[object]
+    folded = 0
+    for root, path in paths:
+        speaks = getattr(root, "labels", None) or getattr(root, "stranded", False)
+        if not path or writable(root) or speaks:
+            kept.append(root)
+            continue
+        device = getattr(root, "device", "")
+        covered = any(
+            other is not root
+            and other_path.startswith(path + "/")
+            and getattr(other, "device", "") == device
+            and writable(other)
+            for other, other_path in paths
+        )
+        if covered:
+            folded += 1
+            continue
+        kept.append(root)
+    return kept, folded
+
+
 def _visible(run, show_all):
     # type: (Run, bool) -> Tuple[List[object], int]
     """The rows to render, and how many were held back.
@@ -1386,6 +1977,8 @@ def _visible(run, show_all):
     # tmpfs through as somewhere to put data.
     primary = [r for r in run.roots if (r.policy or {}).get("rank", RANK_PRIMARY) == RANK_PRIMARY]
     kept, folded = _collapse_families(primary)
+    kept, covered = _fold_covered_parents(kept)
+    folded += covered
     speaking = [r for r in kept if _says_something(r)]
 
     if not speaking:
@@ -1610,6 +2203,39 @@ def _keeping_phrase(root, site):
     return "; ".join(parts)
 
 
+def _snapshot_phrase(root, now=None):
+    # type: (object, Optional[float]) -> str
+    """Whether a copy of this path can be read back, in one line.
+
+    Separate from `_keeping_phrase` and deliberately so. That one reports what
+    the SITE PUBLISHED about backups; this one reports what was MEASURED on
+    the filesystem a moment ago. They can disagree, and when they do the
+    disagreement is the useful part: a site that has published nothing can
+    still be keeping eleven snapshots you could restore from this afternoon.
+    """
+    verdict = getattr(root, "recoverable", None)
+    copies = list(getattr(root, "snapshots", None) or [])
+    if verdict is None or verdict.category == VerdictCategory.NOT_PROBED:
+        # Empty, and the caller omits the whole line. A probe that never ran
+        # has said nothing, and `? (not probed)` is a row of chrome that
+        # teaches a reader the marks on this screen mean nothing. Same rule
+        # the allocation line follows two fields up.
+        return ""
+    if copies:
+        newest = copies[0]
+        when = render_fields.age_phrase(newest.taken_at, now or time.time())
+        if when == render_fields.UNKNOWN:
+            when = newest.name
+        return "%d %s kept, newest %s" % (
+            len(copies),
+            "copy" if len(copies) == 1 else "copies",
+            when,
+        )
+    if verdict.refuted:
+        return verdict.reason or "none kept"
+    return "%s (%s)" % (render_fields.UNKNOWN, verdict.reason or verdict.label)
+
+
 def _findings(root, style, axes=("mounted", "present", "allocated")):
     # type: (object, object, Sequence[str]) -> List[Tuple[str, str]]
     """One (glyph, sentence) per axis with something to say.
@@ -1767,8 +2393,18 @@ def _quota_source(root):
 
     fileset = getattr(row, "fileset", "") or ""
     device = getattr(row, "device", "") or ""
-    if fileset and device and fileset != device:
-        where = "%s on %s" % (fileset, device)
+    if _filesystem_wide(row) and device:
+        # A Lustre user or group figure: no scope name to give, and the device
+        # column is only the path `lfs` was asked about. What it IS matters
+        # more, because it is the whole filesystem and not this directory.
+        where = "your %s quota on the filesystem at %s" % (row.scope, device)
+    elif fileset and device and fileset != device:
+        # A Lustre or XFS project is named by a number, and `13579 on ...`
+        # reads as a figure rather than as the name of a quota.
+        name = (
+            "project %s" % (fileset,) if row.scope == "project" and fileset.isdigit() else fileset
+        )
+        where = "%s on %s" % (name, device)
     elif fileset or device:
         # One name, and it is the name of a QUOTA. Calling it the filesystem
         # would be a claim about which of the two the backend answered for,
@@ -1897,6 +2533,23 @@ def _common_dir(paths):
     return "/" + "/".join(shared) if shared else sorted(paths)[0]
 
 
+def _resolved(path):
+    # type: (str) -> str
+    """``realpath`` of an existing path when it differs, else "".
+
+    Under a deadline, because resolving a symlink into a wedged mount blocks
+    exactly as a `stat` does, and `why` is often run on the path that is
+    misbehaving.
+    """
+    finished, value, exc, _elapsed = with_deadline(
+        lambda: os.path.realpath(path) if os.path.exists(path) else "", DEFAULT_DEADLINE_S
+    )
+    if not finished or exc is not None or not value:
+        return ""
+    value = str(value)
+    return value if value != path else ""
+
+
 def _why(run, path, style, size=None, verbose=False):
     # type: (Run, str, object, Optional[int], bool) -> Tuple[str, int]
     """One path, explained in a screen you can read.
@@ -1943,13 +2596,50 @@ def _why(run, path, style, size=None, verbose=False):
                 location = str((root.policy or {}).get("allocation_location") or "")
                 if location and location.strip("/") == typed:
                     return _why_allocation(root, style, size), EXIT_OK
+    # **Where the path really is, when that differs from how it was typed.**
+    # ACME documents project space as `/egret/<project>`, and `/egret` is a
+    # symlink to `/lus/egret/projects`. Matched as typed, `why
+    # /egret/lanternlab-exampleu` walked up to `/`, the overlay the login node
+    # boots from, and explained that instead: `read only`, `used ?`, "holds no
+    # allocation", about the reader's 30T project. The quota that governs a
+    # path is the one where its bytes live, so the resolved path decides.
+    resolved = ""
+    if match is None:
+        resolved = _resolved(target)
+        if resolved:
+            for root in run.roots:
+                if getattr(root, "path", "") == resolved:
+                    match = root
+                    break
+    basis = resolved or target
     if match is None:
         best = ""
         for root in run.roots:
             candidate = getattr(root, "path", "")
-            if candidate and target.startswith(candidate.rstrip("/") + "/"):
+            if candidate and basis.startswith(candidate.rstrip("/") + "/"):
                 if len(candidate) > len(best):
                     best, match = candidate, root
+
+    if match is not None and match.path != basis and os.path.exists(basis):
+        # An enclosing root on ANOTHER filesystem does not govern this path.
+        # `/dev/shm` is its own tmpfs, which discovery leaves out as kernel
+        # plumbing, and the walk up from it reached `/` and printed `/`'s
+        # figures as the answer. Saying which mount it is on is the truth.
+        here = run.mounts.enclosing_mount(basis) if run.mounts is not None else None
+        there = run.mounts.enclosing_mount(match.path) if run.mounts is not None else None
+        if here is not None and there is not None and here.mountpoint != there.mountpoint:
+            if inside_snapshot_tree(here.mountpoint):
+                return (
+                    "%s is inside a read-only snapshot mounted at %s.\n\n"
+                    "Copy out of it, never into it: `dirscape recover <path>` lists every\n"
+                    "copy of a path and the command to restore one." % (shown, here.mountpoint),
+                    EXIT_PATH,
+                )
+            return (
+                "%s is on the %s mount at %s, which dirscape does not list as storage,\n"
+                "so no root it reports covers this path." % (shown, here.fstype, here.mountpoint),
+                EXIT_PATH,
+            )
 
     if match is not None and match.path != target and not os.path.exists(target):
         # Only when we FELL BACK to an enclosing root. The fallback is right
@@ -1981,9 +2671,15 @@ def _why(run, path, style, size=None, verbose=False):
     room = _room(style, size)
     out = []  # type: List[str]
     out.append(style.head(match.path))
-    if match.path != target:
+    if resolved and resolved != target:
+        out.extend(_prose(style, room, "%s leads here, to %s" % (shown, sanitize(resolved))))
+    if match.path != basis:
         out.extend(
-            _prose(style, room, "the nearest directory dirscape knows about, above %s" % (shown,))
+            _prose(
+                style,
+                room,
+                "the nearest directory dirscape knows about, above %s" % (sanitize(basis),),
+            )
         )
     kind = _kind_phrase(match)
     if kind:
@@ -2025,6 +2721,31 @@ def _why(run, path, style, size=None, verbose=False):
     #    would use and it is doing work.
     out.extend(_field(style, room, "access", _access_phrase(match)))
     out.extend(_field(style, room, "backups", _keeping_phrase(match, run.site)))
+    # Measured, and the one line on this screen that decides whether a lost
+    # file is recoverable, so it names the literal path rather than a command
+    # to go and find it.
+    snapshots = _snapshot_phrase(match)
+    if snapshots:
+        out.extend(_field(style, room, "snapshots", snapshots))
+    newest = (getattr(match, "snapshots", None) or [None])[0]
+    if newest is not None and _mine(match):
+        # Only where the reader can write. On ACME `/soft` keeps NetApp
+        # snapshots and is read-only to users, and the line told them to
+        # `cp -a` a snapshot over the live software tree, which cannot work
+        # and would be a bad idea if it could.
+        #
+        # And `-n`, so it puts back what is missing without rolling anything
+        # back. Without it the line copied the whole snapshot over the live
+        # directory: on meadow2 the newest home snapshot is 47 days old, and
+        # running it would have replaced every file edited since.
+        out.extend(
+            _field(
+                style,
+                room,
+                "restore",
+                "cp -an %s/. %s/" % (newest.path.rstrip("/"), match.path.rstrip("/")),
+            )
+        )
 
     # Why `used` is a question mark, in the one case where it always is.
     #
@@ -2038,15 +2759,19 @@ def _why(run, path, style, size=None, verbose=False):
     # line, and only on the rows that have it.
     row, _how, _reason = render_fields.pick_row(getattr(match, "quota", None), match.path, "blocks")
     if row is None and (match.policy or {}).get("free_bytes") is not None:
-        out.extend(
-            _field(
-                style,
-                room,
-                "note",
-                "no quota is enforced here, so nothing is counting your usage, and "
-                "this directory was too large to add up quickly.",
-            )
-        )
+        # Each half only when it was established. This used to be one fixed
+        # sentence, and it told a reader that `/soft` on ACME enforces no quota
+        # and was too large to add up, when nothing had asked either question:
+        # an NFS tree nobody walked, on a server nobody queried.
+        enforced_none = bool((match.policy or {}).get("no_quota_enforced"))
+        too_big = any("too large to add up" in note for note in match.notes)
+        if enforced_none:
+            said = "no quota is enforced here, so nothing is counting your usage"
+        else:
+            said = "no quota system reported a figure for this directory"
+        if too_big:
+            said += ", and it was too large to add up quickly"
+        out.extend(_field(style, room, "note", said + "."))
 
     # 3. The one piece of provenance that is a fact about the STORAGE rather
     #    than about dirscape, so it stays in the default view.
@@ -2191,6 +2916,93 @@ def _elsewhere(run):
     return "\n".join(out)
 
 
+def _recover(run, target, style, size=None, as_json=False):
+    # type: (Run, str, object, Optional[int], bool) -> Tuple[str, int]
+    """Every readable copy of one path, newest first.
+
+    The only view in this tool that does NOT require its subject to be a
+    discovered root, and the only one whose subject is usually gone. Nothing
+    here consults `run.roots`: a deleted file has no root, no fileset and no
+    quota scope, and refusing to answer until discovery has heard of it would
+    make the command useless in exactly the moment it is wanted. The mount
+    table is enough.
+    """
+    path = os.path.abspath(os.path.expanduser(target))
+    shown = sanitize(path, limit=4096)
+    copies, verdict = copies_for_path(
+        path,
+        run.mounts,
+        snapshot_roots=getattr(run.site, "snapshot_roots", ()) or (),
+    )
+
+    if as_json:
+        return (
+            json.dumps(
+                {
+                    "path": path,
+                    "exists_now": os.path.lexists(path),
+                    "recoverable": verdict.to_json(),
+                    "copies": [copy.to_json() for copy in copies],
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            EXIT_OK,
+        )
+
+    room = _room(style, size)
+    out = [style.head(shown)]
+    if not os.path.lexists(path):
+        out.extend(_prose(style, room, "nothing is at this path now"))
+    out.append("")
+
+    if not copies:
+        out.extend(_prose(style, room, verdict.reason or verdict.label, indent="  "))
+        out.append("")
+        if verdict.refuted:
+            # A durable no about recovery is the single most expensive fact
+            # in this tool to get wrong in the reassuring direction, so it is
+            # said in the words a person would use.
+            out.append(style.bad("  There is no copy of this to restore."))
+        else:
+            out.append(style.dim('  That is not the same as "there is no backup": ask the site.'))
+        return "\n".join(out), EXIT_PATH if verdict.refuted else EXIT_OK
+
+    now = time.time()
+    width = max(len(copy.name) for copy in copies)
+    out.append(
+        "  %d cop%s, newest first. They are READ ONLY: copy out, never edit in place."
+        % (len(copies), "y" if len(copies) == 1 else "ies")
+    )
+    out.append("")
+    for copy in copies:
+        age = render_fields.age_phrase(copy.taken_at, now)
+        out.append(
+            "  %s  %s  %s"
+            % (style.text(copy.name.ljust(width)), style.dim(age.rjust(12)), copy.path)
+        )
+    out.append("")
+    newest = copies[0].path
+    exists = os.path.isdir(path)
+    parent = path if exists else (os.path.dirname(path.rstrip("/")) or "/")
+    if not os.access(parent, os.W_OK):
+        # Read-only to this reader (ACME's `/soft`, say), so restoring in place
+        # cannot work: the useful command copies it out to where they are.
+        out.append(style.dim("  %s is read-only to you, so copy the newest out with" % (parent,)))
+        out.append("  cp -a %s ." % (newest,))
+    elif exists:
+        # The directory is still there. `cp -a SNAP DIR` would nest the copy
+        # inside it as DIR/<name>, and a plain `SNAP/. DIR/` would overwrite
+        # every file changed since the snapshot; `-n` puts back only what is
+        # missing, which is what a partial loss needs.
+        out.append(style.dim("  put back what is missing, leaving newer files alone, with"))
+        out.append("  cp -an %s/. %s/" % (newest.rstrip("/"), path.rstrip("/")))
+    else:
+        out.append(style.dim("  restore the newest with"))
+        out.append("  cp -a %s %s" % (newest, path))
+    return "\n".join(out), EXIT_OK
+
+
 def _render(run, opts, command, style, width):
     # type: (Run, argparse.Namespace, str, object, Optional[int]) -> Tuple[str, int]
     show_all = bool(_merge_flag(opts, "all", False))
@@ -2198,6 +3010,18 @@ def _render(run, opts, command, style, width):
     changes = list(run.changes or [])
     legend_on = bool(_merge_flag(opts, "legend", False))
     summary_on = bool(_merge_flag(opts, "summary", False))
+
+    # Ahead of the `--json` branch on purpose: a recovery answer is about one
+    # path and its copies, not about a set of roots, so it cannot be squeezed
+    # through a renderer whose payload is a root list.
+    if command == "recover":
+        return _recover(
+            run,
+            opts.path,
+            style,
+            size=width,
+            as_json=bool(_merge_flag(opts, "json", False)),
+        )
 
     if _merge_flag(opts, "json", False):
         caveats = list(run.warnings)
@@ -2345,10 +3169,10 @@ def _render(run, opts, command, style, width):
         subset = [r for r in run.roots if r.path and r.path in changed_paths]
         changes = moved
         if not subset:
-            # Every change is on a root with no path (an allocation), so there
-            # is no row to show. `subset or roots` fell back to the entire
-            # atlas here, which answered "what changed?" with "here is
-            # everything", and dropped the grouping and the census with it.
+            # Every change is on a root with no row to show: an allocation with
+            # no path, or a root that has gone. `subset or roots` fell back to
+            # the entire atlas here, which answered "what changed?" with "here
+            # is everything", and dropped the grouping and the census with it.
             return (
                 render_atlas(
                     [],
@@ -2359,6 +3183,7 @@ def _render(run, opts, command, style, width):
                     size=width,
                     legend_on=legend_on,
                     summary=summary_on,
+                    deltas=True,
                     all_roots=run.roots,
                     group=True,
                 ),
@@ -2660,8 +3485,59 @@ def _children(path, limit=CHILD_LIMIT):
     return out, held
 
 
-def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
-    # type: (str, object, Optional[int], Optional[int], int, Optional[List[Dict[str, object]]]) -> Tuple[List[str], List[Dict[str, object]], int]
+def _listing_room(window, count):
+    # type: (Optional[int], int) -> int
+    """How many child rows fit, given the window.
+
+    Nine rows of chrome plus the one `select` leaves the cursor on: two
+    borders, the path, a blank, the rule, the column heading, the "N above, N
+    below" counter, a blank and the key hints. COUNTED against a rendered
+    block rather than estimated, because the first guess was 8 and produced 31
+    lines in a 30 row terminal, and one line over is not a cosmetic error:
+    `select` repaints by moving the cursor up by the number of lines it wrote,
+    so a block taller than the window has scrolled by the time it is erased
+    and takes the reader's scrollback with it.
+    """
+    return max(1, int(window) - 10) if window else count
+
+
+def _window_top(cursor, count, room, top=None):
+    # type: (int, int, int, Optional[int]) -> int
+    """Where the visible slice starts. **The band travels; the list holds.**
+
+    The bug this replaces: `first = cursor - room // 2` recomputed from the
+    cursor on every repaint, which pins the highlight to the middle of the
+    window for ever. Owner, five rows from the end of an 84 item directory:
+    "the highlightor isn't at the bottom when scrolling down, it's somewhere
+    in the middle." The counter said `64 of 84, 52 above, 10 below`, and ten
+    rows the reader could see were below a band that would not move onto them.
+
+    Edge-triggered instead, which is what every list a reader has ever used
+    does: the highlight walks down through the rows until it reaches the last
+    one on screen, and only then does the list scroll under it. So the bottom
+    row is reachable, the top row is reachable, and a short list never scrolls
+    at all.
+
+    ``top`` is the caller's remembered position, which is what makes this
+    edge-triggered rather than centred: the answer depends on where the window
+    already was, and a function handed only the cursor cannot know. Passing
+    None asks for a window centred on the cursor, which is the right answer
+    for a first paint and for any caller with nothing to remember.
+    """
+    if room >= count:
+        return 0
+    if top is None:
+        return max(0, min(cursor - room // 2, count - room))
+    top = max(0, min(int(top), count - room))
+    if cursor < top:
+        top = cursor
+    elif cursor >= top + room:
+        top = cursor - room + 1
+    return max(0, min(top, count - room))
+
+
+def _listing(path, style, cols=None, window=None, cursor=0, kids=None, top=None, held=None):
+    # type: (str, object, Optional[int], Optional[int], int, Optional[List[Dict[str, object]]], Optional[int], Optional[int]) -> Tuple[List[str], List[Dict[str, object]], int]
     """One directory's children, as the same framed table as the main view.
 
     The owner's description of what opening a row should do: "there should be
@@ -2685,7 +3561,8 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
     cols = _window_cols(style) if cols is None else max(8, int(cols))
     inner = max(8, cols - 4)
     if kids is None:
-        kids, _held = _children(path)
+        kids, held = _children(path)
+    held = int(held or 0)
 
     head = [style.head(sanitize(path, limit=4096))]
     tail_keys = "   %s open   %s back   %s quit" % (
@@ -2701,16 +3578,8 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
         ]
         return _fit(panel(lines, style=style, size=cols, shrink=False).splitlines(), cols), [], -1
 
-    # Nine rows of chrome plus the one `select` leaves the cursor on: two
-    # borders, the path, a blank, the rule, the column heading, the "N above,
-    # N below" counter, a blank and the key hints. COUNTED against a rendered
-    # block rather than estimated, because the first guess was 8 and produced
-    # 31 lines in a 30 row terminal, and one line over is not a cosmetic
-    # error: `select` repaints by moving the cursor up by the number of lines
-    # it wrote, so a block taller than the window has scrolled by the time it
-    # is erased and takes the reader's scrollback with it.
-    room = max(1, int(window) - 10) if window else len(kids)
-    first = max(0, min(cursor - room // 2, len(kids) - room))
+    room = _listing_room(window, len(kids))
+    first = _window_top(cursor, len(kids), room, top)
     shown = kids[first : first + room]
 
     rows = []
@@ -2750,14 +3619,19 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None):
     lines.append("")
     # `track`, matching the main table's rule. `dim` is the label tier and a
     # full-width line in it reads as a second heading above the headings.
-    lines.append(style.track(style.g.h * max(1, inner - 2)))
+    # The full content width, as the main table's rule is: two short, it
+    # stopped visibly before the border on every listing.
+    lines.append(style.track(style.g.h * max(1, inner)))
     body_at = len(lines) + 1  # the table's heading row comes first
     lines.extend(body.splitlines())
     above, below = first, len(kids) - (first + len(shown))
-    if above or below:
-        lines.append(
-            style.dim("   %d of %d, %d above, %d below" % (cursor + 1, len(kids), above, below))
-        )
+    if above or below or held:
+        where = "   %d of %d, %d above, %d below" % (cursor + 1, len(kids), above, below)
+        if held:
+            # `_children` stops at `CHILD_LIMIT`, and this line said `1 of 200`
+            # about a Sylvia `/tmp` holding 10,401 entries, as if 200 were all.
+            where += "; %s more not listed" % (render_fields.human_count(held),)
+        lines.append(style.dim(where))
     lines.append("")
     lines.append(style.dim(tail_keys))
 
@@ -2837,6 +3711,60 @@ def _detail(run, root, style, cols=None, window=None):
     return _fit(panel(lines, style=style, size=cols, shrink=False).splitlines(), cols)
 
 
+def _whole_path_at(text, target):
+    # type: (str, str) -> bool
+    """Whether ``target`` appears in ``text`` as a WHOLE cell, not a substring.
+
+    **A path can be a suffix of another path, and one of this cluster's is.**
+    Owner: "when the highlightor is on the gpfs row and when i press the down
+    arrow, it will skip /software and jump directly to /cfs. something is
+    wrong."
+
+    Nothing was being skipped. `/software` is a substring of
+    `/gpfs/meadow2/perf2/software`, which renders one row ABOVE it, so a
+    substring search for the cursor's path found the wrong line first and
+    repainted the band exactly where it already was. The band appeared not to
+    move, the next press moved the cursor to `/cfs/hpc-staff`, and one row of
+    an eleven row table was unreachable:
+
+        software   /gpfs/meadow2/perf2/software   read + write   14G   none
+                   /software                      read + write     ?      ?   <- unreachable
+        archive    /cfs/hpc-staff                 read + write     ?      ?
+
+    A table cell is delimited by whitespace, so requiring whitespace or an
+    edge on both sides is exactly the test: `2` precedes the match inside
+    `perf2/software` and rejects it, while the real row has a gutter on each
+    side. The path column is `atomic` in this renderer and is never
+    ellipsised, so a whole match is always available to find.
+    """
+    if not target:
+        return False
+    start = 0
+    while True:
+        at = text.find(target, start)
+        if at < 0:
+            return False
+        before = text[at - 1] if at else " "
+        end = at + len(target)
+        after = text[end] if end < len(text) else " "
+        if before.isspace() and after.isspace():
+            return True
+        start = at + 1
+
+
+def _row_line(lines, target):
+    # type: (Sequence[str], str) -> int
+    """Which rendered line carries this row, or -1.
+
+    Escapes are stripped before matching, because a cell may carry colour and
+    the path is then not a plain substring of the line it is printed on.
+    """
+    for position, line in enumerate(lines):
+        if _whole_path_at(plain(line), target):
+            return position
+    return -1
+
+
 def _table_frame(
     roots,  # type: Sequence[object]
     cursor,  # type: int
@@ -2891,15 +3819,10 @@ def _table_frame(
     # own path rather than by counting chrome, because the chrome changes with
     # the window and a counted offset would put the highlight on the wrong line
     # at the one width nobody tested.
-    #
-    # Matched against the line with its escapes REMOVED, because a cell may
-    # carry colour and the path is then not a substring of the line it is
-    # printed on.
     target = roots[cursor].path or (roots[cursor].policy or {}).get("allocation_location", "")
-    for position, line in enumerate(lines):
-        if target and target in plain(line):
-            lines = interactive.highlight(lines, position)
-            break
+    position = _row_line(lines, target)
+    if position >= 0:
+        lines = interactive.highlight(lines, position)
     # `shrink=False` for the same reason `_detail` uses it: every frame in the
     # interactive session is the window wide, so none of them changes size as
     # the reader moves or drills in. The table's content already fills the
@@ -2907,8 +3830,8 @@ def _table_frame(
     return panel(lines, style=style, size=window, shrink=False).splitlines()
 
 
-def _descend(start, style, width):
-    # type: (str, object, Optional[int]) -> object
+def _descend(start, style, width, screen=None):
+    # type: (str, object, Optional[int], Optional[interactive.Screen]) -> object
     """Walk down a directory tree, one listing at a time, until the reader leaves.
 
     A STACK rather than recursion, so depth costs nothing and "back" is a pop.
@@ -2924,8 +3847,8 @@ def _descend(start, style, width):
     while stack:
         here = stack[-1]
         rows = interactive.window_rows()
-        kids, _held = _children(here)
-        lines, kids, _band = _listing(here, style, cols=width, window=rows, kids=kids)
+        kids, held = _children(here)
+        lines, kids, _band = _listing(here, style, cols=width, window=rows, kids=kids, held=held)
         if not kids:
             # Nothing to open. Show the listing (which says so) and treat any
             # key except `q` as "back", because there is nowhere to go but up.
@@ -2936,21 +3859,40 @@ def _descend(start, style, width):
                 initial=0,
                 escapable=True,
                 openable=False,
+                screen=screen,
             )
             if outcome == interactive.Key.QUIT:
                 return interactive.Key.QUIT
             stack.pop()
             continue
 
-        def paint(index, where=here, entries=kids, height=rows):
-            # type: (int, str, List[Dict[str, object]], int) -> List[str]
+        # The window's own position, remembered ACROSS repaints. `_listing` is
+        # called afresh on every keypress and is handed only the cursor, so
+        # without this it can do nothing but centre the band, which is the
+        # "highlightor isn't at the bottom" bug. One mutable cell per
+        # directory, seeded from the remembered cursor so returning to a level
+        # lands where the reader left it.
+        viewport = [
+            _window_top(cursors.get(here, 0), len(kids), _listing_room(rows, len(kids)), None)
+        ]
+
+        def paint(index, where=here, entries=kids, height=rows, seen=viewport, more=held):
+            # type: (int, str, List[Dict[str, object]], int, List[int], int) -> List[str]
             # Rebuilt per keypress rather than painted over a fixed block,
             # because the visible window of rows MOVES with the cursor: a
             # directory with 668 children cannot be shown at once, and a band
             # that can only travel as far as the first screenful is a listing
             # the reader cannot reach the bottom of.
+            seen[0] = _window_top(index, len(entries), _listing_room(height, len(entries)), seen[0])
             block, _kids, _band = _listing(
-                where, style, cols=width, window=height, cursor=index, kids=entries
+                where,
+                style,
+                cols=width,
+                window=height,
+                cursor=index,
+                kids=entries,
+                top=seen[0],
+                held=more,
             )
             # Already highlighted: `_listing` paints the band on the content
             # before drawing the border, so there is nothing to do here.
@@ -2961,6 +3903,7 @@ def _descend(start, style, width):
             len(kids),
             initial=min(cursors.get(here, 0), len(kids) - 1),
             escapable=True,
+            screen=screen,
         )
         if choice == interactive.Key.QUIT:
             return interactive.Key.QUIT
@@ -3030,9 +3973,15 @@ def _browse(run, opts, style, width):
         ends the way a plain run ends, with the table in the scrollback, and it
         is robust to the cursor arithmetic being off by a line.
         """
+        screen.erase()
         text, _ = _render(run, opts, "atlas", style, width)
         _write(text)
         return EXIT_OK
+
+    # One screen for the table and every listing opened from it, so each view
+    # is drawn over the last instead of after a blank one. See
+    # `interactive.Screen`.
+    screen = interactive.Screen()
 
     # A frame taller than the window cannot be repainted in place. Moving the
     # cursor up by the block's height lands at the TOP OF THE WINDOW rather
@@ -3055,18 +4004,25 @@ def _browse(run, opts, style, width):
         return EXIT_OK
 
     cursor = 0
-    while True:
-        chosen = interactive.select(
-            frame,
-            len(roots),
-            initial=cursor,
-            escapable=False,
-        )
-        if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
-            return leave()
-        cursor = int(chosen)  # type: ignore[arg-type]
-        if _descend(roots[cursor].path or "/", style, width) == interactive.Key.QUIT:
-            return leave()
+    try:
+        while True:
+            chosen = interactive.select(
+                frame,
+                len(roots),
+                initial=cursor,
+                escapable=False,
+                screen=screen,
+            )
+            if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
+                return leave()
+            cursor = int(chosen)  # type: ignore[arg-type]
+            if _descend(roots[cursor].path or "/", style, width, screen) == interactive.Key.QUIT:
+                return leave()
+    except Exception:
+        # `main` falls back to the static print, which must not land under a
+        # frame left on screen for a next view that is never coming.
+        screen.erase()
+        raise
 
 
 def main(argv=None):
@@ -3132,18 +4088,40 @@ def main(argv=None):
         and interactive.supported()
     ):
         try:
-            return _browse(run, opts, style, width)
+            code = _browse(run, opts, style, width)
         except Exception:
             # Fall through to the static print. A failed browse must leave the
             # user holding the report.
             pass
+        else:
+            # The warnings too, and this is what the browse used to skip. It
+            # returned straight out of here, so in a terminal, the one place a
+            # person is reading, a run that ran out of time printed a table of
+            # `?` with no word of why: measured on a meadow2 login node, where
+            # a slow automount spent the allowance and the only symptom was
+            # 48 rows of question marks.
+            _report(run, opts, "")
+            return code
 
     text, code = _render(run, opts, command, style, width)
     _write(text)
+    _report(run, opts, text)
+    return code
 
-    # Never silent, and never in the table. See `_surfaceable`.
+
+def _report(run, opts, text):
+    # type: (Run, argparse.Namespace, str) -> None
+    """The warnings and `--timing`, on stderr, after whatever view was shown.
+
+    Never silent, and never in the table. See `_surfaceable`. Said once:
+    `dirscape new` already folds its warnings into its answer, and the same
+    sentence arriving again on stderr straight underneath it was the note
+    twice in a row.
+    """
+    shown = plain(text)
     for note in _surfaceable(run):
-        sys.stderr.write("dirscape: %s\n" % (note,))
+        if note not in shown:
+            sys.stderr.write("dirscape: %s\n" % (note,))
 
     if _merge_flag(opts, "timing", False):
         sys.stderr.write("\nstage timings:\n")
@@ -3152,8 +4130,6 @@ def main(argv=None):
             sys.stderr.write("  %-14s %6.3fs\n" % (label, elapsed - last))
             last = elapsed
         sys.stderr.write("  %-14s %6.3fs\n" % ("total", last))
-
-    return code
 
 
 if __name__ == "__main__":  # pragma: no cover

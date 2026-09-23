@@ -140,6 +140,16 @@ extra_bin_dirs = /usr/lpp/mmfs/bin
 # new dataset appearing in a shared area shows up as a new root.
 roots =
 
+[snapshots]
+# Directories that ARE a snapshot container, comma-separated. Only needed
+# where the site publishes snapshots somewhere the filesystem does not: the
+# hidden `.snapshots`, `.snapshot`, `.zfs/snapshot` and `.snap` trees inside a
+# filesystem are found without any configuration. Each entry may hold the
+# snapshots directly (`/snapshots/<SNAP>/home/<user>`) or one directory per
+# filesystem above them (`/snapshots/home/<SNAP>/home/<user>`); both shapes
+# are recognised, so state the top of the tree and nothing else.
+roots =
+
 [policy]
 # glob = key=value; key=value . Keys: purge_days, backup, speed, readonly,
 # node_class, note. Purely advisory, and shown in the POLICY column.
@@ -237,6 +247,7 @@ class Site(object):
         "wrapper_paths",
         "extra_bin_dirs",
         "dataset_roots",
+        "snapshot_roots",
         "policy_globs",
     )
 
@@ -258,6 +269,12 @@ class Site(object):
         self.wrapper_paths = []  # type: List[str]
         self.extra_bin_dirs = ["/usr/lpp/mmfs/bin"]  # type: List[str]
         self.dataset_roots = []  # type: List[str]
+        # Absolute paths that ARE a snapshot container, as opposed to the
+        # hidden `.snapshots` a filesystem grows inside its own tree. Needed
+        # because a site can publish its snapshots somewhere the filesystem
+        # does not: this one exposes `/snapshots` on login nodes only, and
+        # nothing about `/home` or the mount table leads you to it.
+        self.snapshot_roots = []  # type: List[str]
         self.policy_globs = []  # type: List[Tuple[str, Dict[str, object]]]
 
     # -- lookups ---------------------------------------------------------
@@ -397,6 +414,7 @@ class Site(object):
             "wrapper_paths": list(self.wrapper_paths),
             "extra_bin_dirs": list(self.extra_bin_dirs),
             "dataset_roots": list(self.dataset_roots),
+            "snapshot_roots": list(self.snapshot_roots),
             "ignore": list(self.ignore),
         }
 
@@ -451,6 +469,8 @@ def _merge_ini(site, text, source):
 
     if parser.has_section("datasets"):
         site.dataset_roots.extend(_split_list(parser.get("datasets", "roots", fallback="")))
+    if parser.has_section("snapshots"):
+        site.snapshot_roots.extend(_split_list(parser.get("snapshots", "roots", fallback="")))
 
     if parser.has_section("policy"):
         for pattern, value in parser.items("policy"):
@@ -472,6 +492,7 @@ def _merge_json(site, text, source):
         ("quota_order", site.quota_order),
         ("wrapper_paths", site.wrapper_paths),
         ("dataset_roots", site.dataset_roots),
+        ("snapshot_roots", site.snapshot_roots),
     ):
         value = payload.get(key)
         if isinstance(value, list):
@@ -543,6 +564,20 @@ def load_site(paths=None, warn=None):
 # GRES rather than on a hostname prefix.
 _NODE_SUFFIX = re.compile(r"[-_]?\d+$")
 
+# What a node is FOR, at the end of its name once the number is gone:
+# `procyon-login-02` is a login node of `procyon`, not a cluster called
+# `procyon-login`, which is what ACME's header read before this existed.
+_NODE_ROLE = re.compile(r"[-_]?(?:login|gpu|cpu|compute|node|bigmem|himem)$", re.IGNORECASE)
+
+# A bare device name, the kind GPFS uses (`meadow3_cap`). Only these are worth
+# a common prefix: Lustre and NFS devices lead with NIDs and hostnames, so on
+# a Lustre-only site the "shared prefix" of two devices was `172.2`.
+_BARE_DEVICE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+# An HPE Cray xname (`x1234c0s13b0n0`) says where a blade sits and nothing
+# about which machine it belongs to.
+_XNAME = re.compile(r"^x\d+c\d+s\d+b\d+n\d+$", re.IGNORECASE)
+
 
 def guess_cluster_name(hostname, mount_devices=()):
     # type: (str, Sequence[str]) -> str
@@ -553,7 +588,7 @@ def guess_cluster_name(hostname, mount_devices=()):
     from any node, whereas a hostname changes per node and per login round
     robin.
     """
-    names = [d for d in mount_devices if d and not d.startswith("/")]
+    names = [d for d in mount_devices if d and _BARE_DEVICE.match(d)]
     if names:
         shared = os.path.commonprefix(sorted(names)).strip("_-")
         # Two characters is not a name, it is a coincidence of alphabetical
@@ -561,5 +596,15 @@ def guess_cluster_name(hostname, mount_devices=()):
         if len(shared) >= 3:
             return shared
 
-    short = (hostname or "").split(".")[0]
-    return _NODE_SUFFIX.sub("", short) or short
+    labels = [label for label in (hostname or "").split(".") if label]
+    if not labels or _XNAME.match(labels[0]):
+        return ""
+    # The node's number, then what the node is for, and nothing more: a digit
+    # left after that belongs to the machine (`meadow3`, `collie3`), which is
+    # how `meadow3-0200` once came out as `meadow`.
+    name = _NODE_ROLE.sub("", _NODE_SUFFIX.sub("", labels[0]))
+    if name:
+        return name
+    # The short name was nothing BUT a role and a number (`login01`), so the
+    # machine is named one label up, as in `login01.frontera.example.edu`.
+    return labels[1] if len(labels) > 1 else labels[0]

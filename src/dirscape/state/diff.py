@@ -687,6 +687,17 @@ def diff(previous, current, since=None):
     if warning:
         warnings.append(warning)
 
+    # **Another login node is another machine.** Round-robin DNS puts a reader
+    # on a different login node from one run to the next, and measured on
+    # Sylvia the second node disagreed with the first about four network
+    # roots and every node-local one: NFS and tmpfs `st_dev` numbers are
+    # handed out per client, so `/admin_home` and `/soft` read as "replaced",
+    # and `/tmp` is a different disk with the same name. So across hosts a
+    # node-local root is not compared at all, and a network root's identity is
+    # its inode, which the server assigns and every client agrees on.
+    same_host = bool(previous.hostname) and previous.hostname == current.hostname
+    local_skipped = 0
+
     records = []  # type: List[Change]
     matched = set()  # type: set
     stamp = previous.taken_at
@@ -696,11 +707,23 @@ def diff(previous, current, since=None):
     # comparable by a script.
     for record in sorted(current.records, key=lambda r: (r.path, r.device)):
         before = previous.match(record)
+        if not same_host and (record.node_local or (before is not None and before.node_local)):
+            if before is not None:
+                matched.add(before.key)
+            # Counted only when the comparison would have SAID something, so
+            # hopping login nodes with an unchanged `/tmp` stays silent.
+            if before is None or _changes_for(
+                record, before, stamp, None, current, vantage, same_host=False
+            ):
+                local_skipped += 1
+            continue
         renamed_from = None  # type: Optional[str]
-        if before is None:
+        if before is None and same_host:
             # Second chance on the inode. A renamed directory misses on the
             # path and hits here, and it is the same object, so it must not be
-            # reported as one root lost and another gained.
+            # reported as one root lost and another gained. Same host only:
+            # the pair it matches on includes `st_dev`, which another host
+            # numbers differently.
             by_inode = previous.by_identity(record.identity)
             if by_inode is not None:
                 before = by_inode
@@ -708,7 +731,9 @@ def diff(previous, current, since=None):
         if before is not None:
             matched.add(before.key)
 
-        for change in _changes_for(record, before, stamp, renamed_from, current, vantage):
+        for change in _changes_for(
+            record, before, stamp, renamed_from, current, vantage, same_host=same_host
+        ):
             records.append(change)
             _write_back(current, record, change)
 
@@ -716,8 +741,18 @@ def diff(previous, current, since=None):
     for record in sorted(previous.records, key=lambda r: (r.path, r.device)):
         if record.key in matched:
             continue
+        if not same_host and record.node_local:
+            local_skipped += 1
+            continue
         change = _gone_or_unknown(record, current, stamp, vantage, None)
         records.append(change)
+
+    if local_skipped:
+        warnings.append(
+            "the baseline was taken on %s, so %d difference(s) on this node's own disks "
+            "were left out: they are different disks"
+            % (previous.hostname or "another host", local_skipped)
+        )
 
     if since is not None:
         # A `new` row whose `first_seen` predates the window is not new to the
@@ -733,8 +768,24 @@ def diff(previous, current, since=None):
         describe(records),
         no_baseline=False,
         same_vantage=vantage,
-        warnings=warnings + _identity_notes(current, previous, records),
+        warnings=warnings + _identity_notes(current, previous, records, same_host=same_host),
     )
+
+
+def _replaced(record, before, same_host=True):
+    # type: (RootRecord, RootRecord, bool) -> bool
+    """Whether the object behind a path changed, as far as the evidence goes.
+
+    Both sides need an identity: a probe that could not `stat` produces None,
+    and a None must never read as "the fileset was recreated". Across hosts
+    only the inode is compared, because `st_dev` there is the other client's
+    local numbering and not a property of the storage.
+    """
+    if record.identity is None or before.identity is None:
+        return False
+    if same_host:
+        return record.identity != before.identity
+    return record.identity[1] != before.identity[1]
 
 
 def _changes_for(
@@ -744,6 +795,7 @@ def _changes_for(
     renamed_from,  # type: Optional[str]
     current,  # type: Snapshot
     vantage,  # type: bool
+    same_host=True,  # type: bool
 ):
     # type: (...) -> List[Change]
     """Every row one current root produces."""
@@ -768,14 +820,8 @@ def _changes_for(
             out.append(stranded)
         return out
 
-    # A replacement: same path, new object behind it. Compared only when both
-    # sides actually have an identity, because a probe that could not `stat`
-    # produces None and a None must never read as "the fileset was recreated".
-    identity_changed = (
-        record.identity is not None
-        and before.identity is not None
-        and record.identity != before.identity
-    )
+    # A replacement: same path, new object behind it. See `_replaced`.
+    identity_changed = _replaced(record, before, same_host)
 
     if renamed_from:
         out.append(
@@ -878,8 +924,8 @@ def _reach_rows(record, before, stamp, identity_changed):
     ]
 
 
-def _identity_notes(current, previous, records):
-    # type: (Snapshot, Snapshot, Sequence[Change]) -> List[str]
+def _identity_notes(current, previous, records, same_host=True):
+    # type: (Snapshot, Snapshot, Sequence[Change], bool) -> List[str]
     """Warnings for a path whose object was replaced with nothing else to say.
 
     A fileset deleted and recreated at the same path, with the same reach and
@@ -897,7 +943,9 @@ def _identity_notes(current, previous, records):
         before = previous.match(record)
         if before is None or before.identity is None:
             continue
-        if before.identity != record.identity:
+        if not same_host and (record.node_local or before.node_local):
+            continue
+        if _replaced(record, before, same_host):
             out.append(
                 "%s is a different directory than it was at %s (st_dev, st_ino) moved "
                 "from %s to %s, so the fileset behind the path was replaced"

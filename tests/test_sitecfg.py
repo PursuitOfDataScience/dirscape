@@ -319,3 +319,29 @@ def test_cluster_name_ignores_a_two_character_coincidence():
 @pytest.mark.parametrize("hostname", ["", "x"])
 def test_cluster_name_never_raises_on_a_degenerate_hostname(hostname):
     assert isinstance(guess_cluster_name(hostname, []), str)
+
+
+def test_a_site_can_publish_a_snapshot_tree(tmp_path):
+    """`[snapshots] roots` covers the case the filesystem cannot answer for.
+
+    The hidden `.snapshots`, `.snapshot`, `.zfs/snapshot` and `.snap` trees
+    inside a filesystem need no configuration. A site that publishes its
+    snapshots somewhere else does: `/snapshots` here is a plain top-level
+    directory belonging to no device, and nothing in the mount table leads
+    to it.
+    """
+    from dirscape.sitecfg import load_site
+
+    conf = tmp_path / "site.conf"
+    conf.write_text("[snapshots]\nroots = /snapshots, /old-snapshots\n")
+
+    site = load_site([str(conf)])
+
+    assert site.snapshot_roots == ["/snapshots", "/old-snapshots"]
+    assert site.to_json()["snapshot_roots"] == ["/snapshots", "/old-snapshots"]
+
+
+def test_the_site_template_documents_the_snapshots_section():
+    from dirscape.sitecfg import SITE_TEMPLATE
+
+    assert "[snapshots]" in SITE_TEMPLATE

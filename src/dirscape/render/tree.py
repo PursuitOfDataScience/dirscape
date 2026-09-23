@@ -52,6 +52,20 @@ def group(roots):
     return devices
 
 
+def _device_label(device, lustre):
+    # type: (str, bool) -> str
+    """A device heading a reader can take in.
+
+    A Lustre device is every server's network id and then the filesystem,
+    162 characters on ACME before the word `acorn`, so the heading was cut off
+    exactly where it said which filesystem it was. The name after `:/`, with
+    any subdirectory the mount shows, is what `lfs df` and the site's docs use.
+    """
+    if lustre and ":/" in (device or ""):
+        return "%s (lustre)" % (device.rpartition(":/")[2].rstrip("/"),)
+    return device
+
+
 def _quota_line(roots, style):
     # type: (Sequence[Root], Style) -> Tuple[str, str]
     """The group's figures: one quota, or the sum of several measurements.
@@ -110,7 +124,11 @@ def render(roots, style=None, size=None):
     out = []  # type: List[str]
     grouped = group(roots)
     for device, filesets in grouped:
-        label = device or fields.UNKNOWN
+        fstype = ""
+        for _fileset, members in filesets:
+            fstype = fstype or next((m.fstype for m in members if m.fstype), "")
+        lustre = fstype.lower() == "lustre"
+        label = _device_label(device, lustre) or fields.UNKNOWN
         head = style.head(label)
         if not device:
             head += style.dim("  (device not determined)")
@@ -134,10 +152,18 @@ def render(roots, style=None, size=None):
             # filesets, and the figures beside it were measured by walking the
             # directory. Nothing failed, so nothing should read as failed.
             walked = any((member.policy or {}).get("walked") for member in members)
-            if fileset:
+            if fileset and lustre and fileset.isdigit():
+                # `lfs project -d` names a project by number, and a bare
+                # `13579` on a line of its own reads as a figure.
+                name, note = "project %s" % (fileset,), ""
+            elif fileset:
                 name, note = fileset, ""
             elif walked:
                 name, note = "measured", "  (added up by walking, no quota here)"
+            elif lustre:
+                # Not "no quota scopes": Lustre has project quotas, this
+                # directory just carries none, and a user quota covers it.
+                name, note = "no project", "  (a user quota covers the whole filesystem)"
             else:
                 name, note = "no fileset", "  (this filesystem has no quota scopes)"
             line = "  %s %s" % (style.dim(f_stem), style.accent(name))

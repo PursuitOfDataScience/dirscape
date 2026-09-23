@@ -344,6 +344,7 @@ class RootRecord(object):
         "sources",
         "quota_source",
         "first_seen",
+        "node_local",
     )
 
     def __init__(
@@ -367,6 +368,7 @@ class RootRecord(object):
         sources=(),  # type: Sequence[str]
         quota_source="",  # type: str
         first_seen=None,  # type: Optional[float]
+        node_local=False,  # type: bool
     ):
         # type: (...) -> None
         self.path = path
@@ -399,6 +401,9 @@ class RootRecord(object):
         self.sources = list(sources)[:_MAX_SOURCES]
         self.quota_source = quota_source
         self.first_seen = first_seen
+        # On this node's own disk or memory, so only comparable with a run on
+        # the same host. Set by discovery; see `diff.diff`.
+        self.node_local = bool(node_local)
 
     @property
     def key(self):
@@ -455,6 +460,7 @@ class RootRecord(object):
             sources=list(root.sources),
             quota_source=_quota_source(root),
             first_seen=first_seen,
+            node_local=bool((root.policy or {}).get("node_local")),
         )
 
     def to_json(self):
@@ -501,6 +507,8 @@ class RootRecord(object):
             out["quota_source"] = self.quota_source
         if self.first_seen is not None:
             out["first_seen"] = self.first_seen
+        if self.node_local:
+            out["node_local"] = True
         return out
 
     @classmethod
@@ -554,6 +562,7 @@ class RootRecord(object):
             sources=[str(s) for s in sources] if isinstance(sources, list) else (),
             quota_source=str(payload.get("quota_source") or ""),
             first_seen=_restore_time(payload.get("first_seen")),
+            node_local=payload.get("node_local") is True,
         )
 
     def __repr__(self):

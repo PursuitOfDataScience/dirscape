@@ -623,6 +623,22 @@ class Backend(object):
 
     name = ""  # type: str
 
+    #: Whether this backend's answer DEPENDS on the exact path it is asked
+    #: about, as opposed to returning everything the reader holds on a device
+    #: whatever path names it.
+    #:
+    #: False for `mmlsquota`, which is why one sweep before discovery is
+    #: enough on GPFS: `mmlsquota <device>` lists every fileset the user has
+    #: usage in. True for Lustre and XFS project quotas, which are a property
+    #: of the DIRECTORY: `lfs project -d /lus/egret` returns 0 while
+    #: `lfs project -d /lus/egret/projects/lanternlab-exampleu` returns 13579,
+    #: so a sweep that asked about the mount never asks for the project scope
+    #: at all and a 29.58T allocation reported `?`.
+    #:
+    #: `cli._attach_quota` reads this to decide which backends are worth
+    #: asking a second time, once the roots are known.
+    per_path = False  # type: bool
+
     def supported(self, runner):
         # type: (object) -> Optional[str]
         """The resolved path of the executable this backend needs, or None.
@@ -806,20 +822,22 @@ def default_backends(site=None):
 
     1. ``mmlsquota``   live, per fileset, publishes the device
     2. ``lfs quota``   live, per scope, publishes the mount point
-    3. ``xfs_quota``   project quotas, then statvfs capacity as a labelled floor
-    4. site wrapper    cached, but the only backend that sees unmounted allocations
-    5. ``quota -s``    stock, last because it knows nothing of parallel filesystems
+    3. CephFS xattrs   live, per directory, no command at all
+    4. ``xfs_quota``   project quotas, then statvfs capacity as a labelled floor
+    5. site wrapper    cached, but the only backend that sees unmounted allocations
+    6. ``quota -s``    stock, last because it knows nothing of parallel filesystems
 
     A site may override the order with ``quota_order``, which is how a cluster
     whose wrapper is authoritative puts it first without editing the package.
     """
-    from . import gpfs, lustre, posix, wrapper, xfs
+    from . import ceph, gpfs, lustre, posix, wrapper, xfs
 
     extra_dirs = tuple(_site_list(site, "extra_bin_dirs")) or None
     wrapper_paths = tuple(_site_list(site, "wrapper_paths")) or None
     built = [
         gpfs.GpfsBackend(extra_dirs=extra_dirs or gpfs.GPFS_BIN_DIRS),
         lustre.LustreBackend(extra_dirs=extra_dirs or ()),
+        ceph.CephBackend(),
         xfs.XfsBackend(extra_dirs=extra_dirs or xfs.XFS_BIN_DIRS),
         wrapper.SiteWrapperBackend(
             script_paths=wrapper_paths or wrapper.KNOWN_WRAPPER_PATHS,

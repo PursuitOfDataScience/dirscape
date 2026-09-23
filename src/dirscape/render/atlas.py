@@ -625,6 +625,19 @@ def render(
     out = _header(roots, info, style, size=budget).splitlines()
 
     if not roots:
+        _stranded, changed = (
+            _delta_lines(census, changes, style, size=budget) if deltas else ([], [])
+        )
+        if changed:
+            # Every change is about a root with no live row: it has GONE, or
+            # it is an allocation with no path. That is exactly what `dirscape
+            # new` exists to say, and it printed "no roots were handed to this
+            # view" instead, inside an otherwise empty box. Measured on a
+            # second Sylvia login node, where the baseline's snapshot mounts
+            # were not mounted.
+            out.append("")
+            out.extend(changed)
+            return _finish(out, style, window, frame)
         out.append(style.dim(_INDENT + "no roots were handed to this view"))
         return _finish(out, style, window, frame)
 
@@ -755,7 +768,25 @@ def render(
     # built.
     rule_at = len(out)
     out.append("")
-    out.extend(body.splitlines())
+    # **Air around the heading row, on both sides.** Owner, on the first live
+    # version: "the vertical spacing is too narrow, especially the column row
+    # and the first row." The table was five lines of chrome stacked with no
+    # gap anywhere in it, so `kind path access used quota files` sat directly
+    # on the rule above it and directly on `/home/jdoe42` below it, and the
+    # eye had nothing to tell the labels from the data. Two blank lines fix
+    # the whole block, and they cost two rows of a window that already
+    # devotes three to a title and a border.
+    #
+    # Safe for the interactive view because `_table_frame` locates the
+    # highlight by MATCHING THE ROW'S PATH in the rendered text rather than
+    # by counting chrome, exactly so that a change here cannot move the band
+    # onto the wrong line.
+    heading, _, remainder = body.partition("\n")
+    out.append("")
+    out.append(heading)
+    if remainder:
+        out.append("")
+        out.extend(remainder.splitlines())
     dropped.extend(extra)
 
     stranded, changed = _delta_lines(census, changes, style, size=budget)

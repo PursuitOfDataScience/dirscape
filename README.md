@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Where can I put my data on this cluster, and what changed?</strong><br>
-  GPFS &middot; Lustre &middot; XFS &middot; NFS &middot; anything with a mount table
+  GPFS &middot; Lustre &middot; CephFS &middot; XFS &middot; NFS &middot; anything with a mount table
 </p>
 
 You land on a new cluster. Where does 2 TB go? What gets purged on Friday? Nobody hands
@@ -15,17 +15,20 @@ $ ds
 │ dirscape  ·  jdoe42                                                                                                        │
 │                                                                                                                            │
 │ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                                                                                                                            │
 │    kind                path                               access                  used             quota             files │
-│    home                /home/jdoe42                       read + write            868M               30G               37k │
-│    project             /project/hpc                       read + write             11T              none              3.1M │
-│                        /project2/hpc                      read + write            928K              none                66 │
-│    scratch             /scratch/collie3/jdoe42            read + write              0B              400G                 7 │
+│                                                                                                                            │
+│    home                /home/jdoe42                       read + write            873M               30G               37k │
+│    project             /collie3/hpc-staff                 read + write            149G              1.0T              260k │
+│                        /project/hpc                       read + write             11T              none              3.1M │
+│                        /project2/hpc                      read + write            928K              none                60 │
+│    scratch             /scratch/collie3/jdoe42            read + write              0B              400G                 1 │
 │                        /scratch/local/jdoe42              read + write              0B              none                 0 │
 │                        /scratch/meadow2/jdoe42            read + write              0B              100G                 1 │
 │                        /scratch/meadow3/jdoe42            read + write             22G              100G              3.7k │
 │    dataset             /project2/reference                read only                23T              none               33k │
 │    software            /software                          read + write            314G              none              2.6M │
-│    local               /tmp                               read + write            1.2G              none              2.2k │
+│    local               /tmp                               read + write            1.2G              none              2.5k │
 ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -51,6 +54,7 @@ ds                            # no flags, no config, no setup
 
 | Command | Answers |
 | :- | :- |
+| `ds recover <path>` | Snapshot copies of a file you deleted, and how to restore one |
 | `ds new` | What changed since the last run |
 | `ds stranded` | Space you hold in filesets you can no longer reach |
 | `ds elsewhere` | Allocations with no path on this node |
@@ -71,9 +75,10 @@ ds                            # no flags, no config, no setup
 | **Files have a quota too.** | A home here allows 300,000 files against 30G, so a tree of small files runs out of inodes long before bytes. The table shows the count; `ds why <path>` shows the ceiling. |
 | **`read` is not `read only`.** | `read` means nobody checked whether you can write. `os.access` lies under root-squashed NFS, so pass `--probe-write` to settle it by writing a file. |
 | **A `?` is never a zero.** | It means nobody could measure it. Roots with no quota system are added up by a bounded walk instead; if the tree is too big to count quickly the `?` stays rather than being reported short. `--no-measure` skips the walk. |
-| **`?` never means zero.** | It means the tool could not find out, and it never becomes a number, a blank or a `0%`. |
+| **Snapshots are not backups.** | `ds recover` lists what the filesystem is keeping and nothing else. A `✗` in the `snapshot` column of `ds matrix` means a deleted file there is gone, which on this cluster is every `/scratch`. A `?` means no snapshot tree was found, and the site may still be writing tape. |
+| **A directory you can only read is folded away.** | If you can write to `/cfs3/hpc-staff` but not to `/cfs3`, only the first is a row: the parent's figure is every group's usage, not yours. `--all` shows both. |
 | **Mounts depend on the node.** | `/cfs3` exists on login nodes and not on compute. The header states where it ran, and it refuses to diff across node classes. |
-| **Write access is not probed by default.** | `os.access` lies under root-squashed NFS. Pass `--probe-write` to find out for real. |
+| **Python 3.6 installs the wheel.** | Building from a checkout needs Python 3.7+. On 3.6, run a checkout in place: `PYTHONPATH=src python3 -m dirscape`. |
 
 ## 🛠️ For site administrators
 

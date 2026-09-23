@@ -8,6 +8,7 @@ GPFS · Lustre · CephFS · XFS · NFS · anything with a mount table
 
 <a href="https://github.com/PursuitOfDataScience/dirscape/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/dirscape/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://pypi.org/project/dirscape/"><img src="https://img.shields.io/pypi/v/dirscape.svg" alt="PyPI"></a>
+<a href="https://pypi.org/project/dirscape/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/dirscape/badges/downloads.json" alt="PyPI downloads per month"></a>
 <img src="https://img.shields.io/badge/python-3.6%2B-blue.svg" alt="Python 3.6+">
 
 <img src="https://raw.githubusercontent.com/PursuitOfDataScience/dirscape/main/assets/demo.gif" width="900" alt="ds lists every storage root on a cluster with its usage, quota and file count, opens /software four levels deep and climbs back out, then explains one scratch directory with ds why.">

@@ -1,0 +1,213 @@
+name: downloads-badge
+
+# Publishes the PyPI 30-day download count as a shields.io endpoint badge.
+#
+# The number is pypistats' mirror-excluded 30-day total, the conventional PyPI
+# download figure. It counts every fetch of the sdist or wheel, so automated
+# traffic (scanners, crawlers, proxies) is included.
+#
+# pypistats rate-limits, and GitHub's runners share IPs, so a single request is
+# not enough: it is retried with backoff, then read from shields.io, which serves
+# the same pypistats figure from its own cache. A package pypistats has no record
+# of yet (it imports once a day, so a fresh release has none) is a known zero and
+# is published as one. If neither source answers at all, the badge keeps its last
+# published value; if none was ever published, the run fails, because a README
+# showing "resource not found" is a broken page, not a quiet warning.
+#
+# The value lands on an orphan `badges` branch holding one file, built with git
+# plumbing so the default branch never receives a bot commit.
+
+on:
+  # Also fires on the push that adds or edits this file, so the badge goes live
+  # with that push rather than at the next scheduled run.
+  push:
+    branches: [main, master]
+    paths:
+      - .github/workflows/downloads-badge.yml
+  schedule:
+    # 06:57 UTC daily, staggered across the six repos so they do not hit
+    # pypistats in the same minute. Upstream lags about a day, so the window is
+    # really "30 days ending yesterday".
+    - cron: "57 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: downloads-badge
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Refresh the downloads badge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the 30-day download count
+        id: count
+        env:
+          PKG: dirscape
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import random
+          import time
+          import urllib.error
+          import urllib.request
+
+          pkg = os.environ["PKG"]
+          ua = f"{pkg}-downloads-badge (+https://github.com/PursuitOfDataScience/{pkg})"
+
+
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": ua})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode())
+
+
+          def from_pypistats():
+              try:
+                  payload = get(f"https://pypistats.org/api/packages/{pkg}/recent")
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      # No record yet is a known zero, not an unknown.
+                      return 0, "0/month"
+                  raise
+              n = int(payload["data"]["last_month"])
+              return n, f"{n:,}/month"
+
+
+          def from_shields():
+              # The same pypistats figure, from shields' cache: "541/month" or "1.2k/month".
+              text = get(f"https://img.shields.io/pypi/dm/{pkg}.json")["value"]
+              figure = text.split("/")[0].strip().lower()
+              scale = {"k": 1_000, "m": 1_000_000}.get(figure[-1:], 1)
+              return int(float(figure.rstrip("km")) * scale), text
+
+
+          known, n, message, source = False, 0, "", ""
+          for name, fetch in (("pypistats", from_pypistats), ("shields.io", from_shields)):
+              for attempt in range(4):
+                  try:
+                      n, message = fetch()
+                      known, source = True, name
+                      break
+                  except Exception as exc:
+                      wait = 10 * 2**attempt + random.uniform(0, 5)
+                      print(f"{name} attempt {attempt + 1}/4 failed ({exc}); retrying in {wait:.0f}s")
+                      time.sleep(wait)
+              if known:
+                  break
+
+          if known:
+              print(f"{message} from {source}")
+          else:
+              print("::warning::no download figure could be fetched from pypistats or shields.io")
+
+          # Same thresholds shields.io uses, so the colour means what readers expect.
+          if n >= 1000:
+              color = "brightgreen"
+          elif n >= 500:
+              color = "green"
+          elif n >= 100:
+              color = "yellowgreen"
+          else:
+              color = "yellow"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"known={'true' if known else 'false'}\n")
+              fh.write(f"downloads={n}\n")
+              fh.write(f"message={message}\n")
+              fh.write(f"color={color}\n")
+          PY
+
+      - name: Keep the published value, or fail if there is none
+        if: steps.count.outputs.known != 'true'
+        run: |
+          set +e
+          git ls-remote --exit-code --heads origin badges >/dev/null 2>&1
+          rc=$?
+          set -e
+          case "$rc" in
+            0)
+              echo "::warning::no fresh figure today; the badge keeps its last published value"
+              ;;
+            2)
+              echo "::error::no figure could be fetched and no badge was ever published, so the README shows 'resource not found'"
+              exit 1
+              ;;
+            *)
+              echo "::error::cannot reach origin (git ls-remote exit $rc)"
+              exit 1
+              ;;
+          esac
+
+      - name: Publish downloads.json to the badges branch
+        if: steps.count.outputs.known == 'true'
+        env:
+          MESSAGE: ${{ steps.count.outputs.message }}
+          COLOR: ${{ steps.count.outputs.color }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+
+          json="$RUNNER_TEMP/downloads.json"
+          python3 - > "$json" <<'PY'
+          import json
+          import os
+
+          print(
+              json.dumps(
+                  {
+                      "schemaVersion": 1,
+                      "label": "downloads",
+                      "message": os.environ["MESSAGE"],
+                      "color": os.environ["COLOR"],
+                      # The value only moves once a day; let shields hold it.
+                      "cacheSeconds": 3600,
+                  },
+                  indent=2,
+              )
+          )
+          PY
+
+          blob=$(git hash-object -w "$json")
+          tree=$(printf '100644 blob %s\tdownloads.json\n' "$blob" | git mktree)
+
+          # Distinguish "branch does not exist yet" (exit 2) from "cannot reach
+          # origin" (anything else). Treating a network error as the former
+          # would orphan the branch history on every hiccup.
+          set +e
+          git ls-remote --exit-code --heads origin badges >/dev/null 2>&1
+          rc=$?
+          set -e
+
+          case "$rc" in
+            0)
+              git fetch --depth=1 origin badges
+              parent=$(git rev-parse FETCH_HEAD)
+              if [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
+                echo "Still $MESSAGE; nothing to push."
+                exit 0
+              fi
+              commit=$(git commit-tree "$tree" -p "$parent" -m "downloads: $MESSAGE")
+              ;;
+            2)
+              echo "Creating the badges branch."
+              commit=$(git commit-tree "$tree" -m "downloads: $MESSAGE")
+              ;;
+            *)
+              echo "::error::cannot reach origin (git ls-remote exit $rc)"
+              exit 1
+              ;;
+          esac
+
+          git push origin "$commit:refs/heads/badges"
+          echo "Published $MESSAGE."

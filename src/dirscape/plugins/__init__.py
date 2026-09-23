@@ -34,11 +34,11 @@ class Allocation(object):
     """Storage an allocation database says you have.
 
     Kept separate from a mounted root on purpose, and this is the whole reason
-    the class exists. Measured on this cluster: `allocs storage` reports
-    allocations on `cfs1`, `cfs2`, `cfs4` and `project3`, and **none of those
-    paths exist on the node that printed them**. An allocation, a mount and an
-    accessible directory are three independent facts, and a tool that collapses
-    them tells a user their data is gone when it is merely elsewhere.
+    the class exists. Measured at one site: its allocation command reports
+    allocations on four filesystems, and **none of those paths exist on the
+    node that printed them**. An allocation, a mount and an accessible
+    directory are three independent facts, and a tool that collapses them
+    tells a user their data is gone when it is merely elsewhere.
     """
 
     __slots__ = ("account", "location", "path", "size_gb", "kind", "start", "end", "source")
@@ -56,7 +56,7 @@ class Allocation(object):
     ):
         # type: (...) -> None
         self.account = account
-        # The location as the allocation database names it, e.g. "cfs4/hpc-staff".
+        # The location as the allocation database names it, e.g. "cfs4/ops-staff".
         # Not necessarily a path, and deliberately not coerced into one.
         self.location = location
         # A filesystem path, only when the plugin can establish one honestly.
@@ -128,9 +128,12 @@ class SitePlugin(object):
         return {}
 
 
-def available_plugins():
-    # type: () -> List[SitePlugin]
-    """Every plugin that ships with the package.
+def available_plugins(site=None):
+    # type: (Optional[object]) -> List[SitePlugin]
+    """Every plugin that ships with the package, configured from `site`.
+
+    One plugin ships, and it knows no site: everything it does comes from the
+    `[plugin]` section of the site config, so with none it detects nothing.
 
     Imported lazily inside the function rather than at module import, so a
     plugin with a syntax error cannot take down the whole tool, and so the
@@ -138,9 +141,9 @@ def available_plugins():
     """
     found = []  # type: List[SitePlugin]
     try:
-        from .hpc import HPCPlugin
+        from .site import ConfiguredSite
 
-        found.append(HPCPlugin())
+        found.append(ConfiguredSite(getattr(site, "plugin", None) or {}))
     except Exception:
         # A broken plugin is not a reason to fail a diagnostic run. The core
         # works without any plugin at all; losing one costs labels, not
@@ -149,14 +152,14 @@ def available_plugins():
     return found
 
 
-def detect_plugins(runner, mounts, enabled=None):
-    # type: (object, Sequence[object], Optional[Sequence[str]]) -> List[SitePlugin]
+def detect_plugins(runner, mounts, enabled=None, site=None):
+    # type: (object, Sequence[object], Optional[Sequence[str]], Optional[object]) -> List[SitePlugin]
     """Plugins that claim this site.
 
     `enabled` forces a specific set by name, which is how the test suite runs
-    the HPC rules against a recorded meadow2 transcript from anywhere.
+    a site's rules against a recorded transcript from anywhere.
     """
-    candidates = available_plugins()
+    candidates = available_plugins(site)
     if enabled is not None:
         wanted = set(enabled)
         return [p for p in candidates if p.name in wanted]

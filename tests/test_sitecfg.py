@@ -345,3 +345,70 @@ def test_the_site_template_documents_the_snapshots_section():
     from dirscape.sitecfg import SITE_TEMPLATE
 
     assert "[snapshots]" in SITE_TEMPLATE
+
+
+def test_a_heuristic_extension_is_checked_where_the_built_in_one_is(tmp_path):
+    """`[heuristics]` extends one built-in group in place; `[roles]` overrides.
+
+    A site's own word for archive storage sits beside `*archive*`: checked
+    after the home and scratch patterns, and case-insensitively. As a `[roles]`
+    glob it would be checked first and claim `/vault3/home/x` as archive.
+    """
+    from dirscape.sitecfg import load_site
+
+    assert load_site(paths=[]).role_for("/vault3/set") == "other"
+
+    conf = tmp_path / "site.conf"
+    conf.write_text("[heuristics]\narchive = */vault*, */Keep*\nnonsense = */x*\n")
+    site = load_site([str(conf)])
+
+    assert site.role_heuristics == [("archive", "*/vault*"), ("archive", "*/Keep*")]
+    assert site.role_for("/vault3/set") == "archive"
+    assert site.role_for("/VAULT3/set") == "archive", "case-insensitive, like the built-ins"
+    assert site.role_for("/keeper/set") == "archive"
+    assert site.role_for("/vault3/home/x") == "home", "home is still checked first"
+    assert site.to_json()["role_heuristics"] == [["archive", "*/vault*"], ["archive", "*/Keep*"]]
+
+
+def test_heuristics_and_decimal_mounts_are_read_from_json(tmp_path):
+    from dirscape.sitecfg import load_site
+
+    conf = tmp_path / "config.json"
+    conf.write_text(
+        '{"heuristics": {"archive": ["*/vault*"]}, "decimal_suffix_mounts": ["/grant"],'
+        ' "plugin": {"fileset_prefixes": ["project-"]}}'
+    )
+    site = load_site([str(conf)])
+    assert site.role_for("/vault/x") == "archive"
+    assert site.decimal_suffix_mounts == ["/grant"]
+    assert site.plugin == {"fileset_prefixes": ["project-"]}
+
+
+def test_decimal_suffix_mounts_reach_the_wrapper_backend(tmp_path):
+    """No site's mount is decimal by default; a site names its own."""
+    from dirscape.quota import default_backends, wrapper
+    from dirscape.sitecfg import load_site
+
+    def wrapper_of(site):
+        backends = default_backends(site)
+        (backend,) = [b for b in backends if isinstance(b, wrapper.SiteWrapperBackend)]
+        return backend
+
+    assert wrapper.DECIMAL_SUFFIX_MOUNTS == {}
+    assert not wrapper_of(load_site(paths=[])).decimal_mounts
+
+    conf = tmp_path / "site.conf"
+    conf.write_text("[quota]\ndecimal_suffix_mounts = /grant, /other\n")
+    site = load_site([str(conf)])
+    assert site.decimal_suffix_mounts == ["/grant", "/other"]
+    assert wrapper_of(site).decimal_mounts == {
+        "/grant": wrapper.DECIMAL_SUFFIX_NOTE,
+        "/other": wrapper.DECIMAL_SUFFIX_NOTE,
+    }
+
+
+def test_the_site_template_documents_every_new_section():
+    from dirscape.sitecfg import SITE_TEMPLATE
+
+    for needle in ("[plugin]", "[heuristics]", "decimal_suffix_mounts"):
+        assert needle in SITE_TEMPLATE

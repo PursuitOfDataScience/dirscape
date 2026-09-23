@@ -1561,7 +1561,7 @@ def sweep(opts, runner=None, save_state=True):
         else:
             runner = SubprocessRunner(budget=budget)
 
-    run.plugins = detect_plugins(runner, list(run.mounts))
+    run.plugins = detect_plugins(runner, list(run.mounts), site=run.site)
     _apply_plugin_defaults(run.site, run.plugins)
     mark("plugins")
 

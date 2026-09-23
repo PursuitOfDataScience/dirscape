@@ -1827,9 +1827,15 @@ def test_the_tree_sums_walked_figures_and_never_calls_them_unknown(tmp_path):
     text = render_tree(roots, style=style)
     assert "?" not in text, "an absent fileset is not an unknown one: %r" % (text,)
     assert "no quota here" in text, "it says why there is no fileset"
-    # 3 files of one 4k block each, in the second directory only, and the
-    # device node must report the pair rather than whichever came first.
-    assert "12K used" in text or "12.0K used" in text, text
+    # 3 files in the second directory only, and the device node must report
+    # the pair rather than whichever came first. What 3 small files occupy is
+    # the filesystem's business (GPFS can charge a fresh 4k file 0 blocks and
+    # a flushed one 12k), so the expected figure is the two walks' own sum.
+    from dirscape.render.fields import human_bytes
+
+    walked = [row.used for root in roots for row in root.quota.rows]
+    assert walked[0] == 0 and walked[1] > 0, walked
+    assert "%s used" % (human_bytes(sum(walked)),) in text, text
 
 
 def test_the_detail_view_is_fields_and_not_paragraphs():

@@ -73,7 +73,7 @@ _DEFAULT_ROLE_PATTERNS = (
     # makes a user distrust the whole table.
     ("software", ("*/software*", "*/apps", "*/apps/*", "*/modules*", "/opt", "/opt/*")),
     ("dataset", ("*databases*", "*datasets*", "*/data/shared*", "*/reference*")),
-    ("archive", ("*archive*", "*/tape*", "*/cold*", "*/cfs*", "*/dune*")),
+    ("archive", ("*archive*", "*/tape*", "*/cold*")),
     ("project", ("*/project*", "*/proj*", "*/work*", "*/groups/*", "*/lab/*")),
     ("local", ("/tmp", "/tmp/*", "/var/tmp*", "/dev/shm*", "*/local")),
 )
@@ -134,6 +134,10 @@ wrapper_paths =
 # Extra directories to search for backend executables, comma-separated.
 # GPFS tools are commonly installed outside PATH, in /usr/lpp/mmfs/bin.
 extra_bin_dirs = /usr/lpp/mmfs/bin
+# Mount points whose wrapper section is printed in 1000-based steps while the
+# wrapper counts 1024-byte blocks, comma-separated. Nothing in the output
+# itself says so, so a T there is overstated by 7.4% unless it is listed here.
+decimal_suffix_mounts =
 
 [datasets]
 # Shared collection directories to list one level deep, comma-separated, so a
@@ -155,6 +159,33 @@ roots =
 # node_class, note. Purely advisory, and shown in the POLICY column.
 #   /scratch/* = purge_days=30; backup=no; speed=fast
 #   /software  = readonly=yes; backup=yes
+
+[heuristics]
+# role = patterns . EXTENDS one built-in heuristic in place, where [roles]
+# overrides everything: checked after the home, scratch, software and dataset
+# patterns, and case-insensitively, exactly like the built-in words.
+#   archive = */vault*
+
+[plugin]
+# What a site can only EXECUTE rather than describe. Every key is optional,
+# and with no [plugin] section there is no plugin. Lists are comma-separated;
+# fileset_groups and roles take left:right pairs.
+#   description            = Example Cluster
+#   detect_files           = /opt/site/bin/allocs
+#   detect_device_prefixes = example
+#   bin_dir                = /opt/site/bin
+#   allocation_command     = allocs storage
+#   fileset_prefixes       = project2-, project-
+#   group_prefixes         = pi-
+#   fileset_groups         = project-ops:ops-staff
+#   wrapper_paths          = /opt/site/bin/quota
+#   extra_bin_dirs         = /usr/lpp/mmfs/bin, /opt/site/bin
+#   dataset_roots          = /datasets
+#   snapshot_roots         = /snapshots
+#   roles                  = /work:project, /work/*:project
+#   quota_archive          = /var/lib/quota-history
+#   quota_archive_latest   = latest-parsable.quota
+#   quota_archive_daily    = ^(\\d{8})-gpfs\\.quota$
 """
 
 
@@ -249,6 +280,9 @@ class Site(object):
         "dataset_roots",
         "snapshot_roots",
         "policy_globs",
+        "role_heuristics",
+        "decimal_suffix_mounts",
+        "plugin",
     )
 
     def __init__(self):
@@ -276,6 +310,19 @@ class Site(object):
         # nothing about `/home` or the mount table leads you to it.
         self.snapshot_roots = []  # type: List[str]
         self.policy_globs = []  # type: List[Tuple[str, Dict[str, object]]]
+        # (role, pattern) pairs that EXTEND one built-in heuristic group, where
+        # a `[roles]` glob would override everything: a site's own word for
+        # archive storage belongs beside `*archive*`, checked in the same
+        # place and case-insensitively, not ahead of the home and scratch
+        # patterns that would otherwise have claimed a subdirectory first.
+        self.role_heuristics = []  # type: List[Tuple[str, str]]
+        # Mount points whose wrapper figures use 1000-based steps. See
+        # `quota.wrapper.DECIMAL_SUFFIX_NOTE`.
+        self.decimal_suffix_mounts = []  # type: List[str]
+        # The `[plugin]` section, raw. Read by `plugins.site.ConfiguredSite`,
+        # which is how a site's non-declarative knowledge stays out of the
+        # package: see that module.
+        self.plugin = {}  # type: Dict[str, object]
 
     # -- lookups ---------------------------------------------------------
 
@@ -300,7 +347,8 @@ class Site(object):
 
         lowered = path.rstrip("/").lower() or "/"
         for role, patterns in _DEFAULT_ROLE_PATTERNS:
-            for pattern in patterns:
+            extra = [p.lower() for r, p in self.role_heuristics if r == role]
+            for pattern in tuple(patterns) + tuple(extra):
                 if fnmatch.fnmatch(lowered, pattern):
                     return role
         return "other"
@@ -416,6 +464,9 @@ class Site(object):
             "dataset_roots": list(self.dataset_roots),
             "snapshot_roots": list(self.snapshot_roots),
             "ignore": list(self.ignore),
+            "role_heuristics": [list(pair) for pair in self.role_heuristics],
+            "decimal_suffix_mounts": list(self.decimal_suffix_mounts),
+            "plugin": dict(self.plugin),
         }
 
 
@@ -459,9 +510,19 @@ def _merge_ini(site, text, source):
             # paths its administrator did not ask for.
             site.group_prefixes = extra_groups
 
+    if parser.has_section("heuristics"):
+        for role, patterns in parser.items("heuristics"):
+            role = role.strip().lower()
+            if role in ROLES:
+                for pattern in _split_list(patterns):
+                    site.role_heuristics.append((role, pattern))
+
     if parser.has_section("quota"):
         site.quota_order.extend(_split_list(parser.get("quota", "order", fallback="")))
         site.wrapper_paths.extend(_split_list(parser.get("quota", "wrapper_paths", fallback="")))
+        site.decimal_suffix_mounts.extend(
+            _split_list(parser.get("quota", "decimal_suffix_mounts", fallback=""))
+        )
         extra_dirs = _split_list(parser.get("quota", "extra_bin_dirs", fallback=""))
         for directory in extra_dirs:
             if directory not in site.extra_bin_dirs:
@@ -478,6 +539,12 @@ def _merge_ini(site, text, source):
             if policy:
                 site.policy_globs.append((pattern.strip(), policy))
 
+    if parser.has_section("plugin"):
+        # Raw strings. The plugin splits the lists itself, because only it
+        # knows which keys are lists, which are pairs and which are a regex.
+        for key, value in parser.items("plugin"):
+            site.plugin[key.strip()] = value.strip()
+
 
 def _merge_json(site, text, source):
     # type: (Site, str, str) -> None
@@ -493,6 +560,7 @@ def _merge_json(site, text, source):
         ("wrapper_paths", site.wrapper_paths),
         ("dataset_roots", site.dataset_roots),
         ("snapshot_roots", site.snapshot_roots),
+        ("decimal_suffix_mounts", site.decimal_suffix_mounts),
     ):
         value = payload.get(key)
         if isinstance(value, list):
@@ -513,6 +581,15 @@ def _merge_json(site, text, source):
         for pattern, policy in policies.items():
             if isinstance(policy, dict):
                 site.policy_globs.append((str(pattern), dict(policy)))
+    heuristics = payload.get("heuristics")
+    if isinstance(heuristics, dict):
+        for role, patterns in heuristics.items():
+            if str(role).lower() in ROLES and isinstance(patterns, list):
+                for pattern in patterns:
+                    site.role_heuristics.append((str(role).lower(), str(pattern)))
+    plugin = payload.get("plugin")
+    if isinstance(plugin, dict):
+        site.plugin.update(plugin)
 
 
 def load_site(paths=None, warn=None):

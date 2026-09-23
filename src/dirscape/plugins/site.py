@@ -1,30 +1,47 @@
-"""ExampleU HPC: the three things about this site that cannot be config.
+"""A site's non-declarative knowledge, driven entirely by `[plugin]` config.
 
-Everything declarative about HPC belongs in `/etc/dirscape/site.conf`. Three
-things are not declarative and so they live here:
+`sitecfg` covers what a site can DESCRIBE. Three things a site may only be able
+to EXECUTE live here instead, and every one of them is configured rather than
+written into the package, so the package names no cluster at all:
 
-1. **The membership rule is code, not a convention.** Group name, directory
-   name and fileset name are three different strings here. `/project/hpc` is
-   group-owned by `hpc-staff` and lives in fileset `project-hpc`. The
-   authoritative rule is in the site's own `sitequota.py`, which is what the
-   `quota` command actually runs, and it is reproduced in `owns_fileset` below.
+1. **A fileset membership rule.** Group name, directory name and fileset name
+   can be three different strings: a directory `/project/ops` group-owned by
+   `ops-staff` and living in fileset `project-ops`. `owns_fileset` strips the
+   configured prefixes, honours the configured special cases first, and
+   accepts either the bare group or a `pi-` style group.
 
-2. **An allocation CLI with its own table format.** `allocs storage` reports
-   allocations on `cfs1`, `cfs2`, `cfs4` and `project3`, and none of those
-   paths exist on the node that printed them. That mismatch is the single most
-   useful thing this tool reports, and it is only visible if something parses
-   that table.
+2. **An allocation command with its own table format.** Some sites print what
+   storage an account has been granted, including allocations with no path on
+   the node that printed them. That mismatch is the single most useful thing
+   this tool reports, and it is only visible if something parses that table.
 
-3. **A world-readable historical quota archive.** `/project/hpc/usagedata/gpfsdumps`
-   holds daily cluster-wide `mmrepquota` dumps back to 2021-02-08. Bisecting
-   them dates a fileset's creation to the day, which is otherwise impossible
-   here: birth time is unavailable on GPFS (`stat -c %W` returns 0) and
-   directory mtime is a decoy (`/project/aarnold`'s fileset first appears in
-   this archive in March 2026 while its directory mtime reads 2026-05-15, two
-   months late).
+3. **A readable history of daily quota dumps.** Bisecting a directory of daily
+   `mmrepquota` dumps dates a fileset's creation to the day, which is otherwise
+   impossible where birth time is unavailable (`stat -c %W` returns 0 on GPFS)
+   and directory mtime is a decoy that can read months late.
 
-Point 3 is a happy accident of one site. The core's newness mechanism is its
-own snapshot lineage and must never depend on anything here.
+Point 3 is an accident of whichever site keeps such an archive. The core's
+newness mechanism is its own snapshot lineage and never depends on it.
+
+Every key is optional, and a site with no `[plugin]` section gets no plugin:
+
+    [plugin]
+    description            = Example Cluster
+    detect_files           = /opt/site/bin/allocs
+    detect_device_prefixes = example
+    bin_dir                = /opt/site/bin
+    allocation_command     = allocs storage
+    fileset_prefixes       = project2-, project-
+    group_prefixes         = pi-
+    fileset_groups         = project-ops:ops-staff
+    wrapper_paths          = /opt/site/bin/quota
+    extra_bin_dirs         = /usr/lpp/mmfs/bin, /opt/site/bin
+    dataset_roots          = /datasets
+    snapshot_roots         = /snapshots
+    roles                  = /work:project, /work/*:project
+    quota_archive          = /var/lib/quota-history
+    quota_archive_latest   = latest-parsable.quota
+    quota_archive_daily    = ^(\\d{8})-gpfs\\.quota$
 """
 
 import os
@@ -34,40 +51,47 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import Allocation, SitePlugin
 
-__all__ = ["HPCPlugin", "parse_accounts_storage", "parse_mmrepquota_parsable"]
+__all__ = ["ConfiguredSite", "parse_allocation_table", "parse_mmrepquota_parsable"]
+
+#: What a daily dump is called when `quota_archive_daily` does not say.
+DEFAULT_ARCHIVE_DAILY = r"^(\d{8})-gpfs\.quota$"
 
 
-# The historical archive. Read-only, world-readable through a `--x` traversal
-# on /project/hpc, and entirely optional: every method that touches it degrades
-# to None when it is absent, which is what happens on every other cluster.
-_ARCHIVE_DIR = "/project/hpc/usagedata/gpfsdumps"
-_ARCHIVE_LATEST = "last-gpfs-parsable.quota2"
-_ARCHIVE_DAILY = re.compile(r"^(\d{8})-gpfs\.quota$")
-
-# Site CLIs. Absolute paths as well as bare names, because a site wrapper is
-# sometimes a SHELL ALIAS and a subprocess cannot see one: on meadow2 the
-# working `quota` is an alias to a script while the binary on PATH exits 127.
-_SITE_BIN = "/opt/site/bin"
-_WRAPPER_PATHS = (
-    "/opt/site/bin/quota",
-    "/project2/hpc/admin/bin/quota.py",
-)
-
-# Fileset prefixes that encode a group name, longest first so `project2-` is
-# tried before `project-` and does not get half-stripped.
-_FILESET_PREFIXES = ("project2-", "project3-", "collie3-", "project-")
+def _split(value):
+    # type: (object) -> List[str]
+    """A config value as a list: comma or newline separated, or a JSON list."""
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    out = []  # type: List[str]
+    for line in str(value or "").replace(",", "\n").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
 
 
-def parse_accounts_storage(text):
-    # type: (str) -> List[Allocation]
-    """Parse the `allocs storage` ASCII table.
+def _pairs(value):
+    # type: (object) -> List[Tuple[str, str]]
+    """`left:right` entries, split on the LAST colon so a glob keeps its own."""
+    out = []  # type: List[Tuple[str, str]]
+    for entry in _split(value):
+        if ":" in entry:
+            left, right = entry.rsplit(":", 1)
+            if left.strip() and right.strip():
+                out.append((left.strip(), right.strip()))
+    return out
 
-    Shape, as measured:
+
+def parse_allocation_table(text, source="allocations"):
+    # type: (str, str) -> List[Allocation]
+    """Parse an allocation command's ASCII table.
+
+    Shape, as measured at one site:
 
         +-----------+------+---------+--------+-------------------+
         |  Account  |  ID  |  Type   | GB(s)  |     Location      |
         +-----------+------+---------+--------+-------------------+
-        | hpc-staff | 301  | Special | 256000 |  cfs1/hpc-staff   |
+        | ops-staff | 301  | Special | 256000 |  cfs1/ops-staff   |
 
     Parsed by locating the columns from the HEADER row rather than by fixed
     offsets, so a widened Account column does not shift every field. Rows whose
@@ -108,8 +132,8 @@ def parse_accounts_storage(text):
             Allocation(
                 account=row.get("account", ""),
                 location=location,
-                # Deliberately NOT derived into a path. "cfs4/hpc-staff" looks
-                # like it should be "/cfs4/hpc-staff" and often is, but the
+                # Deliberately NOT derived into a path. "cfs4/ops-staff" looks
+                # like it should be "/cfs4/ops-staff" and often is, but the
                 # allocation database is not a mount table and inventing a path
                 # here would be exactly the guess that rapiDU's RD-3 made when
                 # it attributed a /scratch walk to the wrong cluster.
@@ -118,7 +142,7 @@ def parse_accounts_storage(text):
                 kind=row.get("type", ""),
                 start=row.get("start", ""),
                 end=row.get("end", ""),
-                source="allocs storage",
+                source=source,
             )
         )
 
@@ -197,15 +221,25 @@ def _fileset_names_in_daily(text):
     return names
 
 
-class HPCPlugin(SitePlugin):
-    """ExampleU HPC (meadow2, meadow3, collie3)."""
+class ConfiguredSite(SitePlugin):
+    """Whatever the `[plugin]` section of the site config describes."""
 
-    name = "hpc"
+    name = "site"
 
-    def __init__(self):
-        # type: () -> None
+    def __init__(self, settings=None):
+        # type: (Optional[Dict[str, object]]) -> None
+        self.settings = dict(settings or {})
         self._archive_days = None  # type: Optional[List[Tuple[str, str]]]
         self._first_seen_cache = {}  # type: Dict[str, Optional[float]]
+
+    def _list(self, key):
+        # type: (str) -> List[str]
+        return _split(self.settings.get(key))
+
+    def _text(self, key, default=""):
+        # type: (str, str) -> str
+        value = self.settings.get(key)
+        return str(value).strip() if value not in (None, "") else default
 
     # -- detection -------------------------------------------------------
 
@@ -213,98 +247,89 @@ class HPCPlugin(SitePlugin):
         # type: (object, Sequence[object]) -> bool
         """Cheap, and never a hostname check.
 
-        Two independent signals, either of which is enough: the site's own CLI
-        directory, or a storage device named after one of the clusters. A
-        hostname check would be the wrong instrument, for the same reason
-        nodetop filters GPU nodes on GRES rather than on a hostname prefix:
-        `collie3-bigmem1` is a CPU node despite its name.
+        No `[plugin]` section means no plugin. With one, either configured
+        signal is enough: a file only this site has, or a storage device named
+        after one of its clusters. A section that names neither applies
+        wherever it is read. A hostname check would be the wrong instrument,
+        for the same reason nodetop filters GPU nodes on GRES rather than on a
+        hostname prefix: a node called `...-bigmem1` can be a CPU node.
         """
-        if os.path.isdir(_SITE_BIN) and os.path.isfile(os.path.join(_SITE_BIN, "accounts")):
+        if not self.settings:
+            return False
+        files = self._list("detect_files")
+        prefixes = tuple(self._list("detect_device_prefixes"))
+        if not files and not prefixes:
+            return True
+        if any(os.path.isfile(path) for path in files):
             return True
         for mount in mounts or ():
             device = str(getattr(mount, "device", "") or "")
-            if device.startswith(("meadow", "collie3")):
+            if prefixes and device.startswith(prefixes):
                 return True
         return False
 
     def describe(self):
         # type: () -> str
-        return "ExampleU HPC (meadow2 / meadow3 / collie3)"
+        return self._text("description", "a configured site")
 
     def site_defaults(self):
         # type: () -> Dict[str, object]
-        """Config this site would otherwise need a `site.conf` to state."""
+        """Config values, merged at the LOWEST precedence.
+
+        Each path list is existence-checked, because one config serves every
+        node of a site and a directory can exist on one class of node only:
+        a snapshot tree published on login nodes is absent on every compute
+        node, and a root that is not there must not become a row.
+        """
         return {
-            "fileset_prefixes": list(_FILESET_PREFIXES),
-            "group_prefixes": ["pi-"],
-            "wrapper_paths": [p for p in _WRAPPER_PATHS if os.path.isfile(p)],
-            "extra_bin_dirs": ["/usr/lpp/mmfs/bin", _SITE_BIN],
-            "dataset_roots": [p for p in ("/project2/reference",) if os.path.isdir(p)],
-            # `/snapshots` is the only route to this site's GPFS snapshots
-            # that a LOGIN node offers, and nothing in the mount table leads
-            # to it: it is a plain top-level directory belonging to no device.
-            # Declared here rather than in the core because the name is this
-            # site's choice, and existence-checked because the directory is
-            # login-node only and absent on every compute node.
-            #
-            # One entry covers both shapes the site uses. Meadow3 puts the
-            # snapshots straight underneath (`/snapshots/<SNAP>/home/<user>`)
-            # and meadow2 puts one directory per filesystem in between
-            # (`/snapshots/home/<SNAP>/home/<user>`); `SnapshotIndex.containers`
-            # tells them apart by looking at the names.
-            "snapshot_roots": [p for p in ("/snapshots",) if os.path.isdir(p)],
-            # `/collie3` is project space and nothing in the built-in role
-            # heuristics says so: it matches no pattern, so it scored the
-            # fallback role `other` and sorted to the bottom of the table
-            # under that heading. The site's own `quota` command calls it
-            # ">>> Capacity Filesystem: project (Collie3 GPFS mounted at
-            # /collie3)", so `project` is the site's word and not a guess.
-            #
-            # This is a LABEL and it is the whole effect. Discovery stopped
-            # depending on the role when `candidates` moved to a denylist, so
-            # `/collie3/hpc-staff` is found either way; without this it was
-            # found and then filed under "other".
-            "role_globs": [("/collie3", "project"), ("/collie3/*", "project")],
+            "fileset_prefixes": self._list("fileset_prefixes"),
+            "group_prefixes": self._list("group_prefixes"),
+            "wrapper_paths": [p for p in self._list("wrapper_paths") if os.path.isfile(p)],
+            "extra_bin_dirs": self._list("extra_bin_dirs"),
+            "dataset_roots": [p for p in self._list("dataset_roots") if os.path.isdir(p)],
+            "snapshot_roots": [p for p in self._list("snapshot_roots") if os.path.isdir(p)],
+            # A LABEL, and that is the whole effect: a project area named by
+            # no built-in pattern scores the fallback role `other` and sorts
+            # to the bottom of the table under that heading. Discovery does
+            # not depend on the role, so the root is found either way.
+            "role_globs": _pairs(self.settings.get("roles")),
         }
 
     # -- allocations -----------------------------------------------------
 
     def allocations(self, runner, budget):
         # type: (object, object) -> List[Allocation]
-        """Read `allocs storage`.
+        """Run the configured allocation command and parse its table.
 
         Returns an empty list on any failure rather than raising. An allocation
         listing is an enrichment: without it the tool still reports every
         mounted root correctly, it just cannot say "allocated, not mounted
         here" about the ones that are missing.
         """
-        exe = runner.available("accounts", extra_dirs=(_SITE_BIN,))  # type: ignore[attr-defined]
+        command = self._text("allocation_command").split()
+        if not command:
+            return []
+        bin_dir = self._text("bin_dir")
+        extra = (bin_dir,) if bin_dir else ()
+        exe = runner.available(command[0], extra_dirs=extra)  # type: ignore[attr-defined]
         if not exe:
             return []
-        result = runner.run([exe, "storage"])  # type: ignore[attr-defined]
+        result = runner.run([exe] + command[1:])  # type: ignore[attr-defined]
         if result.failed:
             return []
-        return parse_accounts_storage(result.stdout)
+        return parse_allocation_table(result.stdout, source=" ".join(command))
 
     # -- membership ------------------------------------------------------
 
     def owns_fileset(self, fileset, groups):
         # type: (str, Sequence[str]) -> Optional[bool]
-        """The site's own rule, reproduced from its `sitequota.py` (lines 377-408).
+        """The site's own rule, applied to one fileset.
 
-        The original, which is what the `quota` command runs:
-
-            name = proj.replace('project-', '').replace('collie3-', '')
-            if proj == 'project-hpc' and 'hpc-staff' not in groups:
-                continue
-            if name not in groups and 'pi-' + name not in groups:
-                continue
-
-        Reproduced rather than reimplemented, including the `project-hpc`
-        special case, because this rule is the site's definition of the answer
-        and a cleaner rule would be a different, wrong answer. Verified against
-        the cluster-wide fileset dump: it returns exactly the three filesets
-        the site `quota` command prints for this account.
+        Special cases come first and the order matters: `project-ops` strips
+        to `ops`, which can be a real group too, so testing the general rule
+        first would grant it to every member of `ops`. Reproduced exactly
+        rather than tidied, because the site's rule is the site's definition
+        of the answer and a cleaner rule would be a different, wrong answer.
 
         Returns None, not False, for a fileset the rule does not recognise. A
         rule that has never heard of a fileset has not established that the
@@ -314,14 +339,12 @@ class HPCPlugin(SitePlugin):
             return None
         group_set = set(groups or ())
 
-        # The special case comes first in the original and the order matters:
-        # `project-hpc` strips to `hpc`, which IS a real group here, so testing
-        # the general rule first would grant it to every member of `hpc`.
-        if fileset == "project-hpc":
-            return "hpc-staff" in group_set
+        for special, needed in _pairs(self.settings.get("fileset_groups")):
+            if fileset == special:
+                return needed in group_set
 
         name = fileset
-        for prefix in _FILESET_PREFIXES:
+        for prefix in self._list("fileset_prefixes"):
             if name.startswith(prefix):
                 name = name[len(prefix) :]
                 break
@@ -331,7 +354,8 @@ class HPCPlugin(SitePlugin):
             # about it. Those are reached through the mount table instead.
             return None
 
-        return bool(name in group_set or "pi-" + name in group_set)
+        group_prefixes = self._list("group_prefixes") or ["pi-"]
+        return bool(name in group_set or any(p + name in group_set for p in group_prefixes))
 
     # -- history ---------------------------------------------------------
 
@@ -342,16 +366,19 @@ class HPCPlugin(SitePlugin):
             return self._archive_days
 
         found = []  # type: List[Tuple[str, str]]
-        try:
-            with os.scandir(_ARCHIVE_DIR) as entries:
-                for entry in entries:
-                    match = _ARCHIVE_DAILY.match(entry.name)
-                    if match:
-                        found.append((match.group(1), entry.path))
-        except OSError:
-            # Absent on every other cluster, and unreadable to a user without
-            # traversal on /project/hpc. Both are normal.
-            found = []
+        directory = self._text("quota_archive")
+        pattern = re.compile(self._text("quota_archive_daily", DEFAULT_ARCHIVE_DAILY))
+        if directory:
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        match = pattern.match(entry.name)
+                        if match:
+                            found.append((match.group(1), entry.path))
+            except OSError:
+                # Absent on every node that does not mount it, and unreadable
+                # to a user without traversal on its parent. Both are normal.
+                found = []
         found.sort()
         self._archive_days = found
         return found
@@ -365,7 +392,7 @@ class HPCPlugin(SitePlugin):
         oldest file (in which case it predates the archive and the honest
         answer is "at least this old", not a date).
 
-        Bisection rather than a linear scan because the archive holds about
+        Bisection rather than a linear scan because an archive can hold about
         2,000 files: 11 reads instead of 2,000. Each read is a few hundred KB.
         """
         if fileset in self._first_seen_cache:
@@ -420,9 +447,12 @@ class HPCPlugin(SitePlugin):
         the ones this user holds blocks in, which is how a fileset the user has
         group access to but has never written to becomes visible.
         """
-        path = os.path.join(_ARCHIVE_DIR, _ARCHIVE_LATEST)
+        directory = self._text("quota_archive")
+        latest = self._text("quota_archive_latest")
+        if not directory or not latest:
+            return []
         try:
-            with open(path, "r") as handle:
+            with open(os.path.join(directory, latest), "r") as handle:
                 return parse_mmrepquota_parsable(handle.read())
         except OSError:
             return []

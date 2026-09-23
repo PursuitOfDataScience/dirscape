@@ -22,7 +22,7 @@ FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 @pytest.fixture(autouse=True)
 def _a_person_at_the_keyboard(monkeypatch):
-    """Every test runs as a person unless it sets an agent variable itself.
+    """Every test runs as a person, on no site config, unless it says otherwise.
 
     The suite is often launched from an agent harness, which exports
     `AI_AGENT` or `CLAUDECODE`, and under one of those `main` behaves
@@ -34,6 +34,11 @@ def _a_person_at_the_keyboard(monkeypatch):
 
     for name in cli.AGENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+    # Nor does a test read the machine's own site config. A developer's
+    # `~/.config/dirscape/config.conf` can switch the site plugin on, and a
+    # suite that passes on one login node and fails on a clean runner is
+    # testing the node. `load_site` skips a path that is not a regular file.
+    monkeypatch.setenv("DIRSCAPE_CONFIG", os.devnull)
 
 
 @pytest.fixture

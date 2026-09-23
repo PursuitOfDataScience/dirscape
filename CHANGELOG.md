@@ -5,6 +5,27 @@ All notable changes to `dirscape` are recorded here, newest first, following
 
 ## [Unreleased]
 
+### Changed
+
+- **The site plugin knows no site.** Everything it did for one cluster, the
+  allocation table it parses, the fileset membership rule and its special
+  case, the daily quota archive it bisects, the wrapper scripts, dataset and
+  snapshot roots and role labels it supplies, now comes from a `[plugin]`
+  section of `site.conf`, and with no such section there is no plugin. The
+  code is the same code: its constants moved into configuration, and the
+  output on the cluster it was written for is unchanged, checked view by view
+  against the previous release with that cluster's settings in a config file.
+  `dirscape --site-template` documents every key.
+- **`[heuristics]` extends a built-in role in place.** `archive = */vault*`
+  is checked where `*archive*` is, after the home and scratch patterns and
+  case-insensitively, where a `[roles]` glob would override everything. Two
+  archive words that only ever described one site left the built-ins for it.
+- **`[quota] decimal_suffix_mounts`** names the wrapper sections printed in
+  1000-based steps. No mount is decimal by default any more, and the wrapper
+  paths the package searches on its own are down to `/usr/local/bin/quota`.
+- The test suite no longer reads the machine's own site config, so a
+  developer's `~/.config/dirscape/config.conf` cannot change what it tests.
+
 ### Added
 
 - **`dirscape recover <path>`: every read-only copy the filesystem still
@@ -42,7 +63,7 @@ All notable changes to `dirscape` are recorded here, newest first, following
   construction.
 - **`/snapshots`, and any other snapshot tree a site publishes outside its
   filesystems.** `[snapshots] roots` in `site.conf`, supplied automatically by
-  the HPC plugin where the directory exists. The hidden `.snapshots`,
+  the site plugin where the directory exists. The hidden `.snapshots`,
   `.snapshot`, `.zfs/snapshot` and `.snap` trees inside a filesystem still
   need no configuration; this covers the case they cannot reach, and on this
   site that case is the only route a LOGIN node offers. `/snapshots` is a
@@ -557,7 +578,7 @@ so Python 3.6 installs from the wheel, which pip prefers anyway.
   up a 149 GiB tree the wrapper had already reported to the byte. Fixed by
   the `<mount>/<scope>` join described below, which gets there without any
   site configuring anything.
-- `/collie3` is labelled `project` rather than `other` by the HPC plugin,
+- `/collie3` is labelled `project` rather than `other` by the site plugin,
   which is the site's own word for it: its `quota` command prints "Capacity
   Filesystem: project (Collie3 GPFS mounted at /collie3)". A label only;
   discovery no longer depends on the role.

@@ -834,6 +834,7 @@ def default_backends(site=None):
 
     extra_dirs = tuple(_site_list(site, "extra_bin_dirs")) or None
     wrapper_paths = tuple(_site_list(site, "wrapper_paths")) or None
+    decimal = dict.fromkeys(_site_list(site, "decimal_suffix_mounts"), wrapper.DECIMAL_SUFFIX_NOTE)
     built = [
         gpfs.GpfsBackend(extra_dirs=extra_dirs or gpfs.GPFS_BIN_DIRS),
         lustre.LustreBackend(extra_dirs=extra_dirs or ()),
@@ -842,6 +843,7 @@ def default_backends(site=None):
         wrapper.SiteWrapperBackend(
             script_paths=wrapper_paths or wrapper.KNOWN_WRAPPER_PATHS,
             extra_dirs=extra_dirs or (),
+            decimal_mounts=decimal or None,
         ),
         posix.PosixQuotaBackend(extra_dirs=extra_dirs or ()),
     ]

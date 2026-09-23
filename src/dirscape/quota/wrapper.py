@@ -87,32 +87,28 @@ __all__ = [
 
 
 # Absolute paths as well as the bare name, because a site wrapper is often not
-# a binary on PATH at all. The second entry is the measured alias target on one
-# cluster here, where the PATH binary exits 127 and this file is the one that
-# works; it is reachable from other clusters on the shared filesystem, so it is
-# a real path rather than folklore.
-KNOWN_WRAPPER_PATHS = (
-    "/opt/site/bin/quota",
-    "/project2/hpc/admin/bin/quota.py",
-    "/usr/local/bin/quota",
+# a binary on PATH at all: where the working `quota` is a shell alias, the
+# binary on PATH can exit 127 while a script elsewhere is the one that works.
+# A site names its own in `[quota] wrapper_paths`; this is the generic place.
+KNOWN_WRAPPER_PATHS = ("/usr/local/bin/quota",)
+
+# Why a section's figures are in doubt when the producer formatted them with
+# 1000-based steps. Measured at one site: its wrapper formats every section
+# with a 1024-based helper except one, and the input to both is a count of
+# 1024-byte KB blocks, so a `7.52T` there is 7.52 * 1000**3 KB, and reading the
+# suffix as binary overstates it by 7.4% (1024**3 / 1000**3 = 1.0737), which on
+# that row is 553 GB.
+DECIMAL_SUFFIX_NOTE = (
+    "the wrapper formats this section with 1000-based steps while its "
+    "input is 1024-byte blocks, so reading the suffix as binary would "
+    "overstate a T figure by 7.4%"
 )
 
 # Sections whose figures the producer formatted with 1000-based steps, keyed by
-# the mount point it publishes. Data rather than logic, and empty for any site
-# not listed, because there is no signal in the output itself to detect it.
-#
-# Measured from the wrapper's own source: it formats every section with a
-# 1024-based helper except one, which uses `decimal_line` / `to_decimal`. The
-# input to both is a count of 1024-byte KB blocks, so a `7.52T` there is
-# 7.52 * 1000**3 KB, and reading the suffix as binary overstates it by 7.4%
-# (1024**3 / 1000**3 = 1.0737), which on that row is 553 GB.
-DECIMAL_SUFFIX_MOUNTS = {
-    "/shared": (
-        "the wrapper formats this section with 1000-based steps while its "
-        "input is 1024-byte blocks, so reading the suffix as binary would "
-        "overstate a T figure by 7.4%"
-    )
-}
+# the mount point it publishes. Data rather than logic, and empty unless a site
+# lists its mounts in `[quota] decimal_suffix_mounts`, because there is no
+# signal in the output itself to detect it.
+DECIMAL_SUFFIX_MOUNTS = {}  # type: Dict[str, str]
 
 TIME_NOTE = (
     "this is a cached figure: the wrapper prints a report refreshed by a "

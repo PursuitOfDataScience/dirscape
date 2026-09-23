@@ -1,27 +1,27 @@
-"""Render the README's demo GIF by driving the real `ds` in a terminal.
+"""Render the README's demo GIF by driving the real `ds` interface in a terminal.
 
-Not shipped in the wheel: a maintenance script. It runs the actual command in
-a pseudo-terminal, presses the keys a reader would press, replays every byte
-the program wrote through a terminal emulator, and draws each screen. Nothing
-is mocked, so the GIF cannot show a view the tool does not produce.
+Not shipped in the wheel: a maintenance script. It runs the command in a
+pseudo-terminal, presses the keys a reader would press, replays every byte the
+program wrote through a terminal emulator, and draws each screen.
 
-It records whatever cluster it runs on, so the storyboard only opens rows whose
-listings are public, the site software tree. Never a home or a group
-directory, whose entries are private files or other people's names, and that
-cannot be taken back once the image is pushed. For the same reason the
-recording user's name is replaced, in every frame, by a stand-in of the same
-length, so the columns still line up.
+**Over an invented cluster, never a real one.** `demo_cluster.py` serves a
+made-up sweep and made-up directory listings to the unmodified interface, so
+the renderer, the browser and its keys are real and every name and figure is
+not. A recording of a live cluster puts its paths, groups and usage into a
+public image, and that cannot be taken back once it is pushed. As a second
+line, a frame showing any path outside the invented roots, or the recording
+user's own name, stops the script before a GIF is written.
 
     pip install pyte pillow
     python tools/record_demo.py              # writes assets/demo.gif
 
-Linux only, because it needs `pty`. `--no-state` keeps the recording from
-moving the baseline `ds new` compares against.
+Linux only, because it needs `pty`.
 """
 
 import fcntl
 import os
 import pty
+import re
 import select
 import signal
 import struct
@@ -38,13 +38,17 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "assets" / "demo.gif"
 COLS, ROWS = 100, 26
 
-#: The storyboard. Rows are found by their text, never by index, because the
-#: table is whatever this cluster reports today.
+#: The storyboard. Rows are found by their text, never by index, so the
+#: invented cluster can change without the storyboard counting rows again.
 TABLE_ROW = "/software"
-DESCENT = ("R-4.4.1-el8-x86_64/", "lib64/", "R/", "library/")
-WHY_PATH = "/scratch/meadow3/{user}"
+DESCENT = ("R-4.4.1/", "lib64/", "R/", "library/")
+WHY_PATH = "/scratch/jdoe42"
 USER = os.environ.get("USER") or "me"
-SHOWN_AS = ("jdoe42" + "0" * len(USER))[: len(USER)]
+DRIVER = ROOT / "tools" / "demo_cluster.py"
+
+#: Every path a frame may show: the invented roots and what is under them.
+ALLOWED = ("/home/jdoe42", "/project/astro-lab", "/project/genomics-core", "/scratch/jdoe42")
+ALLOWED += ("/datasets/reference", "/software", "/tmp")
 
 FONTS = (
     "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
@@ -84,27 +88,9 @@ class Terminal:
 
     # -- recording ------------------------------------------------------------
     def shot(self, ms, cursor=False):
-        rows = [
-            self.anonymised([self.screen.buffer[y][x] for x in range(COLS)]) for y in range(ROWS)
-        ]
+        rows = [[self.screen.buffer[y][x] for x in range(COLS)] for y in range(ROWS)]
         where = (self.screen.cursor.x, self.screen.cursor.y) if cursor else None
         self.frames.append((rows, where, ms))
-
-    @staticmethod
-    def anonymised(row):
-        """The row with the recording user's name swapped for `SHOWN_AS`, cell for cell."""
-        text, owner = [], []
-        for x, cell in enumerate(row):
-            for ch in cell.data:
-                text.append(ch)
-                owner.append(x)
-        text = "".join(text)
-        at = text.find(USER)
-        while at >= 0:
-            for i, ch in enumerate(SHOWN_AS):
-                row[owner[at + i]] = row[owner[at + i]]._replace(data=ch)
-            at = text.find(USER, at + len(USER))
-        return row
 
     def feed(self, text):
         self.stream.feed(text.encode("utf-8"))
@@ -132,7 +118,7 @@ class Terminal:
         pid, fd = pty.fork()
         if pid == 0:  # the child: size the window before anything reads it
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
-            os.execvpe(sys.executable, [sys.executable, "-m", "dirscape", *argv], env)
+            os.execvpe(sys.executable, [sys.executable, str(DRIVER), *argv], env)
         self.pid, self.fd = pid, fd
 
     def pump(self, quiet=0.35, limit=40.0):
@@ -209,8 +195,8 @@ def storyboard(term):
     term.press("q", 800)
     term.finish()
 
-    term.type("ds why " + WHY_PATH.format(user=SHOWN_AS))
-    term.spawn(["--no-state", "why", WHY_PATH.format(user=USER)])
+    term.type("ds why " + WHY_PATH)
+    term.spawn(["--no-state", "why", WHY_PATH])
     term.finish()
     term.feed(PROMPT)
     term.shot(4200, cursor=True)
@@ -331,8 +317,13 @@ def main():
     storyboard(term)
     for rows, _cursor, _ms in term.frames:
         for row in rows:
-            if USER in "".join(cell.data for cell in row):
-                raise SystemExit("a frame still names %r; not writing the GIF" % (USER,))
+            text = "".join(cell.data for cell in row)
+            if len(USER) > 2 and USER in text:
+                raise SystemExit("a frame names %r; not writing the GIF" % (USER,))
+            for path in re.findall(r"(?<![\w.])/[\w.+-]+(?:/[\w.+-]*)*", text):
+                # A prefix of an invented root is what the typing animation shows.
+                if not path.startswith(ALLOWED) and not any(r.startswith(path) for r in ALLOWED):
+                    raise SystemExit("a frame shows %r; not writing the GIF" % (path,))
     TARGET.parent.mkdir(exist_ok=True)
     render(term.frames, TARGET)
     seconds = sum(ms for _r, _c, ms in term.frames) / 1000.0

@@ -27,6 +27,7 @@ Exit codes, so a script can branch on them:
 import argparse
 import contextlib
 import errno
+import functools
 import json
 import os
 import shlex
@@ -228,7 +229,7 @@ def _add_global_args(parser, suppress=False):
         "--legend",
         action="store_true",
         default=_absent(suppress),
-        help=h("explain the reach letters and the figure marks"),
+        help=h("explain the access words and the marks the table uses"),
     )
     parser.add_argument(
         "--summary",
@@ -260,9 +261,10 @@ def build_parser():
             "and what is new since last time."
         ),
         epilog=(
-            "dirscape never walks a directory tree: its cost is the number of "
-            "roots, not the number of files. For bytes per directory use `rdu` "
-            "or `ncdu`. "
+            "Sizes come from quotas, so dirscape's cost is the number of roots, "
+            "not the number of files. The one walk it makes is capped, of a root "
+            "no quota covers, and --no-measure skips it. For bytes per directory "
+            "use `rdu` or `ncdu`. "
             "Scripts and agents: `dirscape paths --json` lists every place with "
             "exact figures, `dirscape why PATH --json` explains one path, and "
             "`dirscape mcp` serves the same answers as MCP tools."
@@ -383,6 +385,7 @@ class Run(object):
         "timings",
         "discovery",
         "baseline_at",
+        "baseline_since",
         "saved",
     )
 
@@ -403,6 +406,8 @@ class Run(object):
         self.timings = []  # type: List[Tuple[str, float]]
         self.discovery = unknown(VerdictCategory.NOT_PROBED)
         self.baseline_at = None  # type: Optional[float]
+        # The `--since` that chose the baseline, or None when it is the last run.
+        self.baseline_since = None  # type: Optional[str]
         # False once a save has been attempted and failed.
         self.saved = True
 
@@ -1740,6 +1745,16 @@ def _record_state(run, opts, save=True):
             older = run.lineage.baseline_for(since)
             if older is not None:
                 previous = older
+                run.baseline_since = str(raw_since).strip()
+                if older.taken_at > since:
+                    # `baseline_for` falls back to the oldest run kept when
+                    # none is old enough, and nothing said so: `new --since
+                    # 30d` on a lineage begun that afternoon answered "No
+                    # change since the last run" about a two hour window.
+                    run.warnings.append(
+                        "no run is %s old yet, so --since %s compared against the "
+                        "oldest one kept" % (run.baseline_since, run.baseline_since)
+                    )
 
     run.snapshot = Snapshot.from_roots(
         run.roots,
@@ -3112,7 +3127,7 @@ def _recover(run, target, style, size=None, as_json=False):
             % (style.text(copy.name.ljust(width)), style.dim(age.rjust(12)), copy.path)
         )
     out.append("")
-    how, command = _restore_line(path, copies[0].path)
+    how, command = _restore_line(path, copies[0].path, copies[0].name)
     out.append(style.dim("  " + how))
     out.append("  " + command)
     return "\n".join(out), EXIT_OK
@@ -3132,29 +3147,67 @@ def _copy_back(snapshot, path):
     )
 
 
-def _restore_line(path, newest):
-    # type: (str, str) -> Tuple[str, str]
+def _restore_line(path, newest, name=""):
+    # type: (str, str, str) -> Tuple[str, str]
     """``(what it does, the command)`` to restore ``path`` from ``newest``.
 
     Shared by `recover` and the agent's `recover_path`, so the command a
     person is shown and the one an agent runs cannot drift apart.
+
+    **No command this returns can overwrite anything: every form is
+    `cp -an`.** Only the directory form had `-n`, because `isdir` was the only
+    question asked. A file that still existed fell through to `cp -a SNAP
+    FILE`, so `recover README.md` printed the line that replaces the live
+    README with the older copy, and `recover_path` handed an agent that same
+    line to run. A file that is still there is restored BESIDE itself, named
+    after the snapshot (``name``), which leaves the reader two files to
+    compare instead of choosing for them.
     """
-    exists = os.path.isdir(path)
-    parent = path if exists else (os.path.dirname(path.rstrip("/")) or "/")
-    if not os.access(parent, os.W_OK):
-        # Read-only to this reader (ACME's `/soft`, say), so restoring in place
-        # cannot work: the useful command copies it out to where they are.
-        return (
-            "%s is read-only to you, so copy the newest out with" % (parent,),
-            "cp -a %s ." % (shlex.quote(newest),),
-        )
-    if exists:
+    here = path.rstrip("/") or "/"
+    if os.path.isdir(here):
         # The directory is still there. `cp -a SNAP DIR` would nest the copy
         # inside it as DIR/<name>, and a plain `SNAP/. DIR/` would overwrite
         # every file changed since the snapshot; `-n` puts back only what is
         # missing, which is what a partial loss needs.
-        return "put back what is missing, leaving newer files alone, with", _copy_back(newest, path)
-    return "restore the newest with", "cp -a %s %s" % (shlex.quote(newest), shlex.quote(path))
+        if not os.access(here, os.W_OK):
+            return _copy_out(here, newest)
+        return "put back what is missing, leaving newer files alone, with", _copy_back(newest, here)
+    parent = os.path.dirname(here) or "/"
+    if os.path.lexists(here):
+        if not os.access(parent, os.W_OK):
+            return _copy_out(parent, newest)
+        beside = "%s.%s" % (here, name or "snapshot")
+        return (
+            "it is still here, so put the copy beside it rather than over it, with",
+            "cp -an %s %s" % (shlex.quote(newest), shlex.quote(beside)),
+        )
+    # Gone, and after an `rm -rf` of a whole tree its directory is gone too.
+    # `os.access` is False for a directory that does not exist, which printed
+    # "is read-only to you" about one nobody can see any more, so the nearest
+    # directory that does exist decides, and the missing ones are recreated.
+    anchor = parent
+    while anchor != "/" and not os.path.isdir(anchor):
+        anchor = os.path.dirname(anchor) or "/"
+    if not os.access(anchor, os.W_OK):
+        return _copy_out(anchor, newest)
+    command = "cp -an %s %s" % (shlex.quote(newest), shlex.quote(here))
+    if anchor != parent:
+        return (
+            "restore the newest, recreating the directories above it, with",
+            "mkdir -p %s && %s" % (shlex.quote(parent), command),
+        )
+    return "restore the newest with", command
+
+
+def _copy_out(where, newest):
+    # type: (str, str) -> Tuple[str, str]
+    """Read-only to this reader (ACME's `/soft`, say), so restoring in place
+    cannot work: the useful command copies it out to where they are, and
+    `-n` keeps that from replacing a file of the same name there."""
+    return (
+        "%s is read-only to you, so copy the newest out with" % (where,),
+        "cp -an %s ." % (shlex.quote(newest),),
+    )
 
 
 def _paths(run, opts):
@@ -3381,15 +3434,15 @@ def _render(run, opts, command, style, width):
 
         moved = [c for c in changes if getattr(c, "label", "") != "stranded"]
         if not moved:
+            head = "No change since %s." % (_baseline_words(run),)
             standing = len(changes) - len(moved)
             if standing:
                 return (
-                    "No change since the last run. %d fileset%s still hold "
-                    "space you cannot reach: dirscape stranded%s"
-                    % (standing, "" if standing == 1 else "s", note),
+                    "%s %d fileset%s still hold space you cannot reach: dirscape stranded%s"
+                    % (head, standing, "" if standing == 1 else "s", note),
                     EXIT_OK,
                 )
-            return ("No change since the last run." + note, EXIT_OK)
+            return (head + note, EXIT_OK)
         # The atlas renders the delta panel, so it is reused rather than
         # reimplemented. It is handed the roots the changes REFER TO, not an
         # empty list: with no rows the atlas has nothing to hang the panel on
@@ -3484,6 +3537,27 @@ def _write(text):
                 sys.stdout.close()
             return
         raise
+
+
+def _baseline_words(run):
+    # type: (Run) -> str
+    """The run `new` compared against: ``the last run, at 2026-09-24 09:58 (3m ago)``.
+
+    "No change since the last run" named no time, and under `--since` it was
+    not even the last run. The stamp is written the way the change lines
+    write it ("where the run at 2026-09-21 10:01 reported"), so one run is not
+    dated two ways on one screen.
+    """
+    at = getattr(run, "baseline_at", None)
+    if at is None:
+        return "the last run"
+    which = "the run" if getattr(run, "baseline_since", None) else "the last run,"
+    now = getattr(run.meta, "now", None) or time.time()
+    return "%s at %s (%s)" % (
+        which,
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(at)),
+        render_fields.age_phrase(at, now),
+    )
 
 
 def _surfaceable(run):
@@ -3667,9 +3741,19 @@ def _still(reader=None):
 #: than reading all of them; the count of what was held back is printed.
 CHILD_LIMIT = 200
 
+#: How long reading the listed directory itself may take. Measured on
+#: `/scratch/midway3`: 13,914 entries in 0.07s, so a healthy directory is far
+#: inside this, and the only thing that reaches it is a mount that has hung.
+LIST_READ_S = 3.0
 
-def _children(path, limit=CHILD_LIMIT):
-    # type: (str, int) -> Tuple[List[Dict[str, object]], int]
+#: The allowance for the probes of every child in one listing, together. Each
+#: child also gets at most `DEFAULT_DEADLINE_S` of it, so one hung mount costs
+#: a second and the rest of the listing still answers.
+LIST_PROBES_S = 3.0
+
+
+def _children(path, limit=CHILD_LIMIT, read_s=LIST_READ_S, probes_s=LIST_PROBES_S):
+    # type: (str, int, Optional[float], float) -> Tuple[List[Dict[str, object]], int, bool]
     """The sub-directories of one path, with what a listing can cheaply know.
 
     **One `scandir` and one `stat` per entry, and no walking.** Size per child
@@ -3681,40 +3765,81 @@ def _children(path, limit=CHILD_LIMIT):
     Files are left out. This is a browser for places to put data, and the
     reader is descending towards a directory; a home with 300 dotfiles in it
     would bury the four directories that matter.
+
+    **Every call that touches a filesystem runs under a deadline**, the
+    directory read and each child's probe, on `with_deadline`'s abandoned
+    thread. They ran on the UI thread with none, so one hung mount anywhere
+    under the listed directory froze the whole browser, which is exactly what
+    `discover.access` exists to prevent everywhere else. A child that did not
+    answer in time says so in its access cell. The third value is False when
+    the directory itself did not.
     """
+
+    def read():
+        # type: () -> List[Tuple[str, str]]
+        found = []  # type: List[Tuple[str, str]]
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        found.append((entry.name, entry.path))
+                except OSError:
+                    continue
+        return sorted(found)
+
+    finished, value, exc, _elapsed = with_deadline(read, read_s)
+    if not finished:
+        return [], 0, False
+    if exc is not None:
+        if isinstance(exc, OSError):
+            return [], 0, True
+        raise exc
+    found = list(value) if isinstance(value, list) else []  # type: List[Tuple[str, str]]
+
     out = []  # type: List[Dict[str, object]]
-    try:
-        entries = sorted(os.scandir(path), key=lambda e: e.name)
-    except OSError:
-        return [], 0
-    held = 0
-    for entry in entries:
-        try:
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-        except OSError:
-            continue
-        if len(out) >= limit:
-            held += 1
-            continue
-        child = entry.path
-        try:
-            inner = len(os.listdir(child))
-        except OSError:
-            # Readable as an entry, not readable as a directory: that is the
-            # traverse-only case and it is a fact worth showing, not an error.
-            inner = None
-        out.append(
-            {
-                "name": entry.name,
-                "path": child,
-                "items": inner,
-                "readable": os.access(child, os.R_OK | os.X_OK),
-                "writable": os.access(child, os.W_OK),
-                "enterable": os.access(child, os.X_OK),
-            }
+    stop = time.time() + probes_s
+    for name, child in found[:limit]:
+        left = stop - time.time()
+        done, facts, failed, _spent = (
+            with_deadline(functools.partial(_child_facts, child), min(DEFAULT_DEADLINE_S, left))
+            if left > 0
+            else (False, None, None, 0.0)
         )
-    return out, held
+        if done and failed is None and isinstance(facts, dict):
+            out.append(dict(facts, name=name, path=child))
+        else:
+            out.append(
+                {
+                    "name": name,
+                    "path": child,
+                    "items": None,
+                    "readable": False,
+                    "writable": False,
+                    "enterable": False,
+                    # What the access cell says instead of an answer. A child
+                    # past the allowance was never asked, which is not the
+                    # same as one that was asked and hung.
+                    "unknown": "did not answer" if left > 0 else "not checked",
+                }
+            )
+    return out, max(0, len(found) - limit), True
+
+
+def _child_facts(child):
+    # type: (str) -> Dict[str, object]
+    """What a listing shows about one child: its entry count and your access."""
+    try:
+        inner = len(os.listdir(child))  # type: Optional[int]
+    except OSError:
+        # Readable as an entry, not readable as a directory: that is the
+        # traverse-only case and it is a fact worth showing, not an error.
+        inner = None
+    return {
+        "items": inner,
+        "readable": os.access(child, os.R_OK | os.X_OK),
+        "writable": os.access(child, os.W_OK),
+        "enterable": os.access(child, os.X_OK),
+    }
 
 
 def _listing_room(window, count):
@@ -3768,8 +3893,10 @@ def _window_top(cursor, count, room, top=None):
     return max(0, min(top, count - room))
 
 
-def _listing(path, style, cols=None, window=None, cursor=0, kids=None, top=None, held=None):
-    # type: (str, object, Optional[int], Optional[int], int, Optional[List[Dict[str, object]]], Optional[int], Optional[int]) -> Tuple[List[str], List[Dict[str, object]], int]
+def _listing(
+    path, style, cols=None, window=None, cursor=0, kids=None, top=None, held=None, answered=True
+):
+    # type: (str, object, Optional[int], Optional[int], int, Optional[List[Dict[str, object]]], Optional[int], Optional[int], bool) -> Tuple[List[str], List[Dict[str, object]], int]
     """One directory's children, as the same framed table as the main view.
 
     The owner's description of what opening a row should do: "there should be
@@ -3793,7 +3920,7 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None, top=None,
     cols = _window_cols(style) if cols is None else max(8, int(cols))
     inner = max(8, cols - 4)
     if kids is None:
-        kids, held = _children(path)
+        kids, held, answered = _children(path)
     held = int(held or 0)
 
     head = [style.head(sanitize(path, limit=4096))]
@@ -3803,8 +3930,14 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None, top=None,
         style.accent("q"),
     )
     if not kids:
+        empty = (
+            "nothing to open inside this directory"
+            if answered
+            else "this directory did not answer within %gs, so what is inside it is unknown"
+            % (LIST_READ_S,)
+        )
         lines = head + [
-            style.dim("  nothing to open inside this directory"),
+            style.dim("  " + empty),
             "",
             style.dim("   %s back   %s quit" % (style.accent("esc/left"), style.accent("q"))),
         ]
@@ -3816,7 +3949,9 @@ def _listing(path, style, cols=None, window=None, cursor=0, kids=None, top=None,
 
     rows = []
     for kid in shown:
-        if kid["readable"]:
+        if kid.get("unknown"):
+            access = str(kid["unknown"])
+        elif kid["readable"]:
             access = "read + write" if kid["writable"] else "read only"
         elif kid["enterable"]:
             access = "enter only"
@@ -4079,8 +4214,10 @@ def _descend(start, style, width, screen=None):
     while stack:
         here = stack[-1]
         rows = interactive.window_rows()
-        kids, held = _children(here)
-        lines, kids, _band = _listing(here, style, cols=width, window=rows, kids=kids, held=held)
+        kids, held, answered = _children(here)
+        lines, kids, _band = _listing(
+            here, style, cols=width, window=rows, kids=kids, held=held, answered=answered
+        )
         if not kids:
             # Nothing to open. Show the listing (which says so) and treat any
             # key except `q` as "back", because there is nowhere to go but up.
@@ -4398,8 +4535,22 @@ def looks_only(command, environ=None):
 #: Environment variables an agent harness sets in the shells it runs. The
 #: first two are what Claude Code exports (`AI_AGENT` is the cross-vendor
 #: convention it follows, `CLAUDECODE` its own); `GEMINI_CLI` is Gemini CLI's.
-#: `DIRSCAPE_AGENT` is for everything else, and for testing.
-AGENT_VARIABLES = ("AI_AGENT", "CLAUDECODE", "GEMINI_CLI", "DIRSCAPE_AGENT")
+#: Codex exports `CODEX_THREAD_ID` to every command it runs (read back from a
+#: Codex session's own `env`) and `CODEX_SANDBOX_NETWORK_DISABLED` inside its
+#: sandbox; opencode sets `OPENCODE=1` in its own environment at startup, so
+#: every shell it spawns inherits it. Without these, either one moved the
+#: `new` baseline on every look. Not `OPENCODE_API_KEY` or `CODEX_HOME`: a
+#: person's own shell profile exports those. `DIRSCAPE_AGENT` is for
+#: everything else, and for testing.
+AGENT_VARIABLES = (
+    "AI_AGENT",
+    "CLAUDECODE",
+    "GEMINI_CLI",
+    "CODEX_THREAD_ID",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "OPENCODE",
+    "DIRSCAPE_AGENT",
+)
 
 
 def agent_driven(environ=None):

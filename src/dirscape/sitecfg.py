@@ -27,6 +27,7 @@ tell the renderer what to call a root and what to warn about. Whether you can
 read a directory is settled by `os.access`, never by a config file.
 """
 
+import difflib
 import fnmatch
 import json
 import os
@@ -84,6 +85,109 @@ _DEFAULT_ROLE_PATTERNS = (
 _NO_QUOTA_FSTYPES = frozenset(["tmpfs", "devtmpfs", "overlay", "squashfs", "iso9660"])
 
 
+#: `[quota] order` names: the short one the template documents, then the name
+#: `why` prints for the same backend. Both are accepted. Only the printed names
+#: used to match, so `order = wrapper, gpfs`, exactly as documented, matched
+#: nothing and changed nothing. `quota.base.default_backends` reads this table.
+QUOTA_BACKENDS = (
+    ("gpfs", "mmlsquota"),
+    ("lustre", "lfs quota"),
+    ("ceph", "ceph xattrs"),
+    ("xfs", "xfs_quota"),
+    ("wrapper", "site quota wrapper"),
+    ("posix", "quota -s"),
+)
+
+#: Every key the `[plugin]` section reads. `plugins.site.ConfiguredSite` is the
+#: reader, and a test holds the two to the same list.
+PLUGIN_KEYS = (
+    "description",
+    "detect_files",
+    "detect_device_prefixes",
+    "bin_dir",
+    "allocation_command",
+    "fileset_prefixes",
+    "group_prefixes",
+    "fileset_groups",
+    "wrapper_paths",
+    "extra_bin_dirs",
+    "dataset_roots",
+    "snapshot_roots",
+    "roles",
+    "quota_archive",
+    "quota_archive_latest",
+    "quota_archive_daily",
+)
+
+#: The keys each fixed section reads. Anything else there is a typo, or a key
+#: from another version, and either way it does nothing. `[roles]`, `[policy]`
+#: and `[heuristics]` are keyed by the site's own globs and role names, so
+#: they are checked by what they hold instead.
+_SECTION_KEYS = {
+    "site": ("name", "ignore"),
+    "roots": ("templates",),
+    "roles": None,
+    "filesets": ("prefixes", "group_prefixes"),
+    "quota": ("order", "wrapper_paths", "extra_bin_dirs", "decimal_suffix_mounts"),
+    "datasets": ("roots",),
+    "snapshots": ("roots",),
+    "policy": None,
+    "heuristics": None,
+    "plugin": PLUGIN_KEYS,
+}  # type: Dict[str, Optional[Sequence[str]]]
+
+#: The top-level keys of a JSON config.
+_JSON_KEYS = (
+    "name",
+    "ignore",
+    "templates",
+    "roles",
+    "fileset_prefixes",
+    "group_prefixes",
+    "quota_order",
+    "wrapper_paths",
+    "extra_bin_dirs",
+    "decimal_suffix_mounts",
+    "dataset_roots",
+    "snapshot_roots",
+    "policy",
+    "heuristics",
+    "plugin",
+)
+
+
+def _ignored(warn, source, problem, word="", choices=(), wrap="%s"):
+    # type: (Optional[List[str]], str, str, str, Sequence[str], str) -> None
+    """Say that a line of config did nothing, and what it was probably meant to be.
+
+    A typo in a config file is the worst failure mode it has, because it
+    fails SILENTLY: `[rolez]` and a `scrach` role were both read without a
+    word, in `paths` and in `why`, and the site simply lost the setting.
+    Nothing here raises, since a stray line must never stop the tool, but
+    every line it cannot use is named, with the closest word it knows.
+    """
+    if warn is None:
+        return
+    close = difflib.get_close_matches(word, list(choices), n=1, cutoff=0.6) if word else []
+    hint = " (did you mean %s?)" % (wrap % (close[0],),) if close else ""
+    warn.append("%s: %s, ignored%s" % (source, problem, hint))
+
+
+def _check_quota_order(names, source, where, warn):
+    # type: (Sequence[str], str, str, Optional[List[str]]) -> None
+    known = [name for pair in QUOTA_BACKENDS for name in pair]
+    for name in names:
+        wanted = name.strip().lower()
+        if wanted not in known:
+            _ignored(
+                warn,
+                source,
+                "unknown quota backend %s in %s" % (name, where),
+                wanted,
+                [short for short, _full in QUOTA_BACKENDS],
+            )
+
+
 SITE_TEMPLATE = """\
 # dirscape site configuration.
 #
@@ -124,8 +228,8 @@ prefixes =
 group_prefixes = pi-
 
 [quota]
-# Comma-separated, in preference order. Known backends: wrapper, gpfs, lustre,
-# xfs, posix. Leave blank for automatic detection.
+# Comma-separated, in preference order. Known backends: gpfs, lustre, ceph,
+# xfs, wrapper, posix. Leave blank for automatic detection.
 order =
 # Absolute paths to site quota wrapper scripts, one per line. This exists
 # because a wrapper is sometimes a SHELL ALIAS, and a subprocess cannot see a
@@ -232,9 +336,12 @@ def _split_list(raw):
     return parts
 
 
-def _parse_policy_value(raw):
-    # type: (str) -> Dict[str, object]
-    """Parse `purge_days=30; backup=no; speed=fast` into a dict."""
+def _parse_policy_value(raw, problems=None):
+    # type: (str, Optional[List[str]]) -> Dict[str, object]
+    """Parse `purge_days=30; backup=no; speed=fast` into a dict.
+
+    What could not be read goes into ``problems``, one phrase each.
+    """
     out = {}  # type: Dict[str, object]
     for chunk in raw.split(";"):
         if "=" not in chunk:
@@ -249,7 +356,12 @@ def _parse_policy_value(raw):
                 out[key] = int(value)
             except ValueError:
                 # A malformed number is dropped with the rest of the entry
-                # kept. A config typo should cost one field, not the whole row.
+                # kept. A config typo should cost one field, not the whole
+                # row, and it should not cost it in silence: `purge_days=30d`
+                # is the likeliest typo there is, and it deleted the one fact
+                # this column exists to carry.
+                if problems is not None:
+                    problems.append("purge_days=%s is not a whole number of days" % (value,))
                 continue
         elif key in ("backup", "readonly"):
             out[key] = value.lower() in ("1", "yes", "true", "on")
@@ -475,8 +587,8 @@ class Site(object):
 # --------------------------------------------------------------------------
 
 
-def _merge_ini(site, text, source):
-    # type: (Site, str, str) -> None
+def _merge_ini(site, text, source, warn=None):
+    # type: (Site, str, str, Optional[List[str]]) -> None
     parser = configparser.ConfigParser(
         # Keys are globs and paths; lower-casing them would break every
         # case-sensitive path on a Linux filesystem.
@@ -486,6 +598,23 @@ def _merge_ini(site, text, source):
     )
     parser.optionxform = str  # type: ignore[assignment,method-assign]
     parser.read_string(text, source=source)
+
+    # Every section and key, checked against what this module reads, BEFORE
+    # anything is merged: a key the code below never asks for is otherwise
+    # read and thrown away without a word. Keys from `[DEFAULT]` are left out,
+    # because configparser copies them into every section.
+    inherited = set(parser.defaults())
+    for section in parser.sections():
+        if section not in _SECTION_KEYS:
+            known = list(_SECTION_KEYS)
+            _ignored(warn, source, "unknown section [%s]" % (section,), section, known, "[%s]")
+            continue
+        keys = _SECTION_KEYS[section]
+        if keys is None:
+            continue
+        for key in parser.options(section):
+            if key not in keys and key not in inherited:
+                _ignored(warn, source, "unknown key %s in [%s]" % (key, section), key, keys)
 
     if parser.has_section("site"):
         site.name = parser.get("site", "name", fallback="").strip() or site.name
@@ -499,6 +628,14 @@ def _merge_ini(site, text, source):
             role = role.strip().lower()
             if role in ROLES:
                 site.role_globs.append((pattern.strip(), role))
+            elif pattern not in inherited:
+                _ignored(
+                    warn,
+                    source,
+                    "unknown role %s for %s in [roles]" % (role or '""', pattern.strip()),
+                    role,
+                    ROLES,
+                )
 
     if parser.has_section("filesets"):
         site.fileset_prefixes.extend(_split_list(parser.get("filesets", "prefixes", fallback="")))
@@ -511,14 +648,18 @@ def _merge_ini(site, text, source):
             site.group_prefixes = extra_groups
 
     if parser.has_section("heuristics"):
-        for role, patterns in parser.items("heuristics"):
-            role = role.strip().lower()
+        for key, patterns in parser.items("heuristics"):
+            role = key.strip().lower()
             if role in ROLES:
                 for pattern in _split_list(patterns):
                     site.role_heuristics.append((role, pattern))
+            elif key not in inherited:
+                _ignored(warn, source, "unknown role %s in [heuristics]" % (key,), role, ROLES)
 
     if parser.has_section("quota"):
-        site.quota_order.extend(_split_list(parser.get("quota", "order", fallback="")))
+        order = _split_list(parser.get("quota", "order", fallback=""))
+        _check_quota_order(order, source, "[quota] order", warn)
+        site.quota_order.extend(order)
         site.wrapper_paths.extend(_split_list(parser.get("quota", "wrapper_paths", fallback="")))
         site.decimal_suffix_mounts.extend(
             _split_list(parser.get("quota", "decimal_suffix_mounts", fallback=""))
@@ -535,9 +676,18 @@ def _merge_ini(site, text, source):
 
     if parser.has_section("policy"):
         for pattern, value in parser.items("policy"):
-            policy = _parse_policy_value(value)
+            problems = []  # type: List[str]
+            policy = _parse_policy_value(value, problems)
+            for problem in problems:
+                _ignored(warn, source, "%s in [policy] %s" % (problem, pattern.strip()))
             if policy:
                 site.policy_globs.append((pattern.strip(), policy))
+            elif not problems and pattern not in inherited:
+                _ignored(
+                    warn,
+                    source,
+                    "no key=value pair in [policy] %s = %s" % (pattern.strip(), value.strip()),
+                )
 
     if parser.has_section("plugin"):
         # Raw strings. The plugin splits the lists itself, because only it
@@ -546,11 +696,17 @@ def _merge_ini(site, text, source):
             site.plugin[key.strip()] = value.strip()
 
 
-def _merge_json(site, text, source):
-    # type: (Site, str, str) -> None
+def _merge_json(site, text, source, warn=None):
+    # type: (Site, str, str, Optional[List[str]]) -> None
     payload = json.loads(text)
     if not isinstance(payload, dict):
         raise ValueError("config must be a JSON object")
+    for key in payload:
+        if key not in _JSON_KEYS:
+            _ignored(warn, source, "unknown key %s" % (key,), str(key), _JSON_KEYS)
+    order = payload.get("quota_order")
+    if isinstance(order, list):
+        _check_quota_order([str(item) for item in order], source, "quota_order", warn)
     site.name = str(payload.get("name") or site.name)
     for key, target in (
         ("ignore", site.ignore),
@@ -576,19 +732,40 @@ def _merge_json(site, text, source):
         for pattern, role in roles.items():
             if str(role).lower() in ROLES:
                 site.role_globs.append((str(pattern), str(role).lower()))
+            else:
+                _ignored(
+                    warn,
+                    source,
+                    "unknown role %s for %s in roles" % (role, pattern),
+                    str(role).lower(),
+                    ROLES,
+                )
     policies = payload.get("policy")
     if isinstance(policies, dict):
         for pattern, policy in policies.items():
             if isinstance(policy, dict):
                 site.policy_globs.append((str(pattern), dict(policy)))
+            else:
+                _ignored(warn, source, "policy for %s is not an object" % (pattern,))
     heuristics = payload.get("heuristics")
     if isinstance(heuristics, dict):
         for role, patterns in heuristics.items():
-            if str(role).lower() in ROLES and isinstance(patterns, list):
+            if str(role).lower() not in ROLES:
+                _ignored(
+                    warn,
+                    source,
+                    "unknown role %s in heuristics" % (role,),
+                    str(role).lower(),
+                    ROLES,
+                )
+            elif isinstance(patterns, list):
                 for pattern in patterns:
                     site.role_heuristics.append((str(role).lower(), str(pattern)))
     plugin = payload.get("plugin")
     if isinstance(plugin, dict):
+        for key in plugin:
+            if key not in PLUGIN_KEYS:
+                _ignored(warn, source, "unknown key %s in plugin" % (key,), str(key), PLUGIN_KEYS)
         site.plugin.update(plugin)
 
 
@@ -618,9 +795,9 @@ def load_site(paths=None, warn=None):
             continue
         try:
             if path.endswith(".json"):
-                _merge_json(site, text, path)
+                _merge_json(site, text, path, warn)
             else:
-                _merge_ini(site, text, path)
+                _merge_ini(site, text, path, warn)
         except Exception as exc:
             if warn is not None:
                 warn.append("ignored malformed config %s: %s" % (path, exc))

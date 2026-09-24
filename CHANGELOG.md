@@ -5,6 +5,66 @@ All notable changes to `dirscape` are recorded here, newest first, following
 
 ## [Unreleased]
 
+## [0.1.1] (2026-09-24)
+
+### Fixed
+
+- **`recover` no longer prints a command that overwrites a file you still
+  have.** Only a directory got the no-clobber form, because `isdir` was the
+  only question asked, so `ds recover README.md` printed
+  `cp -a <snapshot>/README.md README.md`, which replaces the live file with the
+  older copy, and the MCP `recover_path` tool handed an agent the same line in
+  `restore` to run. Every restore line is `cp -an` now. A file that still
+  exists is restored beside itself under the snapshot's name
+  (`README.md.daily-2026-09-23`), and a deleted file whose directory went with
+  it gets a `mkdir -p` first, where it used to be told that the missing
+  directory was "read-only to you".
+- **`new` says which run it compared against.** "No change since the last
+  run" named no time, and under `--since 30d` it was not even the last run:
+  with no run that old, the oldest one kept was used without a word. It reads
+  `No change since the last run, at 2026-09-24 10:01 (13m ago).` now, and a
+  window the lineage cannot cover adds `no run is 30d old yet, so --since 30d
+  compared against the oldest one kept`.
+- **A line of config that does nothing says so, with the word it probably
+  meant.** `[rolez]`, `nmae` in `[site]`, a role `scrach` in `[roles]` or
+  `[heuristics]`, a `[policy]` line with no `key=value`, `purge_days=30d` and
+  an unknown `[quota] order` backend were all read and dropped in silence,
+  in `paths` and in `why`. Each is a warning now, on stderr and in every agent
+  payload: `site.conf: unknown section [rolez], ignored (did you mean
+  [roles]?)`. JSON configs are checked the same way, and the shipped template
+  still loads with none.
+- **`[quota] order` takes the names the template documents.** Only the names
+  `why` prints (`mmlsquota`, `site quota wrapper`) ever matched, so
+  `order = wrapper, gpfs` as documented changed nothing. Both spellings work
+  now, each backend is asked once however often it is named, and `ceph` is in
+  the documented list.
+- **The stock `quota -s` stands aside for the site wrapper it turns out to
+  be.** Where a site installs its wrapper as `quota`, both backends ran the
+  same script and got byte-identical reports. The stock backend is skipped
+  when the wrapper already read rows from the same file, and still runs where
+  `quota` is the real tool, which the wrapper backend also tries and cannot
+  read. On the development cluster, over 30 paired, interleaved runs of
+  `ds paths --json` after 3 discarded warmups, the median run went from 2.97s
+  to 2.03s: 0.94s saved [95% CI 0.93, 0.96], a median 1.46x [1.456, 1.472],
+  and 1.43x in the worst pair (Wilcoxon p = 2e-9).
+- **A hung mount can no longer freeze the browser.** Opening a row read the
+  directory and probed each child on the UI thread with no deadline, so one
+  wedged mount under it froze the session. Both run under deadlines now (3s
+  for the directory, 1s for each child and 3s for all of them), and a child
+  that did not answer says `did not answer` in its access cell.
+- **Codex and opencode are recognised as agents**, by the `CODEX_THREAD_ID`
+  Codex exports to every command it runs, the `CODEX_SANDBOX_NETWORK_DISABLED`
+  of its sandbox, and the `OPENCODE=1` opencode sets for its shells. Either
+  one moved the `new` baseline on every look and could get the browser in a
+  pty.
+- **Docs that had drifted from the code.** `--legend` no longer promises
+  "reach letters". The `--help` epilog and the README no longer say there is
+  no tree walk: there is one, capped, of a root no quota covers, and
+  `--no-measure` skips it. The notes for 0.1.0 below have their own heading,
+  and its known limits are the ones it shipped with.
+
+## [0.1.0] (2026-09-23)
+
 ### Changed
 
 - **The site plugin knows no site.** Everything it did for one cluster, the
@@ -840,7 +900,7 @@ Also fixed:
 not: real directories under `tmp_path`, a synthetic mount table, and a
 `RecordedRunner` that answers for exactly the tools that site has. A site with
 no quota tooling at all, a Lustre site (the one backend with no live coverage
-anywhere), an ext4 site, a closed directory, and every view rendered on each.
+until Procyon), an ext4 site, a closed directory, and every view rendered on each.
 The load-bearing one runs in STRICT mode, where a backend reaching for a tool
 the fixture never recorded raises instead of guessing: on a real foreign
 cluster that guess is a wrong answer nobody can see.
@@ -1757,8 +1817,11 @@ palettes and semantic colour slots, and nodetop's measured output.
   and directory `mtime` is a decoy. `/project/aarnold`'s fileset first appears
   in the site quota archive on 2026-03-13 while its directory mtime reads
   2026-05-15, two months late.
-- **The Lustre backend has never run live.** No Lustre is mounted on the
-  development cluster and `lfs` is not installed, so that backend is built and
-  tested entirely from recorded fixtures.
-- Write access is reported as unknown unless `--probe-write` is passed, because
-  `os.access(W_OK)` lies under root-squashed NFS.
+- **Lustre has run live only on ACME Procyon and Sylvia.** No Lustre is
+  mounted on the development cluster, so the backend's tests replay recorded
+  fixtures, and the fixes under "Fixed by running on two other clusters" are
+  what those live runs found.
+- **Write access comes from `os.access`**, which a root-squashed NFS export can
+  answer wrongly. `--json` carries that caveat with the answer, and
+  `--probe-write` settles it by writing. Only for uid 0, the one identity such
+  an export remaps, does the table read `read` instead of answering.

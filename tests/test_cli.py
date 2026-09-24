@@ -1786,6 +1786,93 @@ def test_a_directory_with_nothing_inside_says_so(tmp_path):
     assert "nothing to open" in cli.plain("\n".join(lines))
 
 
+def _hang_on(monkeypatch, names):
+    """Make `_child_facts` block, as a wedged mount would, for these children."""
+    import threading
+
+    release = threading.Event()
+    real = cli._child_facts
+
+    def facts(child):
+        if os.path.basename(child) in names:
+            release.wait(30)
+        return real(child)
+
+    monkeypatch.setattr(cli, "_child_facts", facts)
+    return release
+
+
+def test_a_child_that_hangs_costs_its_deadline_and_not_the_browser(tmp_path, monkeypatch):
+    """One hung mount under the listed directory froze the whole browser.
+
+    Every probe ran on the UI thread with no deadline, so a `listdir` on a
+    wedged mount never returned and no key could be pressed. Each child is
+    asked on an abandoned thread now, and the one that did not answer says so.
+    """
+    import time
+
+    from dirscape.render import resolve_style
+
+    root = tmp_path / "project"
+    for name in ("alpha", "stuck", "zeta"):
+        (root / name).mkdir(parents=True)
+    monkeypatch.setattr(cli, "DEFAULT_DEADLINE_S", 0.2)
+    release = _hang_on(monkeypatch, {"stuck"})
+    started = time.time()
+    try:
+        kids, held, answered = cli._children(str(root))
+    finally:
+        release.set()
+
+    assert time.time() - started < 5.0
+    assert answered and held == 0
+    notes = {kid["name"]: kid.get("unknown") for kid in kids}
+    assert notes == {"alpha": None, "stuck": "did not answer", "zeta": None}
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    lines, _kids, _band = cli._listing(str(root), style, cols=100, window=40, kids=kids)
+    assert "did not answer" in cli.plain("\n".join(lines))
+
+
+def test_children_past_the_allowance_are_not_checked_rather_than_waited_for(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    for name in ("a", "b", "c", "d"):
+        (root / name).mkdir(parents=True)
+    release = _hang_on(monkeypatch, {"b", "c", "d"})
+    try:
+        kids, _held, _answered = cli._children(str(root), probes_s=0.3)
+    finally:
+        release.set()
+
+    notes = [kid.get("unknown") for kid in kids]
+    assert notes[0] is None, "the first child answered at once"
+    assert None not in notes[1:]
+    assert notes[-1] == "not checked", "once the allowance is spent nothing more is asked"
+
+
+def test_a_directory_that_hangs_is_reported_rather_than_waited_for(tmp_path, monkeypatch):
+    import threading
+
+    from dirscape.render import resolve_style
+
+    release = threading.Event()
+    real = os.scandir
+    # Scoped, because this is the real `os.scandir` for the whole process.
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "scandir", lambda path: release.wait(30) and real(path))
+        try:
+            kids, held, answered = cli._children(str(tmp_path), read_s=0.2)
+        finally:
+            release.set()
+
+    assert (kids, held, answered) == ([], 0, False)
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    lines, _kids, _band = cli._listing(
+        str(tmp_path), style, cols=100, window=40, kids=kids, held=held, answered=answered
+    )
+    text = cli.plain("\n".join(lines))
+    assert "did not answer" in text and "nothing to open" not in text
+
+
 def test_the_tree_sums_walked_figures_and_never_calls_them_unknown(tmp_path):
     """Two defects in one node of `dirscape tree`, both from the same cause.
 

@@ -528,6 +528,7 @@ class SiteWrapperBackend(Backend):
 
     def read(self, runner, mounts, budget, paths):
         # type: (object, object, object, Sequence[str]) -> QuotaSnapshot
+        self.read_from = None
         candidates = self.candidates(runner)
         if not candidates:
             return unavailable_quota(
@@ -563,6 +564,7 @@ class SiteWrapperBackend(Backend):
                 )
                 continue
             read_at = now()
+            self.read_from = candidate
             return snapshot(
                 self.name,
                 rows,

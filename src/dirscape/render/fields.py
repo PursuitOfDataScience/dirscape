@@ -637,11 +637,12 @@ def used_cell(root, style=None):
 
     Both readings were right, and adding a word to each cell (`used`, `free`)
     did not fix it, because the shapes still differed. Three facts were being
-    packed into one cell, so they are three columns now: `used`, `limit`,
-    `free`. Every cell in every one of them is a single figure or `?`, which
-    is what makes a numeric column scannable, and `limit` says `none` where
-    there is genuinely no cap rather than leaving the reader to infer it from
-    a missing second number.
+    packed into one cell, so each got a cell of its own. The table shows two
+    of them, `used` and the limit under the heading `quota`; `free` came off
+    it and lives in `why` and `paths --json`. Every cell is a single figure or
+    `?`, which is what makes a numeric column scannable, and the limit says
+    `none` where there is genuinely no cap rather than leaving the reader to
+    infer it from a missing second number.
     """
     style = style or Style()
     row, how = _governing(root)
@@ -664,7 +665,7 @@ def used_cell(root, style=None):
     # They are right, and the reason is structural rather than a matter of
     # taste: a grading that only half the rows can carry is not a scale, it is
     # two categories the reader has to decode before comparing two numbers.
-    # `free` now carries "how much room is left" as a figure on every row,
+    # "How much room is left" is the `free` figure in `why` and `paths --json`,
     # which is what the grading was approximating, and this package's standing
     # rule is that colour is never load bearing.
     return figure(text, style), "; ".join(caveats)

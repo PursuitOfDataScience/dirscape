@@ -58,7 +58,7 @@ baseline. Exit codes: `0` answered, `1` bad usage, `2` no place covers that path
 
 | | |
 | :- | :- |
-| ⚡ **No tree walk** | Sizes come from quotas, so it takes seconds. For `du`, use `rdu`. |
+| ⚡ **Quota sizes** | Sizes come from quotas, so it takes seconds. For `du`, use `rdu`. |
 | ❓ **`?` is not zero** | Nothing could measure it, and `--json` gives the reason. |
 | 🆕 **First run** | Nothing is "new" until a baseline exists: run it twice. |
 | 📁 **File limits** | Small files can hit the file quota first; `ds why` shows it. |

@@ -249,6 +249,7 @@ class PosixQuotaBackend(Backend):
     """``quota -s``, in the stock layout and in a site's tabular one."""
 
     name = "quota -s"
+    stock = True
 
     def __init__(
         self,

@@ -412,3 +412,106 @@ def test_the_site_template_documents_every_new_section():
 
     for needle in ("[plugin]", "[heuristics]", "decimal_suffix_mounts"):
         assert needle in SITE_TEMPLATE
+
+
+# --------------------------------------------------------------------------
+# A line of config that does nothing says so
+# --------------------------------------------------------------------------
+
+
+def _loaded(tmp_path, text, name="site.conf"):
+    warnings = []
+    site = load_site(paths=[_write(tmp_path, name, text)], warn=warnings)
+    return site, warnings
+
+
+def _said(warnings, *needles):
+    return any(all(needle in line for needle in needles) for line in warnings)
+
+
+def test_a_misspelt_section_or_key_is_named_with_the_word_it_meant(tmp_path):
+    """`[rolez]` was read, thrown away, and never mentioned, in `paths` or `why`."""
+    _site, warnings = _loaded(
+        tmp_path, "[rolez]\n/x/* = scratch\n[site]\nnmae = acme\n[plugin]\ndescripton = x\n"
+    )
+    assert _said(warnings, "site.conf: unknown section [rolez]", "(did you mean [roles]?)")
+    assert _said(warnings, "unknown key nmae in [site]", "(did you mean name?)")
+    assert _said(warnings, "unknown key descripton in [plugin]", "(did you mean description?)")
+    assert len(warnings) == 3
+
+
+def test_a_role_that_is_not_a_role_is_named_rather_than_dropped(tmp_path):
+    site, warnings = _loaded(tmp_path, "[roles]\n/flash/* = scrach\n[heuristics]\nscrach = */x*\n")
+    assert site.role_globs == [] and site.role_heuristics == []
+    assert _said(warnings, "unknown role scrach for /flash/* in [roles]", "did you mean scratch?")
+    assert _said(warnings, "unknown role scrach in [heuristics]", "did you mean scratch?")
+
+
+def test_a_policy_line_that_sets_nothing_is_named(tmp_path):
+    """`purge_days=30d` cost the row the one fact the policy column exists for."""
+    site, warnings = _loaded(
+        tmp_path, "[policy]\nscrach = 60d\n/scratch/* = purge_days=30d; backup=no\n"
+    )
+    assert site.policy_globs == [("/scratch/*", {"backup": False})]
+    assert _said(warnings, "no key=value pair in [policy] scrach = 60d")
+    assert _said(warnings, "purge_days=30d is not a whole number of days in [policy] /scratch/*")
+
+
+def test_the_documented_quota_order_names_take_effect(tmp_path):
+    """The template says `order = wrapper, gpfs`, and those names matched nothing."""
+    from dirscape.quota import default_backends
+
+    site, warnings = _loaded(tmp_path, "[quota]\norder = wrapper, posix, gpfss, Mmlsquota\n")
+    names = [backend.name for backend in default_backends(site)]
+    assert names[:3] == ["site quota wrapper", "quota -s", "mmlsquota"]
+    assert len(names) == len(set(names)) == 6, "every backend once, none dropped"
+    assert warnings == [
+        "%s: unknown quota backend gpfss in [quota] order, ignored (did you mean gpfs?)"
+        % (tmp_path / "site.conf",)
+    ]
+
+
+def test_every_documented_quota_backend_is_a_backend():
+    import re
+
+    from dirscape.quota import default_backends
+    from dirscape.sitecfg import QUOTA_BACKENDS
+
+    assert sorted(full for _short, full in QUOTA_BACKENDS) == sorted(
+        backend.name for backend in default_backends(None)
+    )
+    listed = re.search(r"Known backends:(.*?)Leave blank", SITE_TEMPLATE, re.S).group(1)
+    names = [word.strip(" #\n.") for word in listed.replace("\n#", " ").split(",")]
+    assert names == [short for short, _full in QUOTA_BACKENDS]
+
+
+def test_the_plugin_keys_are_the_ones_the_plugin_reads_and_the_template_documents():
+    """One list in three places, so a key added to the plugin cannot go unchecked."""
+    import inspect
+    import re
+
+    from dirscape.plugins import site as plugin_site
+    from dirscape.sitecfg import PLUGIN_KEYS
+
+    read = re.findall(r'(?:_text|_list|settings\.get)\("([a-z_]+)"', inspect.getsource(plugin_site))
+    assert set(read) == set(PLUGIN_KEYS)
+    documented = re.findall(r"^#\s+([a-z_]+)\s+=", SITE_TEMPLATE.split("[plugin]", 1)[1], re.M)
+    assert documented == list(PLUGIN_KEYS)
+
+
+def test_a_json_config_names_what_it_ignores(tmp_path):
+    text = (
+        '{"nmae": "acme", "roles": {"/flash/*": "scrach"}, "quota_order": ["gpfss"],'
+        ' "policy": {"/s/*": "purge"}, "plugin": {"descripton": "x"}}'
+    )
+    site, warnings = _loaded(tmp_path, text, name="config.json")
+    assert site.role_globs == [] and site.policy_globs == []
+    for needles in (
+        ("unknown key nmae", "did you mean name?"),
+        ("unknown role scrach for /flash/* in roles", "did you mean scratch?"),
+        ("unknown quota backend gpfss in quota_order", "did you mean gpfs?"),
+        ("policy for /s/* is not an object",),
+        ("unknown key descripton in plugin", "did you mean description?"),
+    ):
+        assert _said(warnings, *needles), needles
+    assert len(warnings) == 5

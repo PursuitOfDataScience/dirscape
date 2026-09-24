@@ -61,7 +61,15 @@ BAR = (22, 27, 34)
 PROMPT = "\033[38;2;126;231;135m$\033[0m "
 
 KEYS = {"down": b"\033[B", "up": b"\033[A", "enter": b"\r", "esc": b"\033", "q": b"q"}
-AGENT_VARIABLES = ("AI_AGENT", "CLAUDECODE", "GEMINI_CLI", "DIRSCAPE_AGENT")
+AGENT_VARIABLES = (
+    "AI_AGENT",
+    "CLAUDECODE",
+    "GEMINI_CLI",
+    "CODEX_THREAD_ID",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "OPENCODE",
+    "DIRSCAPE_AGENT",
+)
 
 _BASE16 = [
     (0, 0, 0), (205, 49, 49), (13, 188, 121), (229, 229, 16),

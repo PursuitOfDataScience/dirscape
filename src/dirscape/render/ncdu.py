@@ -7,9 +7,10 @@ installed on clusters. Writing this array is how `dirscape` gains an
 interactive browser and a historical tree diff without shipping either one.
 
 **This is a SHALLOW export and it is not a substitute for `ncdu -o`.** This
-tool never walks a tree. What lands here is the root plus whatever one level of
+tool does not walk trees for their sizes: its one walk is capped, and only of a
+root no quota covers. What lands here is the root plus whatever one level of
 entries the caller already knows, and the usage figure is the quota backend's,
-not a walk's. For bytes-by-directory, run `rdu` or `ncdu` itself. The
+or that capped walk's. For bytes-by-directory, run `rdu` or `ncdu` itself. The
 consequence is visible in the output rather than hidden in this docstring: the
 root's info block carries ``read_error`` unless the caller states the listing
 is complete, which is the format's own way of saying "some items may be missing

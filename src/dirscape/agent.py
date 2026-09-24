@@ -557,7 +557,7 @@ def recover_payload(run, path):
         dict(copy.to_json(), taken=_iso(getattr(copy, "taken_at", None))) for copy in copies
     ]
     if copies:
-        how, command = cli._restore_line(target, copies[0].path)
+        how, command = cli._restore_line(target, copies[0].path, copies[0].name)
         out["restore"] = command
         out["restore_note"] = how
     else:

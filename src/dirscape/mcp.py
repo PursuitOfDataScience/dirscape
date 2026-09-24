@@ -165,9 +165,10 @@ TOOLS = [
         "description": (
             "Find the read-only snapshot copies the filesystem still keeps of a file or "
             "directory, newest first, including one that has already been deleted, and the "
-            "`restore` command (a cp that puts back what is missing without overwriting newer "
-            "files). No copies with `recoverable.value` false means none are kept; unknown "
-            "means no snapshot mechanism was found, which is not the same as no backup."
+            "`restore` command, a `cp -an` that never overwrites: a directory gets back what is "
+            "missing, and a file that still exists is restored beside itself under the "
+            "snapshot's name. No copies with `recoverable.value` false means none are kept; "
+            "unknown means no snapshot mechanism was found, which is not the same as no backup."
         ),
         "inputSchema": {
             "type": "object",

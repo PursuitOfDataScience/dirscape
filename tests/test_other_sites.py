@@ -8,6 +8,7 @@ node that produced them, trimmed of options that do not matter.
 """
 
 import os
+import re
 
 import pytest
 
@@ -492,7 +493,64 @@ def test_recover_suggests_copying_out_of_a_read_only_tree(tmp_path, monkeypatch)
         target.chmod(0o755)
         locked.chmod(0o755)
     assert "read-only to you" in text
-    assert "cp -a %s ." % (copy.path,) in text
+    # `-n`: copying out must not replace a file of the same name where they are.
+    assert "cp -an %s ." % (copy.path,) in text
+
+
+def _restore_command(tmp_path, monkeypatch, target, copy):
+    """What `recover` prints, and what `recover_path` hands an agent to run."""
+    from dirscape import agent
+
+    found = lambda *a, **k: ([copy], confirmed("1 copy"))  # noqa: E731
+    monkeypatch.setattr(cli, "copies_for_path", found)
+    monkeypatch.setattr(agent, "copies_for_path", found)
+    text, _code = cli._recover(_recover_run(tmp_path, None), str(target), Style(color=False))
+    record = agent.recover_payload(_recover_run(tmp_path, None), str(target))
+    assert record["restore"] in text, "the person and the agent are told the same thing"
+    assert re.search(r"\bcp -a(?!n)", record["restore"]) is None, "every form is no-clobber"
+    return text, record["restore"]
+
+
+def test_recover_never_overwrites_a_file_that_is_still_there(tmp_path, monkeypatch):
+    """`recover README.md` printed `cp -a SNAP/README.md README.md`: measured.
+
+    Run as given, that replaces the live file with the older copy, and the
+    MCP `recover_path` tool returned the same line in `restore` for an agent
+    to run. A file that is still there is restored beside itself.
+    """
+    live = tmp_path / "live" / "README.md"
+    live.parent.mkdir(parents=True)
+    live.write_text("edited since the snapshot\n")
+    copy = SnapshotCopy("daily-2026-09-23", str(tmp_path / "snap" / "README.md"), None)
+
+    text, command = _restore_command(tmp_path, monkeypatch, live, copy)
+
+    assert command == "cp -an %s %s.daily-2026-09-23" % (copy.path, live)
+    assert "beside it" in text
+
+
+def test_recover_puts_a_deleted_file_back_where_it_was(tmp_path, monkeypatch):
+    target = tmp_path / "results.csv"
+    copy = SnapshotCopy("daily", str(tmp_path / "snap" / "results.csv"), None)
+
+    _text, command = _restore_command(tmp_path, monkeypatch, target, copy)
+
+    assert command == "cp -an %s %s" % (copy.path, target)
+
+
+def test_recover_recreates_a_deleted_tree_instead_of_calling_it_read_only(tmp_path, monkeypatch):
+    """After `rm -rf proj`, the file's directory is gone as well.
+
+    `os.access` is False for a directory that does not exist, so this said
+    "is read-only to you" about a directory nobody can see any more.
+    """
+    target = tmp_path / "proj" / "data" / "results.csv"
+    copy = SnapshotCopy("daily", str(tmp_path / "snap" / "proj" / "data" / "results.csv"), None)
+
+    text, command = _restore_command(tmp_path, monkeypatch, target, copy)
+
+    assert "read-only" not in text
+    assert command == "mkdir -p %s && cp -an %s %s" % (target.parent, copy.path, target)
 
 
 def test_a_shared_drop_is_walked_for_the_readers_files_only(tmp_path):

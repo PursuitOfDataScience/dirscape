@@ -392,6 +392,59 @@ def test_a_look_only_run_reads_the_lineage_and_writes_nothing(tmp_path, monkeypa
     assert not any("seeded one" in w for w in run.warnings), "nothing was seeded"
 
 
+def _lineage_of(tmp_path, monkeypatch, ages_days):
+    """A real lineage on disk, one saved run per age, oldest first."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    for _age in ages_days:
+        run = _run()
+        run.identity = None
+        cli._record_state(run, argparse.Namespace(since=None), save=True)
+    (state,) = [os.path.join(d, f) for d, _s, fs in os.walk(str(tmp_path)) for f in fs]
+    with open(state) as handle:
+        payload = json.load(handle)
+    for entry, age in zip(payload["entries"], ages_days):
+        entry["taken_at"] -= age * 86400.0
+    with open(state, "w") as handle:
+        json.dump(payload, handle)
+
+
+def _new(since):
+    run = _run()
+    run.identity = None
+    cli._record_state(run, argparse.Namespace(since=since), save=False)
+    argv = ["new"] + (["--since", since] if since else [])
+    text, _code = cli._render(run, cli.build_parser().parse_args(argv), "new", None, None)
+    return run, text
+
+
+def test_new_names_the_run_it_compared_against(tmp_path, monkeypatch):
+    """`No change since the last run` said nothing about when that was."""
+    _lineage_of(tmp_path, monkeypatch, [0])
+    _, text = _new(None)
+    assert text.startswith("No change since the last run, at 20")
+    assert "ago)." in text
+
+
+def test_since_says_so_when_no_run_is_that_old(tmp_path, monkeypatch):
+    """`new --since 30d` against a lineage begun that day fell back to the
+    oldest run without a word, and answered "No change since the last run"
+    about a window of minutes.
+    """
+    _lineage_of(tmp_path, monkeypatch, [2, 0])
+    run, text = _new("30d")
+    assert run.baseline_since == "30d"
+    assert text.startswith("No change since the run at ")
+    assert "(2d ago)" in text, "the oldest run kept, and it says how old"
+    assert "no run is 30d old yet" in text
+
+
+def test_since_is_quiet_when_the_window_is_covered(tmp_path, monkeypatch):
+    _lineage_of(tmp_path, monkeypatch, [40, 10, 0])
+    run, text = _new("30d")
+    assert "(40d ago)" in text
+    assert not any("old yet" in w for w in run.warnings)
+
+
 def test_why_json_is_about_the_one_path_asked(tmp_path, monkeypatch, capsys):
     """It used to emit every visible root whatever path was named."""
     (tmp_path / "home" / "me").mkdir(parents=True)
@@ -513,8 +566,14 @@ def test_a_restore_command_survives_a_space_in_the_path():
         ({"CLAUDECODE": "1"}, True),
         ({"AI_AGENT": "claude-code_2-1_agent"}, True),
         ({"GEMINI_CLI": "1"}, True),
+        # What a Codex shell and an opencode shell really carry.
+        ({"CODEX_THREAD_ID": "019d9c1e-25a4-79e2-9c10-c4a9e17e78ee"}, True),
+        ({"CODEX_SANDBOX_NETWORK_DISABLED": "1"}, True),
+        ({"OPENCODE": "1"}, True),
         ({"DIRSCAPE_AGENT": "1"}, True),
         ({"CLAUDECODE": ""}, False),
+        # A person's own profile exports these, so they prove nothing.
+        ({"OPENCODE_API_KEY": "sk-x", "CODEX_HOME": "/home/me/.codex"}, False),
     ],
 )
 def test_an_agent_harness_is_recognised(environ, driven):

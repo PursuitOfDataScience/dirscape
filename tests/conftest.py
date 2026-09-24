@@ -39,6 +39,10 @@ def _a_person_at_the_keyboard(monkeypatch):
     # suite that passes on one login node and fails on a clean runner is
     # testing the node. `load_site` skips a path that is not a regular file.
     monkeypatch.setenv("DIRSCAPE_CONFIG", os.devnull)
+    # Nor on whether rapidu is installed beside it: an opened directory is
+    # sized with rapidu's walk when it is, and a test gets the table's own
+    # walk unless it hands rapidu in itself.
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
 
 
 @pytest.fixture

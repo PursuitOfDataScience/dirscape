@@ -13,6 +13,7 @@ end-to-end check replays a captured transcript.
 import argparse
 import contextlib
 import os
+import re
 import sys
 
 import pytest
@@ -1692,98 +1693,249 @@ def test_the_quota_heading_is_the_word_the_site_itself_uses():
     assert "limit" not in text, "the ambiguous word is gone from the table"
 
 
-def test_opening_a_row_lists_what_is_inside_it(tmp_path):
-    """Enter asks "what is in here", and it used to answer a different question.
-
-    Owner: "when zooming into each main dir, there should be all the sub-dirs
-    shown just like the main ui and you can constantly zoom in if there is sub
-    dirs within these sub-dirs." What it did was print that one root's figures
-    as a field list, which is the answer to "tell me about this directory":
-    "this is weird. i don't need to know this kind of info." The field list is
-    still `dirscape why <path>` and the footer points at it.
-    """
+def _plain_style():
     from dirscape.render import resolve_style
 
-    style = resolve_style(color="never", ascii_only=False, stream=None)
+    return resolve_style(color="never", ascii_only=False, stream=None)
+
+
+def _settle(sizes, limit=20.0):
+    """Wait for the walks behind a view, then fold them in as a repaint would."""
+    import time
+
+    stop = time.time() + limit
+    while sizes.busy() and time.time() < stop:
+        time.sleep(0.02)
+    assert not sizes.busy(), "the sizes never settled"
+    sizes.refresh()
+
+
+def _opened(path, cursor=0, width=100, height=40, sized=True, cache=None, **sizing):
+    """Open one directory as `_descend` does, with its sizes added up first."""
+    run = cli.Run()
+    kids, held, _answered = cli._children(str(path))
+    roots = [cli._listed_root(kid, None, run.site, {}) for kid in kids]
+    sizes = cli._Sizes(roots, {} if cache is None else cache, **sizing)
+    if sized:
+        sizes.start()
+        _settle(sizes)
+    style = _plain_style()
+    lines, _top, _room = cli._dir_frame(
+        str(path),
+        roots,
+        cursor,
+        run,
+        style,
+        width,
+        height=height,
+        held=held,
+        notes=cli._dir_notes(roots, style),
+    )
+    return lines, roots, sizes
+
+
+def test_opening_a_row_shows_the_same_table_one_level_down(tmp_path):
+    """Owner: "what the sub-dirs should show should be the exact same structure
+    as what the app shows at the start". It showed a table of its own, `name`,
+    `access` and `items`, and `items` was "a confusing word": the number of
+    names directly inside, which is neither a size nor a file count. Now it is
+    the start screen's own table, with `used` and `files` added up per child.
+    """
     root = tmp_path / "project"
     for name in ("alpha", "beta", "gamma"):
         (root / name).mkdir(parents=True)
     (root / "alpha" / "inner").mkdir()
     (root / "a-file.txt").write_bytes(b"x")
+    for index in range(3):
+        (root / "beta" / ("f%d" % index)).write_bytes(b"x" * 100)
 
-    lines, kids, _band = cli._listing(str(root), style, cols=100, window=40)
+    lines, roots, _sizes = _opened(root)
     text = cli.plain("\n".join(lines))
 
-    assert [kid["name"] for kid in kids] == ["alpha", "beta", "gamma"]
-    assert "alpha/" in text and "beta/" in text
+    assert [r.path for r in roots] == [str(root / n) for n in ("alpha", "beta", "gamma")]
+    heading = [line for line in text.splitlines() if "path" in line and "used" in line]
+    assert heading and "files" in heading[0], "the table's own headings"
+    assert "items" not in text
     assert "a-file.txt" not in text, "files are not places to descend into"
     assert "inner" not in text, "only direct children, never a walk"
-    # The band is asserted on the OUTPUT rather than on a returned index:
-    # `_listing` paints it before drawing the border, the way the main table
-    # does, so that the selection sits inside the box instead of inverting
-    # the border characters with the row.
+    assert "…" not in text, "every figure landed"
+    names = ("alpha/", "beta/", "gamma/")
+    rows = {
+        p[1]: p
+        for p in (line.split() for line in text.splitlines())
+        if p[1:2] in [[n] for n in names]
+    }
+    assert sorted(rows) == list(names), "each row names its child, and the title the rest"
+    assert rows["beta/"][3] == "3", "beta's three files, added up"
+    assert rows["beta/"][4] == "100%", "and all of what the directory holds"
+    # The band is on the first row and INSIDE the frame, as the table's is.
     banded = [line for line in lines if "\033[7m" in line]
-    assert len(banded) == 1, "exactly one row is selected"
-    assert "alpha/" in cli.plain(banded[0]), "the band starts on the first row"
-    # Inside the frame: the border is drawn OUTSIDE the inverse run, so the
-    # text before the escape is the border and the inverted part is content.
-    before, _, inverted = banded[0].partition("\033[7m")
-    assert "\u2502" in before, "the left border must not be inverted with the row"
-    assert cli.plain(inverted).strip().startswith("alpha/")
-    assert "\u2502" in cli.plain(banded[0])[-3:], "and the right border is still drawn"
-
-    # And the counts are the direct entries of each child, one scandir deep.
-    assert [kid["items"] for kid in kids] == [1, 0, 0]
+    assert len(banded) == 1 and "alpha/" in cli.plain(banded[0])
+    before, _, _inverted = banded[0].partition("\033[7m")
+    assert "│" in before, "the left border must not be inverted with the row"
 
 
-def test_a_listing_scrolls_instead_of_outgrowing_the_window(tmp_path):
+def test_a_figure_that_is_coming_says_so_and_is_not_a_question_mark(tmp_path):
+    (tmp_path / "d").mkdir()
+    lines, roots, _sizes = _opened(tmp_path, sized=False)
+    assert "…" in cli.plain("\n".join(lines))
+    assert roots[0].policy.get("measuring") is True
+
+
+def test_an_opened_directory_scrolls_instead_of_outgrowing_the_window(tmp_path):
     """A directory with more children than the terminal has rows.
 
-    The first version rendered every child, so `/project/hpc` produced a block
-    twenty times the height of the terminal: the frame was then truncated to
-    fit, which cut the rows off the bottom, which left the selection band with
-    nothing to land on so it never painted at all. A listing that cannot show
-    its own selection is not a listing.
-
-    Two properties, and the second is the one that protects the scrollback:
-    the band tracks the cursor however far down it goes, and the block never
-    outgrows the window `select` will repaint it in.
+    A block taller than the window cannot be repainted in place: `select`
+    moves the cursor up by the lines it wrote, and a block that has scrolled
+    takes the reader's scrollback with it. So the band tracks the cursor however
+    far down it goes, and the block never outgrows the window.
     """
-    from dirscape.render import resolve_style
-
-    style = resolve_style(color="never", ascii_only=False, stream=None)
     root = tmp_path / "many"
     for index in range(80):
         (root / ("child%02d" % index)).mkdir(parents=True)
+    run = cli.Run()
+    kids, _held, _answered = cli._children(str(root))
+    roots = [cli._listed_root(kid, None, None, {}) for kid in kids]
+    _settle_all = cli._Sizes(roots, {})
+    _settle_all.start()
+    _settle(_settle_all)
 
     window = 24
+    top = None
     for cursor in (0, 40, 79):
-        lines, kids, _band = cli._listing(str(root), style, cols=100, window=window, cursor=cursor)
-        assert len(kids) == 80
-        assert len(lines) < window, "a %d line block cannot be repainted in a %d row window" % (
-            len(lines),
-            window,
+        lines, top, room = cli._dir_frame(
+            str(root), roots, cursor, run, _plain_style(), 100, height=window, top=top
         )
+        assert len(lines) < window, "a %d line block in a %d row window" % (len(lines), window)
         banded = [line for line in lines if "\033[7m" in line]
         assert len(banded) == 1, "the band vanished at cursor %d" % (cursor,)
-        assert "child%02d/" % cursor in cli.plain(banded[0]), (
-            "the band is on the wrong row at cursor %d: %r" % (cursor, cli.plain(banded[0]))
-        )
+        assert "child%02d" % cursor in cli.plain(banded[0])
         assert "of 80" in cli.plain("\n".join(lines)), "the reader is told what is off screen"
+        assert room < 80
 
 
 def test_a_directory_with_nothing_inside_says_so(tmp_path):
     """Rather than an empty frame the reader has to interpret."""
-    from dirscape.render import resolve_style
-
-    style = resolve_style(color="never", ascii_only=False, stream=None)
-    empty = tmp_path / "empty"
-    empty.mkdir()
-
-    lines, kids, band = cli._listing(str(empty), style, cols=100, window=40)
-    assert kids == []
-    assert band == -1, "there is no row to highlight"
+    lines = cli._empty_frame(str(tmp_path), _plain_style(), 100)
     assert "nothing to open" in cli.plain("\n".join(lines))
+
+
+def test_a_child_too_big_for_the_glance_is_walked_to_the_end_behind_it(tmp_path):
+    """Owner, on a `/project` where all but 21 of 84 folders read `?`: "it
+    looks annoying". The glance leaves a floor, and the second pass finishes."""
+    (tmp_path / "big").mkdir()
+    for index in range(5):
+        (tmp_path / "big" / ("f%d" % index)).write_bytes(b"x")
+
+    _lines, roots, _sizes = _opened(tmp_path, entries=2)
+    assert "floor" not in roots[0].policy
+    assert cli.plain(cli.render_fields.file_count_cell(roots[0])) == "5"
+
+
+def test_the_glance_shrinks_so_the_first_pass_reaches_every_folder(tmp_path):
+    """At a fixed 1.5s, 50 of `/project/rcc`'s 84 folders still had no figure a
+    minute in, while the second pass spent the time on the big ones."""
+    roots = [_sized("d%02d" % i) for i in range(84)]
+    sizes = cli._Sizes(roots, {}, per_child_s=1.5, glance_s=15.0)
+    assert sizes.per_child_s == cli.GLANCE_MIN_S
+    assert sizes.glance_s >= 84 * cli.GLANCE_MIN_S, "every folder gets its glance"
+    few = cli._Sizes([_sized("a"), _sized("b")], {}, per_child_s=1.5, glance_s=15.0)
+    assert few.per_child_s == 1.5, "a small directory keeps the full glance"
+
+
+def test_an_unfinished_count_never_shows_a_number(tmp_path):
+    """The owner's `/project/rcc/youzhi`, over 10T in 3M files, read `288G+`: what
+    a glance had counted, printed as a size. "this is just laughable shit"."""
+    (tmp_path / "big").mkdir()
+    for index in range(5):
+        (tmp_path / "big" / ("f%d" % index)).write_bytes(b"x")
+
+    lines, roots, sizes = _opened(tmp_path, entries=2, total_s=0.0)
+    row = [line.split() for line in cli.plain("\n".join(lines)).splitlines() if " big/ " in line][0]
+    assert row[2:4] == ["?", "?"], "no partial figure, however it is marked"
+    assert "not counted" in cli.plain("\n".join(lines))
+    assert str(tmp_path / "big") not in sizes.cache, "an unfinished count is not remembered"
+
+    assert sizes.measure(roots[0]), "m counts it to the end, even past the allowance"
+    _settle(sizes)
+    assert cli.plain(cli.render_fields.file_count_cell(roots[0])) == "5"
+
+
+def test_the_status_line_names_the_folder_being_counted(tmp_path):
+    style = _plain_style()
+    big = _root(str(tmp_path / "big"), reach=Reach.LISTABLE)
+    lines = [cli.plain(line) for line in cli._dir_notes([big], style, big, 3_100_000)]
+    assert lines == ["   \u2026 counting big/: 3.1M entries so far"]
+    assert cli._dir_notes([big], style) == [], "nothing to say when nothing is counting"
+
+
+def test_m_interrupts_the_count_in_flight_and_that_one_is_counted_after(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    (tmp_path / "huge").mkdir()
+    (tmp_path / "wanted").mkdir()
+    (tmp_path / "wanted" / "f").write_bytes(b"x")
+    order = []
+    release = threading.Event()
+
+    def walk(path, **kwargs):
+        order.append(path.rsplit("/", 1)[1])
+        if path.endswith("huge") and len(order) == 1:
+            kwargs["stop"].wait(10)
+            return argparse.Namespace(size=0, files=0, symlinks=0, specials=0, partial=True)
+        return argparse.Namespace(size=10, files=1, symlinks=0, specials=0, partial=False)
+
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    roots = [cli._listed_root(k, None, None, {}) for k in cli._children(str(tmp_path))[0]]
+    sizes = cli._Sizes(roots, {}, glance_s=0.0)
+    huge, wanted = roots
+    sizes.start()
+    stop = time.time() + 5
+    while sizes.counting()[0] is not huge and time.time() < stop:
+        time.sleep(0.01)
+    assert sizes.measure(wanted)
+    _settle(sizes)
+    release.set()
+    assert order == ["huge", "wanted", "huge"], "interrupted, the wanted one, then counted again"
+    assert str(tmp_path / "huge") in sizes.cache and str(tmp_path / "wanted") in sizes.cache
+
+
+def test_a_directory_out_of_time_says_so_and_can_still_be_measured(tmp_path):
+    (tmp_path / "late").mkdir()
+    lines, roots, sizes = _opened(tmp_path, glance_s=0.0, total_s=0.0)
+    assert roots[0].policy.get("not_added") is True
+    assert "not counted" in cli.plain("\n".join(lines))
+    assert sizes.measure(roots[0])
+    _settle(sizes)
+    assert cli.plain(cli.render_fields.file_count_cell(roots[0])) == "0"
+
+
+def test_sizes_are_not_walked_twice_in_one_session(tmp_path):
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").write_bytes(b"x")
+    cache = {}
+    _opened(tmp_path, cache=cache)
+    assert str(tmp_path / "d") in cache
+
+    _lines, roots, sizes = _opened(tmp_path, cache=cache, sized=False)
+    assert not sizes.busy() and not sizes._todo, "nothing left to walk"
+    assert cli.plain(cli.render_fields.file_count_cell(roots[0])) == "1"
+
+
+def test_a_child_the_table_measured_is_the_tables_row(tmp_path):
+    """Its figures are the quota's, not a walk's, and the same as the table shows."""
+    (tmp_path / "lab").mkdir()
+    measured = _measured(_root(str(tmp_path / "lab"), "project-lab"), inodes=7)
+    kid = {
+        "name": "lab",
+        "path": str(tmp_path / "lab"),
+        "readable": True,
+        "writable": True,
+        "enterable": True,
+    }
+    assert cli._listed_root(kid, None, None, {measured.path: measured}) is measured
+    assert not cli._Sizes([measured], {})._todo, "nothing to walk"
 
 
 def _hang_on(monkeypatch, names):
@@ -1811,8 +1963,6 @@ def test_a_child_that_hangs_costs_its_deadline_and_not_the_browser(tmp_path, mon
     """
     import time
 
-    from dirscape.render import resolve_style
-
     root = tmp_path / "project"
     for name in ("alpha", "stuck", "zeta"):
         (root / name).mkdir(parents=True)
@@ -1828,9 +1978,10 @@ def test_a_child_that_hangs_costs_its_deadline_and_not_the_browser(tmp_path, mon
     assert answered and held == 0
     notes = {kid["name"]: kid.get("unknown") for kid in kids}
     assert notes == {"alpha": None, "stuck": "did not answer", "zeta": None}
-    style = resolve_style(color="never", ascii_only=False, stream=None)
-    lines, _kids, _band = cli._listing(str(root), style, cols=100, window=40, kids=kids)
-    assert "did not answer" in cli.plain("\n".join(lines))
+    roots = [cli._listed_root(kid, None, None, {}) for kid in kids]
+    assert roots[1].reach == cli.Reach.UNKNOWN
+    style = _plain_style()
+    assert any("did not answer" in cli.plain(line) for line in cli._dir_notes(roots, style))
 
 
 def test_children_past_the_allowance_are_not_checked_rather_than_waited_for(tmp_path, monkeypatch):
@@ -1852,8 +2003,6 @@ def test_children_past_the_allowance_are_not_checked_rather_than_waited_for(tmp_
 def test_a_directory_that_hangs_is_reported_rather_than_waited_for(tmp_path, monkeypatch):
     import threading
 
-    from dirscape.render import resolve_style
-
     release = threading.Event()
     real = os.scandir
     # Scoped, because this is the real `os.scandir` for the whole process.
@@ -1865,12 +2014,354 @@ def test_a_directory_that_hangs_is_reported_rather_than_waited_for(tmp_path, mon
             release.set()
 
     assert (kids, held, answered) == ([], 0, False)
-    style = resolve_style(color="never", ascii_only=False, stream=None)
-    lines, _kids, _band = cli._listing(
-        str(tmp_path), style, cols=100, window=40, kids=kids, held=held, answered=answered
-    )
-    text = cli.plain("\n".join(lines))
+    text = cli.plain("\n".join(cli._empty_frame(str(tmp_path), _plain_style(), 100, answered)))
     assert "did not answer" in text and "nothing to open" not in text
+
+
+def test_a_walk_the_reader_left_stops_at_the_next_directory(tmp_path):
+    import threading
+
+    for index in range(3):
+        (tmp_path / ("d%d" % index)).mkdir()
+    stop = threading.Event()
+    stop.set()
+    assert cli._walk(str(tmp_path), 1e18, 10**9, stop=stop) == (0, 0, False)
+
+
+class _FakeSizes(object):
+    def __init__(self, changes=(), running=False):
+        self.changes = list(changes)
+        self.running = running
+        self.cursor = 7
+        self.measured = []
+
+    def busy(self):
+        return self.running
+
+    def changed(self):
+        return self.changes.pop(0) if self.changes else False
+
+    def measure(self, root=None):
+        self.measured.append(self.cursor if root is None else root)
+        return True
+
+
+def test_a_landed_figure_repaints_and_m_measures_the_highlighted_row():
+    from dirscape.interactive import Key
+
+    fake = _FakeSizes(changes=[True])
+    pressed = iter([Key.MEASURE, Key.DOWN])
+    keys = cli._sizing_keys(fake, reader=lambda: next(pressed), waiting=lambda t: True)
+    assert keys() == Key.REDRAW, "a figure landed"
+    assert keys() == Key.REDRAW and fake.measured == [7], "m on the highlighted row"
+    assert keys() == Key.DOWN, "every other key passes through"
+
+
+def test_while_walks_run_a_key_is_read_only_once_one_is_waiting():
+    from dirscape.interactive import Key
+
+    fake = _FakeSizes(running=True)
+    waits = iter([False, False, True])
+    keys = cli._sizing_keys(fake, reader=lambda: Key.UP, waiting=lambda t: next(waits))
+    assert keys() == Key.UP
+
+
+def _share_view(size=100, ascii_only=False, share=None, note="3.0K in 3 folders"):
+    """The share column rendered on its own, over three measured children."""
+    from dirscape.render import render_atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=ascii_only, stream=None)
+    roots = []
+    for name, used in (("big", 2048), ("half", 1024), ("none", 0)):
+        root = _measured(_root("/lab/" + name, reach=Reach.LISTABLE), used=used, limit=None)
+        roots.append(root)
+    if share is None:
+        share = {"/lab/big": 2 / 3.0, "/lab/half": 1 / 3.0, "/lab/none": 0.0}
+    text = render_atlas(
+        roots,
+        style=style,
+        size=size,
+        frame=False,
+        title="/lab",
+        note=note,
+        labels={r.path: r.path.rsplit("/", 1)[1] + "/" for r in roots},
+        share=share,
+    )
+    return cli.plain(text).splitlines()
+
+
+def test_an_opened_directory_shows_each_childs_share_as_a_bar():
+    """The question one level down is where the space went, and the room the
+    table used to spread into fifty-space gaps is where the answer goes."""
+    lines = _share_view()
+    heading = [line for line in lines if "path" in line and "share" in line][0]
+    assert heading.split() == ["path", "used", "share"]
+    rows = {line.split()[0]: line for line in lines if line.strip().startswith(("big/", "half/"))}
+    assert re.search(r"67%  \u2587+", rows["big/"]) and re.search(r"33%  \u2587+", rows["half/"])
+    assert rows["big/"].count("\u2587") > rows["half/"].count("\u2587") > 0
+    none = [line for line in lines if line.strip().startswith("none/")][0]
+    assert none.rstrip().endswith("0%") and "\u2587" not in none
+    assert lines[0] == "/lab \u00b7 3.0K in 3 folders", "the title says what the whole is"
+
+
+def test_the_longest_bar_is_the_biggest_folder_and_the_rest_are_in_proportion():
+    """Drawn against the largest share, not 100%: a biggest folder holding a
+    third of the directory left two thirds of every row empty."""
+    lines = _share_view(size=100, share={"/lab/big": 0.3, "/lab/half": 0.15, "/lab/none": 0.0})
+    rows = {
+        line.split()[0]: line.rstrip()
+        for line in lines
+        if line.split()[:1] in (["big/"], ["half/"])
+    }
+    assert 100 - 4 <= len(rows["big/"]) <= 100 - 2, "the biggest spans the room, short of the edge"
+    big, half = rows["big/"].count("\u2587"), rows["half/"].count("\u2587")
+    assert abs(half - big / 2.0) <= 1, "half the share, half the bar"
+    assert re.search(r"30%  \u2587+$", rows["big/"]), "and the percent is still the true share"
+
+
+def test_the_share_column_keeps_the_gutters_their_own_width():
+    """Spreading three columns across the window is what opened fifty-space gaps."""
+    heading = [line for line in _share_view(size=140) if "path" in line and "share" in line][0]
+    gaps = [
+        len(gap)
+        for gap in heading.strip()
+        .replace("path", "|")
+        .replace("used", "|")
+        .replace("share", "|")
+        .split("|")
+        if gap
+    ]
+    assert max(gaps) < 30, heading
+    rule = [line for line in _share_view(size=140) if set(line.strip()) == {"\u2500"}][0]
+    assert len(rule.strip()) == 140, "the rule still spans the panel"
+
+
+def test_the_share_bar_has_an_ascii_twin_and_marks_for_what_is_not_known():
+    lines = _share_view(
+        ascii_only=True, share={"/lab/big": 0.5, "/lab/half": "...", "/lab/none": "?"}
+    )
+    rows = {
+        line.split()[0]: line.rstrip()
+        for line in lines
+        if line.split()[:1] in (["big/"], ["half/"], ["none/"])
+    }
+    assert re.search(r"50%  #+$", rows["big/"]), "the percent, then the bar"
+    assert rows["half/"].endswith("...") and rows["none/"].endswith("?")
+
+
+def test_a_window_too_narrow_for_a_bar_leaves_the_share_out():
+    heading = [line for line in _share_view(size=30) if "path" in line][0]
+    assert "share" not in heading
+
+
+def test_the_start_screen_has_no_share_column_and_still_spreads():
+    """The share is the opened directory's; the start screen is unchanged."""
+    from dirscape.render import render_atlas, resolve_style
+
+    style = resolve_style(color="never", ascii_only=False, stream=None)
+    roots = [_measured(_root("/lab/a")), _measured(_root("/lab/b"), used=5000, limit=9000)]
+    text = cli.plain(render_atlas(roots, style=style, size=140, frame=False))
+    heading = [line for line in text.splitlines() if "path" in line][0]
+    assert "share" not in heading
+    assert len(heading.rstrip()) > 120, "the table still spans the window"
+
+
+@pytest.mark.parametrize(
+    "value, text",
+    [(0.0, "0%"), (0.004, "<1%"), (0.02, "2%"), (1 / 3.0, "33%"), (0.999, "100%"), (1.0, "100%")],
+)
+def test_a_share_is_a_whole_percent_and_never_rounds_a_part_to_nothing(value, text):
+    from dirscape.render import atlas
+
+    assert atlas._percent(value) == text
+
+
+def test_shares_wait_until_the_whole_is_known(tmp_path):
+    """A share of what had been counted so far put a 40G folder at 60% of a
+    directory holding 10T, so no share is shown until every folder is done."""
+    style = _plain_style()
+    done, coming, lost = (
+        _measured(_root("/lab/done", reach=Reach.LISTABLE), used=300, limit=None),
+        _root("/lab/coming", reach=Reach.LISTABLE),
+        _root("/lab/lost", reach=Reach.CLOSED),
+    )
+    coming.policy["measuring"] = True
+    shares, note = cli._shares([done, coming, lost], style)
+    assert cli.plain(shares["/lab/done"]) == cli.plain(shares["/lab/coming"]) == "\u2026"
+    assert shares["/lab/lost"] == "?"
+    assert note == "counting, 2 of 3 folders done"
+    coming.policy.pop("measuring")
+    _measured(coming, used=100, limit=None)
+    shares, note = cli._shares([done, coming, lost], style)
+    assert shares["/lab/done"] == 0.75 and shares["/lab/lost"] == "?"
+    assert note == "400B in 2 of 3 folders"
+    assert cli._shares([done], style)[1] == "300B in 1 folder"
+
+
+def _sized(name, used=None, **policy):
+    root = _root("/lab/" + name, reach=Reach.LISTABLE)
+    if used is not None:
+        _measured(root, used=used, limit=None)
+    root.policy.update(policy)
+    return root
+
+
+def test_an_opened_directory_is_largest_first_with_what_has_no_figure_after():
+    """Owner, on name order: "the share sort of lost its meaning". What is
+    still being counted leads, since a folder the glance could not finish is
+    usually one of the largest; then the counted ones, largest first."""
+    rows = [
+        _sized("a-small", used=10),
+        _sized("b-coming", measuring=True),
+        _sized("c-huge", used=5000),
+        _sized("d-big", used=900),
+        _sized("e-shut"),
+        _sized("f-tie", used=10),
+    ]
+    order = cli._Order(rows)
+    assert [r.path.rsplit("/", 1)[1] for r in order.rows] == [
+        "b-coming",
+        "c-huge",
+        "d-big",
+        "a-small",
+        "f-tie",
+        "e-shut",
+    ]
+    order.toggle()
+    order.arrange()
+    assert [r.path for r in order.rows] == [r.path for r in rows], "`s`: back to names"
+
+
+def test_the_highlight_follows_its_folder_when_the_rows_re_sort():
+    grows, stays = _sized("a-grows", used=1), _sized("b-stays", used=5)
+    order = cli._Order([grows, stays])
+    assert order.rows == [stays, grows]
+    assert order.follow(1) == 0, "before the reader moves, the top row stays highlighted"
+    order.moved = True
+    _measured(grows, used=50, limit=None)
+    assert order.follow(1) == 0 and order.rows[0] is grows, "it moved up, and so did the band"
+
+
+def test_s_flips_the_order_and_repaints():
+    from dirscape.interactive import Key
+
+    order = cli._Order([_sized("a", used=1), _sized("b", used=2)])
+    keys = cli._sizing_keys(_FakeSizes(), order, reader=lambda: Key.SORT, waiting=lambda t: True)
+    assert keys() == Key.REDRAW and order.by_size is False
+
+
+def _banded_frame(tmp_path, color, share_of_first):
+    from dirscape.render import resolve_style
+
+    style = resolve_style(color=color, ascii_only=False, stream=None)
+    big = _measured(_root(str(tmp_path / "big"), reach=Reach.LISTABLE), used=900, limit=None)
+    small = _measured(_root(str(tmp_path / "small"), reach=Reach.LISTABLE), used=1, limit=None)
+    rows = [big, small] if share_of_first else [small, big]
+    lines, _top, _room = cli._dir_frame(str(tmp_path), rows, 0, cli.Run(), style, 100, height=30)
+    return [line for line in lines if "\033[7m" in line][0]
+
+
+def test_the_highlight_stops_before_the_share_bar_instead_of_punching_a_hole_in_it(tmp_path):
+    """Owner: "the highlightor has the problem covering the bar plot", then "very
+    ugly. the main ui doesn't have the issue". A full block in inverse video is
+    a block of the background colour, so the band had a bar-shaped hole in it."""
+    line = _banded_frame(tmp_path, "always", share_of_first=True)
+    band, _, after = line.partition("\033[7m")[2].partition("\033[0m")
+    assert "\u2587" not in band and "100%" in band, "the percent is inside the band"
+    assert "\u2587" in cli.plain(after), "the bar is drawn after it"
+    assert "\033[" in after.split("\u2587")[0], "in its own colour, not inverted"
+
+
+def test_the_band_is_one_width_whatever_the_share(tmp_path):
+    def reach(line):
+        band = line.partition("\033[7m")[2].partition("\033[0m")[0]
+        return len(cli.plain(line.partition("\033[7m")[0])) + len(band)
+
+    with_bar = _banded_frame(tmp_path / "a", "never", share_of_first=True)
+    without = _banded_frame(tmp_path / "b", "never", share_of_first=False)
+    assert reach(with_bar) == reach(without)
+
+
+class _FakeWalk(object):
+    """rapidu's `walk`, recorded: what it was asked, and a canned answer."""
+
+    def __init__(self, answer=None, hang=False, error=None):
+        self.answer = answer or {}
+        self.hang = hang
+        self.error = error
+        self.calls = []
+
+    def __call__(self, path, **kwargs):
+        self.calls.append((path, kwargs))
+        if self.error is not None:
+            raise self.error
+        if self.hang:
+            kwargs["stop"].wait(10)
+        result = argparse.Namespace(size=0, files=0, symlinks=0, specials=0, partial=False)
+        result.__dict__.update(self.answer)
+        if self.hang:
+            result.partial = kwargs["stop"].is_set()
+        return result
+
+
+def test_rapidu_sizes_a_child_when_it_is_installed(tmp_path, monkeypatch):
+    """Owner: "for the large dirs, it's too slow". rapidu keeps sixteen stats in
+    flight where `_walk` waits on one, which is what a cold tree costs."""
+    import threading
+
+    fake = _FakeWalk({"size": 4096, "files": 7, "symlinks": 2, "specials": 1})
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: fake)
+    used, files, done = cli._size_of(str(tmp_path), 1e18, 10, threading.Event())
+    assert (used, files, done) == (4096, 10, True), "every entry that is not a directory"
+    ((path, kwargs),) = fake.calls
+    assert path == str(tmp_path) and kwargs["one_file_system"] is True
+    assert isinstance(kwargs["stop"], threading.Event)
+
+
+def test_rapidu_is_stopped_at_the_deadline_and_the_figure_is_left_unknown(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: _FakeWalk(hang=True))
+    started = time.time()
+    _used, _files, done = cli._size_of(str(tmp_path), time.time() + 0.2, 10, threading.Event())
+    assert not done and time.time() - started < 5.0
+
+
+def test_leaving_the_view_stops_a_rapidu_walk_in_flight(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    fake = _FakeWalk(hang=True)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: fake)
+    (tmp_path / "big").mkdir()
+    roots = [cli._listed_root(kid, None, None, {}) for kid in cli._children(str(tmp_path))[0]]
+    sizes = cli._Sizes(roots, {}, glance_s=0.0)
+    sizes.start()
+    stop = time.time() + 5
+    while not fake.calls and time.time() < stop:
+        time.sleep(0.01)
+    sizes.stop()
+    _settle(sizes, limit=5.0)
+
+
+def test_a_rapidu_without_these_arguments_falls_back_to_the_tables_walk(tmp_path, monkeypatch):
+    import threading
+
+    (tmp_path / "f").write_bytes(b"x")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: _FakeWalk(error=TypeError("old rapidu")))
+    _used, files, done = cli._size_of(str(tmp_path), 1e18, 10, threading.Event())
+    assert (files, done) == (1, True)
+
+
+def test_without_rapidu_the_tables_own_walk_answers(tmp_path):
+    """The suite's default, set in conftest, so a result never depends on
+    whether rapidu happens to be installed where the tests run."""
+    import threading
+
+    (tmp_path / "f").write_bytes(b"x")
+    assert cli._rapidu_walk() is None
+    assert cli._size_of(str(tmp_path), 1e18, 10, threading.Event())[1:] == (1, True)
 
 
 def test_the_tree_sums_walked_figures_and_never_calls_them_unknown(tmp_path):

@@ -89,6 +89,14 @@ class Key(object):
     QUIT = "quit"
     BACK = "back"
     OTHER = "other"
+    #: `m`: add up the highlighted directory in full. Only a directory listing
+    #: acts on it; everywhere else it is ignored like any other letter.
+    MEASURE = "measure"
+    #: `s`: put an opened directory's rows in the other order, size or name.
+    SORT = "sort"
+    #: Not a keypress: the view changed behind the reader (a size arrived) and
+    #: wants painting again, with the cursor where it is.
+    REDRAW = "redraw"
 
 
 def window_rows():
@@ -247,6 +255,17 @@ def _pending(timeout=ESCAPE_GRACE):
         return True
 
 
+def input_waiting(timeout):
+    # type: (float) -> bool
+    """Whether a keypress arrives within ``timeout`` seconds, without reading it.
+
+    For a view whose content changes while the reader looks at it: it waits
+    for input in short slices and repaints between them, and only calls
+    `read_key`, which blocks, once a key is really there.
+    """
+    return _pending(timeout)
+
+
 def read_key(readch=None, pending=None):
     # type: (Optional[Callable[[], str]], Optional[Callable[[], bool]]) -> str
     """One decoded keypress.
@@ -292,6 +311,10 @@ def read_key(readch=None, pending=None):
         return Key.LEFT
     if char in ("l",):
         return Key.RIGHT
+    if char in ("m", "M"):
+        return Key.MEASURE
+    if char in ("s", "S"):
+        return Key.SORT
     if char == "\x03":  # Ctrl-C, which cbreak leaves to us on some platforms
         raise KeyboardInterrupt
     if char != "\x1b":
@@ -521,9 +544,15 @@ def select(
     pending=None,  # type: Optional[Callable[[], bool]]
     clock=None,  # type: Optional[Callable[[], float]]
     screen=None,  # type: Optional[Screen]
+    remap=None,  # type: Optional[Callable[[int], int]]
 ):
     # type: (...) -> object
     """Move a highlight over ``count`` rows; return the index, BACK or QUIT.
+
+    ``remap`` is asked where the cursor goes on every `REDRAW`, for a view
+    whose rows can change ORDER behind the reader: an opened directory sorted
+    by size re-sorts as its sizes land, and the highlight has to stay on the
+    folder it was on rather than on whatever row now has its index.
 
     ``render(i)`` returns the whole block to display with row ``i``
     highlighted, and is called again on every keypress. The whole block is
@@ -630,6 +659,11 @@ def select(
                     continue
                 leave()
                 return cursor
+            elif key == Key.REDRAW:
+                # Painted where it stands: the rows changed, the cursor did not,
+                # unless the rows moved, in which case it follows its row.
+                if remap is not None:
+                    cursor = max(0, min(count - 1, int(remap(cursor))))
             else:
                 continue
             if pending():

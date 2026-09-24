@@ -647,7 +647,7 @@ def used_cell(root, style=None):
     style = style or Style()
     row, how = _governing(root)
     if row is None:
-        return UNKNOWN, ""
+        return _pending_mark(root, style), ""
     text = human_bytes(row.used)
     caveats = []  # type: List[str]
     if how == "inferred":
@@ -742,8 +742,24 @@ def file_count_cell(root, style=None):
     style = style or Style()
     row, _how, _why = pick_row(getattr(root, "inode_quota", None), root.path, "files")
     if row is None:
-        return UNKNOWN
+        return _pending_mark(root, style)
     return figure(human_count(row.used), style)
+
+
+#: The policy flag a directory listing sets on a child it is still adding up.
+MEASURING = "measuring"
+
+
+def _pending_mark(root, style):
+    # type: (Root, Style) -> str
+    """The unknown mark, or an ellipsis for a figure that is being added up now.
+
+    Two different states, and a listing shows both at once: `?` says nothing
+    could measure this, and the ellipsis says the answer is a moment away.
+    """
+    if (getattr(root, "policy", None) or {}).get(MEASURING):
+        return style.dim(style.g.ellipsis)
+    return UNKNOWN
 
 
 def inode_limit_cell(root, style=None):

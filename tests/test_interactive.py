@@ -838,3 +838,66 @@ def test_a_shared_screen_is_drawn_over_rather_than_erased_between_views():
         select(lambda i: ["x"], 1, keys=_reader([Key.QUIT]), raw=False, screen=screen) == Key.QUIT
     )
     assert written[-1].endswith("\033[J") and screen.lines == [], "quitting erases"
+
+
+# --------------------------------------------------------------------------
+# A view whose rows change behind the reader
+# --------------------------------------------------------------------------
+
+
+def test_m_is_the_measure_key_and_s_the_sort_key():
+    assert read_key(_chars("m")) == Key.MEASURE
+    assert read_key(_chars("M")) == Key.MEASURE
+    assert read_key(_chars("s")) == Key.SORT
+
+
+def test_a_redraw_repaints_where_the_cursor_stands():
+    """An opened directory's sizes land while the reader looks: each one is a
+    repaint, and none of them may move the highlight."""
+    painted = []
+
+    def render(index):
+        painted.append(index)
+        return ["row %d" % index]
+
+    chosen = select(
+        render,
+        3,
+        keys=_reader([Key.DOWN, Key.REDRAW, Key.REDRAW, Key.ENTER]),
+        write=lambda text: None,
+        raw=False,
+    )
+    assert chosen == 1
+    assert painted == [0, 1, 1, 1], "one paint per redraw, at the same row"
+
+
+def test_the_measure_key_is_ignored_where_nothing_measures():
+    assert (
+        select(
+            lambda i: ["a", "b"],
+            2,
+            keys=_reader([Key.MEASURE, Key.ENTER]),
+            write=lambda text: None,
+            raw=False,
+        )
+        == 0
+    )
+
+
+def test_a_redraw_asks_where_the_cursor_went_when_rows_can_move():
+    """Rows re-sorted behind the reader: the band goes where its row went."""
+    painted = []
+
+    def render(index):
+        painted.append(index)
+        return ["row %d" % index]
+
+    chosen = select(
+        render,
+        3,
+        keys=_reader([Key.DOWN, Key.REDRAW, Key.ENTER]),
+        write=lambda text: None,
+        raw=False,
+        remap=lambda cursor: 2,
+    )
+    assert painted == [0, 1, 2] and chosen == 2

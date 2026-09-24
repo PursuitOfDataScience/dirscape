@@ -45,7 +45,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..model import Root, VerdictCategory, category_label
 from . import fields
-from .style import Style, legend, panel, table, wrap
+from .style import Style, legend, pad, panel, table, wrap
 from .style import width as measure
 
 __all__ = ["render", "COLUMNS", "DROP_STAGES", "KEEP_COLUMNS"]
@@ -217,12 +217,12 @@ def _path_cell(root, style=None):
     return fields.UNKNOWN
 
 
-def _row(root, style, site):
-    # type: (Root, Style, object) -> Tuple[List[str], str]
+def _row(root, style, site, label=None):
+    # type: (Root, Style, object, Optional[str]) -> Tuple[List[str], str]
     used, caveat = fields.used_cell(root, style)
     cells = [
         fields.role_cell(root, style),
-        _path_cell(root, style),
+        _path_cell(root, style) if label is None else style.text(fields.safe(label, limit=4096)),
         fields.where_cell(root, style),
         fields.reach_cell(root, style),
         used,
@@ -261,14 +261,17 @@ def _heading(index, roots):
     return COLUMNS[index]
 
 
-def _constant_columns(rows):
-    # type: (Sequence[Sequence[str]]) -> set
+def _constant_columns(rows, single=False):
+    # type: (Sequence[Sequence[str]], bool) -> set
     """Column indexes whose value never varies, excluding the ones that must stay.
 
     PATH is never dropped, and USED is never dropped even if every row happens
     to read the same, because both are the answer rather than the context.
+    ``single`` applies the rule to a one-row table as well, which the start
+    screen does not: an opened directory with one child otherwise printed
+    `here`, `?` for its quota and `?` for its policy across the whole row.
     """
-    if len(rows) < 2:
+    if len(rows) < (1 if single else 2):
         return set()
     keep = set(KEEP_COLUMNS)
     out = set()
@@ -383,6 +386,83 @@ def _header(roots, meta, style, size=None):
     # quota, which machine. `node` is still computed above because `--summary`
     # and the JSON metadata both carry it.
     return legend(items, style, size=size if size else style.size, indent="")
+
+
+#: The share bar's length, in cells. It takes the width the columns leave, as
+#: the spread table's gutters do, up to this, and below the minimum it is left
+#: out rather than drawn two cells long.
+SHARE_BAR_MAX = 100
+SHARE_BAR_MIN = 8
+
+#: Cells left between the longest bar and the frame, which it otherwise ran
+#: into: a block of colour pressed against the border reads as part of it.
+SHARE_MARGIN = 2
+
+
+def _percent(value):
+    # type: (float) -> str
+    """A share as a whole percent, with `<1%` for a part too small to round up."""
+    if value <= 0:
+        return "0%"
+    if value < 0.005:
+        return "<1%"
+    return "%d%%" % (int(round(value * 100)),)
+
+
+#: The percent's own width inside the share cell, which is also the width of
+#: the heading above it, so `share` sits over the figures and not the bar.
+_SHARE_PERCENT = 5
+
+
+def _share_cell(value, size, style, peak=1.0):
+    # type: (object, int, Style, float) -> str
+    """The percent, then a bar at most ``size`` cells long.
+
+    **The bar is drawn against the LARGEST share here, not against 100%**,
+    as ncdu draws its own: the biggest folder's bar spans the room and every
+    other is in proportion to it, while the percent beside it stays the true
+    share. Against 100% the longest bar in a home whose biggest folder holds a
+    third of it covered a third of the room, and the owner read the rest as
+    "a lot of space on the right side gets wasted".
+
+    The percent comes FIRST, beside `used` and `files`, so the figures read
+    as one block and the bar trails off to the right of them. The other way
+    round, a row whose bar was empty printed its `<1%` alone at the far edge
+    of the frame, a column of numbers belonging to no row.
+
+    ``value`` is a fraction, or the mark to print where one would be: the
+    ellipsis while the child is being added up, `?` when nothing could be.
+    """
+    if not isinstance(value, float):
+        mark = value if isinstance(value, str) and value else fields.UNKNOWN
+        return pad(mark, _SHARE_PERCENT, "right")
+    cells = (max(0.0, min(1.0, value / peak)) if peak > 0 else 0.0) * size
+    # Whole cells: the partial blocks that gave a bar its last eighth are all
+    # full height, and a tall tip on a short bar reads as a notch.
+    text = style.g.bar * int(cells + 0.5)
+    drawn = style.info(text) if text else ""
+    return pad(_percent(value), _SHARE_PERCENT, "right") + ("  " + drawn if drawn else "")
+
+
+def _title_lines(title, style, size):
+    # type: (str, Style, int) -> List[str]
+    """A path as the title, on as many lines as it needs and never cut.
+
+    Broken after a `/`, so each line ends where a directory name does. The
+    frame would otherwise cut a deep path at its width, and a cut path is a
+    different path: the rule this whole view is built on.
+    """
+    text = fields.safe(title, limit=4096)
+    lines = []  # type: List[str]
+    line = ""
+    for part in re.findall(r"[^/]*/|[^/]+$", text) or [text]:
+        if line and measure(line + part) > size:
+            lines.append(line)
+            line = part
+        else:
+            line += part
+    lines.append(line)
+    return [style.head(piece) for piece in lines]
 
 
 def _delta_lines(roots, changes, style, size=None):
@@ -577,9 +657,33 @@ def render(
     summary=False,
     deltas=False,
     frame=True,
+    title=None,
+    keep=(),
+    labels=None,
+    share=None,
+    note=None,
+    hide=(),
 ):
     # type: (...) -> str
     """The atlas, as one string.
+
+    ``share`` maps a root's path to its part of a whole (0 to 1), or to the
+    mark to print instead, and adds a last column drawing it as a bar and a
+    percent. It is the opened directory's column: the question one level down
+    is where the space went, and every measured child has a part of it, which
+    is what the quota bar this table once had could never say about every
+    row. With it on, the gutters stay their own width and the bar takes the
+    room that spreading would have handed them, which with three columns was
+    fifty spaces a gap. ``note`` follows the title, saying what the whole is.
+
+    ``title`` replaces the header with a path, which is how the browser draws
+    the directory it has opened: the SAME table, one level down, headed by
+    where the reader is instead of by whose storage it is. ``labels`` maps a
+    root's path to what its path cell shows, there the child's own name,
+    because the title already says the rest and a full path one level down is
+    the parent repeated on every row. ``keep`` names columns that stay even
+    when every row reads the same, for a view whose figures are still
+    arriving and whose columns must not jump when they do.
 
     ``changes`` comes from the state layer and is rendered, never computed.
     ``meta`` is anything `fields.RunMeta.of` accepts, and every field of it is
@@ -622,7 +726,16 @@ def render(
     # newline broke the frame open at 60 columns: the border closed after
     # `compute` and the rest of the title landed outside the box with the
     # right-hand border stuck on the end of it.
-    out = _header(roots, info, style, size=budget).splitlines()
+    if title:
+        out = _title_lines(title, style, budget)
+        if note:
+            tail = " %s %s" % (style.g.sep, note)
+            if measure(out[-1]) + measure(tail) <= budget:
+                out[-1] += style.muted(tail)
+            else:
+                out.append(style.muted(note))
+    else:
+        out = _header(roots, info, style, size=budget).splitlines()
 
     if not roots:
         _stranded, changed = (
@@ -644,7 +757,7 @@ def render(
     rows = []  # type: List[List[str]]
     caveats = []  # type: List[Tuple[str, str]]
     for root in roots:
-        cells, caveat = _row(root, style, site)
+        cells, caveat = _row(root, style, site, (labels or {}).get(root.path))
         rows.append(cells)
         if caveat:
             caveats.append((root.path, caveat))
@@ -654,7 +767,12 @@ def render(
     # which spends nine characters of the window saying nothing. Dropped here
     # rather than in `_plan`, because `_plan` is about fitting and this is
     # about content.
-    constant = _constant_columns(rows)
+    constant = _constant_columns(rows, single=share is not None) - {
+        COLUMNS.index(name) for name in keep
+    }
+    # A hidden column goes the way a constant one does: never planned for,
+    # never shown, and never reported as dropped.
+    constant |= {COLUMNS.index(name) for name in hide}
 
     if group:
         # `_align_figures` used to run here, right-aligning the used figure,
@@ -735,10 +853,25 @@ def render(
         )
         return "\n".join(out)
 
+    headings = [_heading(i, roots) for i in columns]
+    cells = [[row[i] for i in columns] for row in rows]
+    aligns = [_ALIGNS[i] for i in columns]
+    if share is not None:
+        # Whatever the columns leave, the bar takes, up to a length a reader
+        # can still judge by eye. Too little room and the column is left out
+        # rather than squeezed: a bar two cells long says nothing.
+        room = budget - _column_width(COLUMNS, rows, columns, _INDENT, _GUTTER) - measure(_GUTTER)
+        bar = min(room - _SHARE_PERCENT - 2 - SHARE_MARGIN, SHARE_BAR_MAX)
+        if bar >= SHARE_BAR_MIN:
+            headings.append("share")
+            aligns.append("left")
+            peak = max([v for v in share.values() if isinstance(v, float)] or [0.0])
+            for root, line in zip(roots, cells):
+                line.append(_share_cell(share.get(root.path), bar, style, peak))
     body, extra = table(
-        [_heading(i, roots) for i in columns],
-        [[row[i] for i in columns] for row in rows],
-        aligns=[_ALIGNS[i] for i in columns],
+        headings,
+        cells,
+        aligns=aligns,
         style=style,
         size=budget,
         keep=[columns.index(i) for i in KEEP_COLUMNS if i in columns],
@@ -750,8 +883,8 @@ def render(
         # became a good idea once the figures were split into real columns:
         # there are seven of them to share the leftover room between now, so
         # each gutter grows by a few characters instead of one opening into a
-        # 40 space gap.
-        spread=True,
+        # 40 space gap. Not with a share bar, which is the use for that room.
+        spread=share is None,
         # Ruled ABOVE the headings instead, spanning the panel. A dashed
         # segment under each heading draws the eye across the table's own
         # width and then stops, which reads as a second, shorter frame inside
@@ -826,7 +959,10 @@ def render(
     # whole view, brighter than the box containing it and nearly as bright as
     # the figures, reads as a second heading. `track` is the tier below dim
     # and is what a separator wants.
-    out[rule_at] = style.track(style.g.h * max(1, min(inner, budget)))
+    # With a share bar the table stops short of the frame by design, and the
+    # rule still spans the panel, as it does over the spread table.
+    span = budget if share is not None else min(inner, budget)
+    out[rule_at] = style.track(style.g.h * max(1, span))
     return _finish(out, style, window, frame)
 
 

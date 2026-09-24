@@ -254,6 +254,11 @@ _GLYPHS = (
     ("doubt", "▒", "+"),
     # A treemap cell's fill.
     ("tile", "▓", "="),
+    # The share bar in an opened directory: each child's part of what the
+    # directory holds. The lower seven-eighths block, not the full one: full
+    # blocks on neighbouring rows touch and the bars read as one slab. Owner:
+    # "there should be a slim between these bordering bars".
+    ("bar", "▇", "#"),
 )
 
 

@@ -5,6 +5,61 @@ All notable changes to `dirscape` are recorded here, newest first, following
 
 ## [Unreleased]
 
+## [0.2.0] (2026-09-24)
+
+### Changed
+
+- **Opening a row shows the start screen's own table, one level down.** The
+  listing had a table of its own, `name`, `access` and `items`, and `items`
+  was the number of names directly inside each child: neither a size nor a
+  file count, and "a confusing word". Each child is now a row of the same
+  table, drawn by the same renderer with the same cells, headed by the
+  directory and naming each child. The same rule drops a column that reads
+  the same on every row, now for a one-row directory too, and `kind` is left
+  out one level down, where it is the parent's kind on every row. A child the
+  sweep already measured shows the table's own figures. A deep directory's
+  title wraps at a `/` instead of being cut.
+- **Every child is counted behind the view, to the end, and a figure is
+  shown only when its count has finished.** The directory is drawn at once,
+  `…` where a figure is coming, the folders on screen first. A first pass
+  glances at every child, held to the table's walk bounds and shortened when
+  there are many, so small folders are exact within seconds: on
+  `/project/rcc`, 58 of its 84 folders at 30s. Every folder the glance did not
+  finish is then counted to the end, one at a time and never restarted, the
+  smallest first, for up to 30 minutes a visit, with a status line naming the
+  folder in progress and its entries so far; `m` counts the highlighted one
+  next. What an unfinished count had reached is never printed as a size: an
+  earlier cut of this showed the owner's own folder, over 10T in 3 million
+  files, as `288G+`. Folders still being counted sort first, since the glance
+  leaves the largest unfinished. Sizes are kept for the session, walking
+  stops when the reader leaves, and a hung mount can stop a figure but never
+  the keys.
+- **Each child's share of what the directory holds, largest first, once the
+  whole is known.** A last `share` column gives the percent beside `used` and
+  `files`, then a bar drawn against the largest share as ncdu draws its own,
+  ending two cells short of the frame. The title says what the whole is,
+  `/home/jdoe42 · 894M in 52 folders`, and `counting, 60 of 84 folders done`
+  until then, because shares of a partial whole put a 40G folder at 60% of a
+  directory holding 10T. In name order the share meant little, since a home
+  directory's first screen was twenty dot-directories at `<1%`, so rows sort
+  by size as figures land, the highlight kept on its folder, and `s` switches
+  to name order and back. The gutters keep their own width, where three
+  columns spread across the window had opened gaps of fifty spaces. The
+  highlight stops one column past the percent, since inverse video turns a
+  bar into a hole in the band, and the bar is the seven-eighths block, so bars
+  on neighbouring rows keep a hairline apart. The start screen is unchanged.
+- **rapidu sizes an opened directory's children when it is installed**
+  (`pip install "dirscape[fast]"`), and nothing requires it. A cold GPFS tree
+  is slow because each `stat` is a round trip to a metadata server and one
+  thread waits on each in turn: the first walk of a 15,346-file folder took
+  10.7s on dirscape's own walk. rapidu keeps sixteen in flight, and with it
+  `/beagle3/rcc-staff` was exact in 11s, 20 GiB and 129k files in its largest
+  folder. It is not faster on a warm tree: over 30 paired, interleaved walks
+  of that folder warm, it took a median 0.37s to 0.16s, 0.43x [95% CI 0.42,
+  0.43], slower in every pair, which a walk running behind the view never
+  shows. Its figures are `du`'s, directory blocks included and hard links
+  counted once.
+
 ## [0.1.1] (2026-09-24)
 
 ### Fixed

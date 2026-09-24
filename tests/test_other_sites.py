@@ -639,15 +639,15 @@ def test_the_listing_says_how_many_entries_it_left_out(tmp_path):
         {
             "name": "d%03d" % i,
             "path": str(tmp_path / ("d%03d" % i)),
-            "items": 0,
             "readable": True,
             "writable": True,
             "enterable": True,
         }
         for i in range(200)
     ]
-    lines, _kids, _band = cli._listing(
-        str(tmp_path), Style(color=False), cols=80, window=20, kids=kids, held=10201
+    roots = [cli._listed_root(kid, None, None, {}) for kid in kids]
+    lines, _top, _room = cli._dir_frame(
+        str(tmp_path), roots, 0, cli.Run(), Style(color=False), 80, height=20, held=10201
     )
     assert any("10k more not listed" in line or "10.2k more not listed" in line for line in lines)
 

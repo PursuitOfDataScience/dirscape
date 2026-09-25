@@ -2090,10 +2090,15 @@ def test_the_walk_hands_over_every_subtree_it_finished(tmp_path):
     parts = {}
     used, files, done = cli._walk(str(tmp_path), 1e18, 10**9, stop=threading.Event(), parts=parts)
     assert done and files == 5
-    assert sorted(parts) == [str(tmp_path / "a"), str(tmp_path / "b")]
+    top = [path for path in parts if os.path.dirname(path) == str(tmp_path)]
+    assert sorted(top) == [str(tmp_path / "a"), str(tmp_path / "b")]
+    assert sorted(set(parts) - set(top)) == [
+        str(tmp_path / "a" / "deep"),
+        str(tmp_path / "b" / "deep"),
+    ]
     for path, figures in parts.items():
         assert figures == cli._walk(path, 1e18, 10**9)[:2], "what walking it alone counts"
-    assert sum(f for _b, f in parts.values()) == files - 1, "the file at the top is nobody's part"
+    assert sum(parts[p][1] for p in top) == files - 1, "the file at the top is nobody's part"
 
 
 def test_a_walk_cut_short_hands_over_only_what_it_finished(tmp_path):
@@ -2177,7 +2182,9 @@ def test_the_threaded_walk_counts_exactly_what_the_serial_one_does(tmp_path):
     tally = cli._Tally()
     threaded = cli._walk_threads(str(root), 1e18, 10**9, parts=threaded_parts, tally=tally)
     assert threaded == serial and serial[2]
-    assert threaded_parts == serial_parts and len(threaded_parts) == 3
+    assert threaded_parts == serial_parts
+    top = [path for path in threaded_parts if os.path.dirname(path) == str(root)]
+    assert len(top) == 3 and len(threaded_parts) == 6, "a, d and e, and below them b, c and f"
     assert tally.inodes > serial[1], "entries read, directories among them"
 
 
@@ -3802,6 +3809,11 @@ def test_a_real_pty_does_not_repaint_the_detail_view():
     Three raw sessions are still required, because without them the test would
     pass by having its keystrokes dropped, which is what an output-driven
     harness does the moment the output it waits on changes shape.
+
+    **With motion off**, because motion changes the shape this counts on: the
+    startup board holds the terminal in a raw session of its own before the
+    table's, and keys sent then are discarded when the table's begins. The
+    same property with motion on is `test_a_real_pty_animates_and_every_frame_fits`.
     """
     pty = pytest.importorskip("pty")
     import re
@@ -3819,7 +3831,7 @@ def test_a_real_pty_does_not_repaint_the_detail_view():
         for name in cli.AGENT_VARIABLES:
             os.environ.pop(name, None)
         os.environ["PYTHONPATH"] = os.path.join(root, "src")
-        os.execv(sys.executable, [sys.executable, "-m", "dirscape", "--no-state"])
+        os.execv(sys.executable, [sys.executable, "-m", "dirscape", "--no-state", "--no-motion"])
 
     import fcntl
     import termios
@@ -4629,3 +4641,1032 @@ def test_slash_in_a_folder_searches_it_and_slash_again_takes_the_search_up_again
     assert cli._descend(top, _plain_style(), 100) == interactive.Key.QUIT
     assert [(here, query) for here, query, _f in views] == [(top, ""), (top, "era5")]
     assert views[0][2] is views[1][2], "the tree read once is asked again"
+
+
+# --------------------------------------------------------------------------
+# Live views: what moves while dirscape waits
+# --------------------------------------------------------------------------
+
+
+class _Clock(object):
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _live_style(ascii_only=False, clock=None, chrome=None):
+    """A truecolor style carrying a `Motion`, as the browser's own copy does."""
+    from dirscape import motion
+    from dirscape.render.style import Glyphs
+
+    style = Style(color=True, depth=24, glyphs=Glyphs(not ascii_only), size=100)
+    moving = motion.Motion(style, clock=clock or _Clock(), chrome=chrome)
+    return style.moving(moving), moving
+
+
+def _waiting_rows(tmp_path, names=("a", "b", "c")):
+    roots = []
+    for name in names:
+        (tmp_path / name).mkdir()
+        kid = {
+            "name": name,
+            "path": str(tmp_path / name),
+            "readable": True,
+            "writable": True,
+            "enterable": True,
+        }
+        root = cli._listed_root(kid, None, None, {})
+        root.policy[render_fields.MEASURING] = True
+        roots.append(root)
+    return roots
+
+
+class _FakeMotion(object):
+    def __init__(self, moving=True, bursts=0):
+        self.moving, self.bursts = moving, bursts
+
+    def animating(self, running=False):
+        return self.moving
+
+    def until_next(self):
+        return 0.1
+
+    def bursting(self):
+        if self.bursts:
+            self.bursts -= 1
+            return True
+        return False
+
+
+def test_while_something_moves_the_keys_ask_for_frames_and_a_key_comes_first():
+    from dirscape.interactive import Key
+
+    keys = cli._sizing_keys(
+        _FakeSizes(running=True), reader=lambda: Key.UP, waiting=lambda t: False,
+        motion=_FakeMotion(),
+    )  # fmt: skip
+    assert keys() == Key.TICK, "a frame, and nothing rendered for it"
+    keys = cli._sizing_keys(
+        _FakeSizes(running=True), reader=lambda: Key.UP, waiting=lambda t: True,
+        motion=_FakeMotion(),
+    )  # fmt: skip
+    assert keys() == Key.UP, "a key waiting is read before any frame"
+
+
+def test_a_burst_is_rendered_frame_by_frame_and_settled_once():
+    from dirscape.interactive import Key
+
+    keys = cli._sizing_keys(
+        _FakeSizes(), reader=lambda: Key.UP, waiting=lambda t: False,
+        motion=_FakeMotion(bursts=2),
+    )  # fmt: skip
+    assert [keys() for _ in range(4)] == [Key.REDRAW, Key.REDRAW, Key.REDRAW, Key.TICK]
+
+
+def test_the_row_being_counted_spins_and_the_rows_waiting_their_turn_do_not(tmp_path):
+    from dirscape import motion
+
+    clock = _Clock()
+    roots = _waiting_rows(tmp_path)
+    live, moving = _live_style(clock=clock)
+    moving.follow(lambda: (str(tmp_path / "b"), 42))
+    lines, _top, _room = cli._dir_frame(str(tmp_path), roots, 0, cli.Run(), live, 100, height=40)
+    moving.overlay(lines)
+    clock.now += motion.SPIN_DELAY_S + motion.FRAME_S
+    shown = [cli.plain(line) for line in moving.overlay(lines)]
+    assert not any(motion.MARK in line for line in moving.overlay(lines))
+    row = {name: next(line for line in shown if " %s/ " % name in line) for name in "abc"}
+    spinning = [ch for ch in row["b"] if "⠀" <= ch <= "⣿"]
+    assert len(spinning) == 2, "the used and files cells of the row in flight both turn"
+    for name in "ac":
+        assert row[name].count("…") >= 2 and not any("⠀" <= ch <= "⣿" for ch in row[name])
+
+
+def test_an_opened_directory_moves_in_ascii_under_ascii(tmp_path):
+    roots = _waiting_rows(tmp_path)
+    live, moving = _live_style(ascii_only=True)
+    moving.follow(lambda: (str(tmp_path / "a"), 7))
+    lines, _top, _room = cli._dir_frame(
+        str(tmp_path), roots, 1, cli.Run(), live, 100, height=40, progress=1 / 3.0
+    )
+    text = "\n".join(cli.plain(line) for line in moving.overlay(lines))
+    assert all(ord(ch) < 128 for ch in text)
+    assert "=" * 10 in text.splitlines()[0], "the top edge fills with the ASCII heavy rule"
+
+
+def test_the_top_edge_is_the_share_of_folders_counted_and_goes_when_all_are(tmp_path):
+    from dirscape import motion
+
+    roots = _waiting_rows(tmp_path)
+    live, moving = _live_style()
+    view = cli._Live(moving, str(tmp_path), cli._Sizes(roots, {}), live)
+    assert view.update(roots) == 0.0
+    roots[0].policy.pop(render_fields.MEASURING)
+    assert view.update(roots) == pytest.approx(1 / 3.0)
+    lines, _top, _room = cli._dir_frame(
+        str(tmp_path), roots, 0, cli.Run(), live, 100, height=40, progress=1 / 3.0
+    )
+    edge = cli.plain(motion.strip_marks(lines[0]))
+    span = len(edge) - 2
+    assert edge.count("━") == round(span / 3.0)
+    assert edge.count("─") == span - edge.count("━")
+    for root in roots:
+        root.policy.pop(render_fields.MEASURING, None)
+    assert view.update(roots) is None, "every folder counted: the edge is a border again"
+
+
+def test_a_figure_that_lands_fades_in_and_then_is_drawn_as_ever(tmp_path):
+    from dirscape import motion
+
+    clock = _Clock()
+    roots = _waiting_rows(tmp_path, names=("a",))
+    live, moving = _live_style(clock=clock)
+    sizes = cli._Sizes(roots, {})
+    view = cli._Live(moving, str(tmp_path), sizes, live)
+    cli._Sizes._apply(roots[0], 4096, 3)
+    sizes.landed.append(roots[0])
+    view.update(roots)
+    used, _caveat = render_fields.used_cell(roots[0], live)
+    assert "\033[?7700;%d;" % (motion.FLASH,) in used
+    clock.now += 2 * motion.FLASH_S
+    used, _caveat = render_fields.used_cell(roots[0], live)
+    assert motion.MARK not in used, "faded: the cell is exactly what it always was"
+
+
+def test_the_bars_grow_in_once_the_last_folder_lands_and_only_after_a_count(tmp_path):
+    from dirscape import motion
+
+    clock = _Clock()
+    roots = _waiting_rows(tmp_path, names=("a", "b"))
+    live, moving = _live_style(clock=clock)
+    view = cli._Live(moving, str(tmp_path), cli._Sizes(roots, {}), live)
+    view.update(roots)
+    assert view.grow() == 1.0 and view.finished is None
+    for root in roots:
+        root.policy.pop(render_fields.MEASURING)
+    view.update(roots)
+    assert view.finished == clock.now and moving.bursting()
+    clock.now += motion.GROW_S / 2
+    assert 0.0 < view.grow() < 1.0
+    clock.now += motion.GROW_S
+    assert view.grow() == 1.0
+
+    complete = _waiting_rows(tmp_path / "x" if (tmp_path / "x").mkdir() is None else tmp_path)
+    for root in complete:
+        root.policy.pop(render_fields.MEASURING)
+    opened_complete = cli._Live(moving, str(tmp_path), cli._Sizes(complete, {}), live)
+    opened_complete.update(complete)
+    assert opened_complete.finished is None, "nothing was waited for: nothing to celebrate"
+
+
+def test_the_bars_grow_from_nothing_and_the_percent_is_true_throughout():
+    from dirscape.render import atlas
+
+    style = _plain_style()
+    half = cli.plain(atlas._share_cell(0.5, 40, style, peak=0.5, grow=0.5))
+    whole = cli.plain(atlas._share_cell(0.5, 40, style, peak=0.5, grow=1.0))
+    assert half.split()[0] == whole.split()[0] == "50%"
+    assert whole.count("▇") == 40 and half.count("▇") == 20
+
+
+def test_a_count_long_enough_to_walk_away_from_ends_with_a_notification(tmp_path):
+    notes = []
+
+    class Chrome(object):
+        def title(self, text):
+            pass
+
+        def progress(self, fraction=None, busy=False):
+            pass
+
+        def notify(self, text):
+            notes.append(text)
+
+    from dirscape import motion
+
+    roots = _waiting_rows(tmp_path, names=("a",))
+    live, moving = _live_style(chrome=Chrome())
+    wall = [0.0]
+    view = cli._Live(moving, str(tmp_path), cli._Sizes(roots, {}), live, wall=lambda: wall[0])
+    view.update(roots)
+    roots[0].policy.pop(render_fields.MEASURING)
+    cli._Sizes._apply(roots[0], 4096, 3)
+    wall[0] = motion.NOTIFY_AFTER_S + 5
+    view.update(roots)
+    assert len(notes) == 1 and str(tmp_path) in notes[0] and "2:05" in notes[0]
+
+    quick = _waiting_rows(tmp_path / "q" if (tmp_path / "q").mkdir() is None else tmp_path)
+    notes[:] = []
+    wall[0] = 0.0
+    fast = cli._Live(moving, str(tmp_path), cli._Sizes(quick, {}), live, wall=lambda: wall[0])
+    fast.update(quick)
+    for root in quick:
+        root.policy.pop(render_fields.MEASURING)
+    wall[0] = 3.0
+    fast.update(quick)
+    assert notes == [], "a count that was watched to its end needs no notification"
+
+
+def test_the_status_line_tells_the_pace_the_time_and_a_wait_on_the_filesystem(tmp_path):
+    from dirscape import motion
+
+    root = cli._listed_root(
+        {"name": "big", "path": str(tmp_path / "big"), "readable": True, "writable": True,
+         "enterable": True},
+        None, None, {},
+    )  # fmt: skip
+    entries = [0]
+
+    class Sizes(object):
+        def live_count(self):
+            return root, entries[0], 100.0
+
+    clock = _Clock()
+    live, moving = _live_style(clock=clock)
+    moving.follow(lambda: (root.path, entries[0]))
+    wall = [100.0]
+    line = cli._live_status(Sizes(), live, motion.Meter(), wall=lambda: wall[0])
+    for _second in range(4):
+        entries[0] += 20000
+        clock.now += 1.0
+        wall[0] += 1.0
+        text = cli.plain(line(100, clock.now))
+    assert "counting big/: 80k entries so far" in text
+    assert "0:04" in text and "20k/s" in text
+    assert any(ch in text for ch in live.g.spark)
+    clock.now += motion.STALL_S + 1
+    wall[0] += motion.STALL_S + 1
+    assert "waiting on the filesystem for 0:06" in cli.plain(line(100, clock.now))
+    assert cli.render_style.width(line(40, clock.now)) <= 40, "pieces go before the line overflows"
+
+
+def test_a_slow_listing_spins_the_row_being_opened_and_a_fast_one_draws_nothing(monkeypatch):
+    import time
+
+    from dirscape import interactive, motion
+
+    # The real clock: the spinner on a row being opened turns on time, since a
+    # listing has no count to be honest to.
+    live, moving = _live_style(clock=time.monotonic)
+    monkeypatch.setattr(cli.interactive, "raw_session", lambda: interactive._Nothing())
+    written = []
+    screen = interactive.Screen(write=written.append, motion=moving)
+    band = interactive.highlight(["   home   /home/me   901M", "   project   /lab   3T"], 0)
+    screen.paint(band)
+    before = len(written)
+
+    monkeypatch.setattr(cli, "_children", lambda path: ([], 0, True))
+    assert cli._listing("/home/me", screen, moving) == ([], 0, True)
+    assert len(written) == before, "fast: the new view is its own answer"
+
+    def slow(path):
+        time.sleep(0.7)
+        return ["kids"], 0, True
+
+    monkeypatch.setattr(cli, "_children", slow)
+    assert cli._listing("/home/me", screen, moving) == (["kids"], 0, True)
+    drawn = "".join(written[before:])
+    assert motion.MARK not in drawn
+    turned = {ch for ch in cli.plain(drawn) if "⠀" <= ch <= "⣿"}
+    assert len(turned) >= 2, "the spinner in the row's margin turned while it waited"
+
+    def broken(path):
+        time.sleep(0.2)
+        raise RuntimeError("the listing broke")
+
+    monkeypatch.setattr(cli, "_children", broken)
+    with pytest.raises(RuntimeError):
+        cli._listing("/home/me", screen, moving)
+
+
+def test_ctrl_c_while_a_folder_is_being_listed_quits_instead_of_raising(tmp_path, monkeypatch):
+    from dirscape import interactive
+
+    def interrupted(here, screen, motion):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_listing", interrupted)
+    assert cli._descend(str(tmp_path), _plain_style(), 100) == interactive.Key.QUIT
+
+
+def test_the_sweep_tells_its_board_every_stage_and_what_each_found(tmp_path, monkeypatch):
+    from dirscape.discover import read_mount_table
+    from dirscape.runner import RecordedRunner
+    from dirscape.sitecfg import Site
+
+    (tmp_path / "work" / "me").mkdir(parents=True)
+    table = read_mount_table(text="fs:/export %s nfs4 rw 0 0\n" % (tmp_path / "work",))
+    monkeypatch.setattr(cli, "read_mount_table", lambda: table)
+    monkeypatch.setattr(cli, "load_site", lambda warn=None: Site())
+    told = []
+
+    class Board(object):
+        def __getattr__(self, name):
+            return lambda *args: told.append((name,) + args)
+
+    opts = cli.build_parser().parse_args(["--no-state", "--no-measure"])
+    cli.sweep(opts, runner=RecordedRunner([], strict=False), observer=Board())
+    stages = [entry[1] for entry in told if entry[0] == "stage"]
+    assert stages == [
+        "config", "mounts", "plugins", "quota", "allocations", "discover", "attribute",
+        "snapshots", "quota-attach",
+    ]  # fmt: skip
+    assert ("note", "mounts", "1 filesystem") in told
+    assert any(entry[:2] == ("note", "paths") for entry in told)
+    assert ("claim", "allocations") in told and ("release", "allocations") in told
+
+
+def test_a_board_that_raises_costs_the_sweep_nothing(tmp_path, monkeypatch):
+    from dirscape.discover import read_mount_table
+    from dirscape.runner import RecordedRunner
+    from dirscape.sitecfg import Site
+
+    monkeypatch.setattr(cli, "read_mount_table", lambda: read_mount_table(text=""))
+    monkeypatch.setattr(cli, "load_site", lambda warn=None: Site())
+
+    class Broken(object):
+        def __getattr__(self, name):
+            def fail(*args):
+                raise RuntimeError("the board broke")
+
+            return fail
+
+    opts = cli.build_parser().parse_args(["--no-state"])
+    run = cli.sweep(opts, runner=RecordedRunner([], strict=False), observer=Broken())
+    assert [label for label, _at in run.timings][:3] == ["config", "mounts", "plugins"]
+
+
+def test_the_runner_tells_its_observer_and_nothing_it_does_changes_the_result():
+    from dirscape.runner import SubprocessRunner
+
+    seen = []
+
+    class Observer(object):
+        def started(self, argv):
+            seen.append(("started", argv[-1]))
+            return "token"
+
+        def finished(self, token, completed):
+            seen.append(("finished", token, completed.returncode))
+
+    runner = SubprocessRunner()
+    runner.observer = Observer()
+    result = runner.run([sys.executable, "-c", "print('hi')"])
+    assert result.stdout.strip() == "hi"
+    assert seen == [("started", "print('hi')"), ("finished", "token", 0)]
+
+    class Broken(object):
+        def started(self, argv):
+            raise RuntimeError("no")
+
+        def finished(self, token, completed):
+            raise RuntimeError("no")
+
+    runner.observer = Broken()
+    assert runner.run([sys.executable, "-c", "print('hi')"]).stdout.strip() == "hi"
+
+
+@pytest.mark.parametrize(
+    "argv,env",
+    [
+        (["--no-motion"], {}),
+        ([], {"DIRSCAPE_NO_MOTION": "1"}),
+        ([], {"DIRSCAPE_AGENT": "1"}),
+        (["--json"], {}),
+        (["--replay", "x.json"], {}),
+    ],
+)
+def test_no_board_where_nothing_may_move(monkeypatch, argv, env):
+    from dirscape import motion
+
+    for name in cli.AGENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(motion, "foreground", lambda stream: True)
+    monkeypatch.setattr(cli, "_is_pipe", lambda stream: False)
+    opts = cli.build_parser().parse_args(argv)
+    assert cli._startup_board(opts, "atlas", _plain_style()) is None
+
+
+def test_the_line_board_is_put_away_before_the_answer_is_printed(monkeypatch, capsys):
+    import time
+
+    from dirscape import motion
+
+    for name in cli.AGENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("DIRSCAPE_NO_MOTION", raising=False)
+    monkeypatch.setattr(motion, "foreground", lambda stream: True)
+    monkeypatch.setattr(cli, "_is_pipe", lambda stream: False)
+    monkeypatch.setattr(cli.interactive, "supported", lambda stream=None: False)
+    run = cli.Run()
+    run.roots = [_measured(_root("/home/me", "home"), used=10, limit=100)]
+
+    def slow(opts, runner=None, save_state=True, observer=None):
+        time.sleep(motion.BOARD_DELAY_S + 0.8)
+        return run
+
+    monkeypatch.setattr(cli, "sweep", slow)
+    assert cli.main(["paths", "--no-state"]) == cli.EXIT_OK
+    out, err = capsys.readouterr()
+    assert "reading the cluster" in err, "the line was drawn while the sweep ran"
+    assert err.endswith("\r\033[K"), "and taken away again before anything else"
+    assert out.strip() == "/home/me" and "\033" not in out
+
+
+def test_a_printed_view_never_carries_a_marker(capsys):
+    from dirscape import motion
+
+    marked = motion.Motion(object()).spin("/lab/a", "...")
+    cli._write("figure " + marked)
+    out = capsys.readouterr().out
+    assert motion.MARK not in out and "figure ..." in out
+
+
+def test_a_large_directory_moves_the_count_before_its_last_entry(tmp_path):
+    """A folder of 100k files on GPFS is seconds of `stat` calls in one directory."""
+    import threading
+
+    for index in range(2500):
+        (tmp_path / ("f%d" % index)).write_bytes(b"")
+    seen = []
+
+    class Tally(cli._Tally):
+        def __setattr__(self, name, value):
+            if name == "inodes":
+                seen.append(value)
+            object.__setattr__(self, name, value)
+
+    used, files, done = cli._walk_threads(
+        str(tmp_path), 1e18, 10**9, threading.Event(), None, 2, Tally()
+    )
+    assert done and files == 2500
+    assert any(0 < value < 2500 for value in seen), "the count moved inside the directory"
+    assert seen[-1] == 2500
+
+
+def test_the_serial_walk_counts_its_entries_for_the_status_line(tmp_path):
+    for index in range(5):
+        (tmp_path / ("f%d" % index)).write_bytes(b"x")
+    (tmp_path / "d").mkdir()
+    tally = cli._Tally()
+    cli._walk(str(tmp_path), 1e18, 10**9, tally=tally)
+    assert tally.inodes == 6
+
+
+def test_the_spinner_follows_the_long_count_and_never_a_glance(tmp_path, monkeypatch):
+    """A glance is over in a quarter of a second when there are many folders:
+    a spinner shown for a frame before it is cut is flicker."""
+    import threading
+    import time
+
+    (tmp_path / "slow").mkdir()
+    release = threading.Event()
+    walking = []
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        if progress is not None:
+            progress.inodes = 17
+        walking.append(sizes.walking())
+        release.wait(5)
+        return 1, 1, True
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    roots = [cli._listed_root(kid, None, None, {}) for kid in cli._children(str(tmp_path))[0]]
+
+    sizes = cli._Sizes(roots, {})
+    sizes.start()
+    stop = time.time() + 5
+    while not walking and time.time() < stop:
+        time.sleep(0.01)
+    assert walking == [(None, None)], "the glance in flight is not followed"
+    release.set()
+    _settle(sizes)
+
+    release.clear()
+    walking[:] = []
+    roots = [cli._listed_root(kid, None, None, {}) for kid in cli._children(str(tmp_path))[0]]
+    sizes = cli._Sizes(roots, {}, glance_s=0.0)
+    sizes.start()
+    stop = time.time() + 5
+    while sizes.walking()[0] is None and time.time() < stop:
+        time.sleep(0.01)
+    assert sizes.walking() == (str(tmp_path / "slow"), 17), "the long count is"
+    release.set()
+    _settle(sizes)
+    assert sizes.walking() == (None, None)
+
+
+def test_a_real_pty_animates_and_every_frame_fits():
+    """Motion end to end in an actual terminal: the board, then the table, then a count.
+
+    The sweep is slowed past `BOARD_DELAY_S` so the board is drawn wherever
+    this runs, including a CI runner whose sweep takes milliseconds. What must
+    hold with motion on is what held without it: every repaint moves up by
+    fewer lines than the window has rows, the cursor comes back, and no marker
+    ever reaches the terminal. The window title is saved and put back.
+    """
+    pty = pytest.importorskip("pty")
+    import fcntl
+    import select as sel
+    import struct
+    import termios
+    import time
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    driver = (
+        "import sys, time\n"
+        "sys.path.insert(0, %r)\n"
+        "from dirscape import cli\n"
+        "real = cli.sweep\n"
+        "def slow(*args, **kwargs):\n"
+        "    time.sleep(0.9)\n"
+        "    return real(*args, **kwargs)\n"
+        "cli.sweep = slow\n"
+        "sys.exit(cli.main(['--no-state']))\n" % (os.path.join(root, "src"),)
+    )
+    pid, fd = pty.fork()
+    if pid == 0:  # pragma: no cover - the child execs
+        os.environ["TERM"] = "xterm-256color"
+        for name in cli.AGENT_VARIABLES + ("TMUX", "STY", "DIRSCAPE_NO_MOTION"):
+            os.environ.pop(name, None)
+        os.execv(sys.executable, [sys.executable, "-c", driver])
+
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
+    out = b""
+    script = [b"\r", b"\x1b[B", b"q"]
+    sent, ready_at = 0, None
+    deadline = time.time() + 90
+    try:
+        while time.time() < deadline:
+            ready, _, _ = sel.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            if ready_at is None:
+                if b"quit" in out:
+                    ready_at = time.time() + 0.6
+                continue
+            if time.time() < ready_at or sent >= len(script):
+                continue
+            os.write(fd, script[sent])
+            sent += 1
+            ready_at = time.time() + 1.2
+        text = out.decode("utf-8", "replace")
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.waitpid(pid, os.WNOHANG)
+
+    if "\033[?25l" not in text:
+        pytest.skip("no interactive frame was drawn here, so there is nothing to measure")
+    assert sent == len(script), "the keystrokes were never all sent"
+    assert "reading the cluster" in text, "the board never drew"
+    assert text.index("reading the cluster") < text.index("quit"), "board first, then the table"
+    assert "\033[?770" not in text, "a motion marker reached the terminal"
+    ups = [int(n) for n in re.findall(r"\033\[(\d+)A", text)]
+    assert ups and max(ups) < 40, "a repaint moved up past the top of a 40 row window"
+    assert text.rfind("\033[?25h") > text.rfind("\033[?25l"), "the cursor was left hidden"
+    assert "\033[22;0t" in text and text.rfind("\033[23;0t") > text.rfind("\033]0;")
+
+
+def test_landings_are_drawn_a_few_times_a_second_and_keys_are_never_held():
+    """Every landing re-sorts the rows: drawn one by one, a first pass
+    reshuffled the table a dozen times a second."""
+    from dirscape.interactive import Key
+
+    now = [0.0]
+
+    class Landing(_FakeSizes):
+        """Figures that land at given moments, and a walk that ends with the last."""
+
+        def __init__(self, times):
+            _FakeSizes.__init__(self, running=True)
+            self.times = list(times)
+
+        def busy(self):
+            return bool(self.times)
+
+        def changed(self):
+            if self.times and self.times[0] <= now[0]:
+                self.times = [t for t in self.times if t > now[0]]
+                return True
+            return False
+
+    def waiting(seconds):
+        now[0] += seconds
+        return False
+
+    keys = cli._sizing_keys(
+        Landing([0.0, 0.05, 0.1, 0.5]), reader=lambda: Key.QUIT, waiting=waiting,
+        clock=lambda: now[0], motion=_FakeMotion(moving=False),
+    )  # fmt: skip
+    drawn = []
+    while True:
+        key = keys()
+        if key != Key.REDRAW:
+            break
+        drawn.append(now[0])
+    gaps = [b - a for a, b in zip(drawn, drawn[1:])]
+    assert len(drawn) == 3, "the two that landed close together are drawn as one"
+    assert all(gap >= cli.LANDING_GAP_S - 1e-9 for gap in gaps), gaps
+
+    held = cli._sizing_keys(
+        _FakeSizes(changes=[True, True], running=True), reader=lambda: Key.UP,
+        waiting=lambda t: True, clock=lambda: now[0], motion=_FakeMotion(moving=False),
+    )  # fmt: skip
+    assert held() == Key.REDRAW
+    assert held() == Key.UP, "a key waiting is read at once, landing or not"
+
+
+def test_without_motion_every_landing_is_drawn_as_it_always_was():
+    from dirscape.interactive import Key
+
+    keys = cli._sizing_keys(
+        _FakeSizes(changes=[True, True]), reader=lambda: Key.UP, waiting=lambda t: True
+    )
+    assert [keys(), keys()] == [Key.REDRAW, Key.REDRAW]
+
+
+def test_a_quick_figure_lands_quietly_and_one_that_was_waited_for_fades_in(tmp_path):
+    from dirscape import motion
+
+    roots = _waiting_rows(tmp_path, names=("quick", "slow", "elsewhere"))
+    live, moving = _live_style()
+    sizes = cli._Sizes(roots, {})
+    view = cli._Live(moving, str(tmp_path), sizes, live)
+    sizes.took = {roots[0].path: 0.1, roots[1].path: motion.FLASH_AFTER_S + 0.5}
+    for root in roots:
+        root.policy.pop(render_fields.MEASURING)
+        cli._Sizes._apply(root, 4096, 3)
+    sizes.landed.extend(roots)
+    view.update(roots)
+    marked = [render_fields.LANDED in root.policy for root in roots]
+    assert marked == [False, True, True], (
+        "only the waited-for fade in; the aside's counts were long"
+    )
+
+
+# --------------------------------------------------------------------------
+# Counting less and sooner: freshness, deeper figures, the first pass together
+# --------------------------------------------------------------------------
+
+
+def test_a_large_folder_stays_fresh_longer_and_every_figure_ages_out_in_a_week():
+    assert cli._fresh_for(10) == cli.FRESH_S
+    assert cli._fresh_for(cli.FRESH_FILES) == cli.FRESH_S
+    assert cli._fresh_for(20 * cli.FRESH_FILES) == 20 * cli.FRESH_S
+    assert cli._fresh_for(10**9) == cli.FRESH_MAX_S
+
+
+def test_a_big_folder_counted_yesterday_is_not_walked_again_and_a_small_one_is(tmp_path):
+    """`/project/rcc` read "sizes as counted 19h ago, counting again behind the
+    view": the whole tree walked again because a day had passed."""
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    for name in ("big", "small"):
+        (tmp_path / "lab" / name).mkdir(parents=True)
+    index = SizeIndex()
+    then = time.time() - 19 * 3600
+    for name, files in (("big", 3 * 10**6), ("small", 50)):
+        path = tmp_path / "lab" / name
+        index.put(str(path), 10**12, files, then, ino=os.lstat(str(path)).st_ino)
+    roots, sizes = _open_level(tmp_path / "lab", {}, index)
+    stale = [os.path.basename(root.path) for root in sizes._stale]
+    assert stale == ["small"], "the 3 million file folder is still fresh at 19 hours"
+    assert sizes.stored()[1] is True, "and the small one is being counted again"
+
+
+def test_a_walk_keeps_the_figures_below_its_folders_largest_first(tmp_path):
+    parts = {}
+    top = str(tmp_path)
+    for name in ("a", "b"):
+        parts[os.path.join(top, name)] = (100, 1)
+        for n in range(cli.DEEP_KEPT + 20):
+            parts[os.path.join(top, name, "d%03d" % n)] = (n, 1)
+    kept = cli._kept_parts(top, parts)
+    assert kept[:2] == [os.path.join(top, "a"), os.path.join(top, "b")], "the first level, all"
+    deeper = kept[2:]
+    assert len(deeper) == cli.DEEP_KEPT
+    assert min(parts[path][0] for path in deeper) >= max(
+        parts[path][0]
+        for path in parts
+        if path not in kept and path.count(os.sep) > top.count(os.sep) + 1
+    ), "the largest below"
+
+
+def test_only_what_a_listing_can_open_is_kept(tmp_path):
+    top = str(tmp_path)
+    parts = {os.path.join(top, "f%04d" % n): (1, 1) for n in range(cli.CHILD_LIMIT + 50)}
+    kept = cli._kept_parts(top, parts)
+    assert kept == sorted(parts)[: cli.CHILD_LIMIT], "a listing shows the first by name"
+
+
+def test_a_folder_counted_once_opens_two_levels_down_without_a_walk(tmp_path):
+    """After `/project/rcc` was counted, `lykhin/` opened at once and
+    `lykhin/runs/` was walked from scratch."""
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    root = _tree(tmp_path / "lab", {"x/runs/a": 2, "x/runs/b": 1, "x/other": 1})
+    index = SizeIndex()
+    roots, sizes = _open_level(root, {}, index)
+    sizes.start()
+    _settle(sizes)
+    for sub in ("x/runs", "x/runs/a", "x/runs/b", "x/other"):
+        path = str(root / sub)
+        kept = index.get(path, os.lstat(path).st_ino)
+        assert kept is not None and kept[:2] == cli._walk(path, 1e18, 10**9)[:2], sub
+        assert kept[2] <= time.time()
+
+    walked = []
+    real = cli._size_of
+
+    def spy(path, *args, **kwargs):
+        walked.append(path)
+        return real(path, *args, **kwargs)
+
+    cli_size_of = cli._size_of
+    cli._size_of = spy
+    try:
+        _roots, deeper = _open_level(root / "x" / "runs", {}, index)
+        deeper.start()
+        _settle(deeper)
+    finally:
+        cli._size_of = cli_size_of
+    assert walked == [], "its folders came from the walk of the level above"
+
+
+def _network_rows(tmp_path, names):
+    parent = Root(str(tmp_path), fstype="gpfs")
+    rows = []
+    for name in names:
+        (tmp_path / name).mkdir()
+        kid = {"name": name, "path": str(tmp_path / name), "readable": True,
+               "writable": True, "enterable": True}  # fmt: skip
+        rows.append(cli._listed_root(kid, parent, None, {}))
+    return rows
+
+
+def test_the_first_pass_glances_at_folders_together_and_the_second_counts_one_at_a_time(
+    tmp_path, monkeypatch
+):
+    import threading
+    import time
+
+    lock = threading.Lock()
+    flight = {"glance": [0, 0], "full": [0, 0]}
+    walkers = {"glance": set(), "full": set()}
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        kind = "full" if deadline - time.time() > 100 else "glance"
+        with lock:
+            flight[kind][0] += 1
+            flight[kind][1] = max(flight[kind][1], flight[kind][0])
+            walkers[kind].add(threads)
+        try:
+            time.sleep(0.15)
+            done = kind == "full" or not os.path.basename(path).startswith("big")
+            return 1, 1, done
+        finally:
+            with lock:
+                flight[kind][0] -= 1
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    rows = _network_rows(tmp_path, ["a", "b", "c", "d", "e", "f", "big1", "big2", "big3"])
+    sizes = cli._Sizes(rows, {})
+    sizes.start()
+    _settle(sizes)
+    assert flight["glance"][1] > 1, "several glances at once"
+    assert flight["glance"][1] <= cli.GLANCE_WORKERS
+    assert flight["full"][1] == 1, "the long counts one at a time"
+    assert all(path in sizes.cache for path in (row.path for row in rows)), "every figure landed"
+    assert walkers["glance"] == {cli.WALK_THREADS // cli.GLANCE_WORKERS}, (
+        "sixteen walkers shared out"
+    )
+    assert walkers["full"] == {cli.WALK_THREADS}, "and a long count has all of them"
+
+
+def test_local_storage_glances_one_folder_at_a_time(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    lock = threading.Lock()
+    flight = [0, 0]
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        with lock:
+            flight[0] += 1
+            flight[1] = max(flight[1], flight[0])
+        time.sleep(0.05)
+        with lock:
+            flight[0] -= 1
+        return 1, 1, True
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    for name in "abcd":
+        (tmp_path / name).mkdir()
+    rows = [cli._listed_root(kid, None, None, {}) for kid in cli._children(str(tmp_path))[0]]
+    sizes = cli._Sizes(rows, {})
+    sizes.start()
+    _settle(sizes)
+    assert flight[1] == 1
+
+
+def test_with_rapidu_the_glances_in_flight_split_its_threads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    asked = []
+    lock = threading.Lock()
+
+    class Result(object):
+        size, files, partial, root, dir_agg = 1, 1, False, "", {}
+
+    def walk(path, **options):
+        with lock:
+            asked.append(options.get("threads"))
+        time.sleep(0.05)
+        return Result()
+
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    rows = _network_rows(tmp_path, ["a", "b", "c", "d", "e", "f"])
+    sizes = cli._Sizes(rows, {})
+    sizes.start()
+    _settle(sizes)
+    assert asked and set(asked) == {cli.WALK_THREADS // cli.GLANCE_WORKERS}
+    assert len(sizes.cache) == 6
+
+
+def test_leaving_stops_every_glance_in_flight(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    stopped = []
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        while not stop.is_set() and time.time() < deadline:
+            time.sleep(0.01)
+        stopped.append(stop.is_set())
+        return 0, 0, False
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    rows = _network_rows(tmp_path, ["a", "b", "c", "d"])
+    sizes = cli._Sizes(rows, {}, per_child_s=30.0, glance_s=120.0)
+    sizes.start()
+    stop = time.time() + 5
+    while sizes._glancing < 2 and time.time() < stop:
+        time.sleep(0.01)
+    assert sizes._glancing >= 2
+    sizes.stop()
+    stop = time.time() + 5
+    while sizes.busy() and time.time() < stop:
+        time.sleep(0.01)
+    assert not sizes.busy() and stopped and all(stopped)
+
+
+def test_a_folder_the_short_glance_did_not_finish_gets_a_longer_one(tmp_path, monkeypatch):
+    """Short glances fill in the small folders fast; the middling ones get a
+    second, longer glance side by side instead of waiting their turn for a
+    long count."""
+    import threading
+    import time
+
+    lock = threading.Lock()
+    calls = []
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        cap = deadline - time.time()
+        name = os.path.basename(path)
+        with lock:
+            calls.append((name, "full" if cap > 100 else "glance", threads, cap))
+        if cap > 100:
+            return 1, 1, True
+        needs = {"small": 0.0, "mid": 1.5 * sizes.per_child_s}.get(name[:-1], 1e9)
+        return 1, 1, cap >= needs
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    rows = _network_rows(tmp_path, ["small1", "small2", "mid1", "mid2", "big1", "big2"])
+    sizes = cli._Sizes(rows, {}, per_child_s=0.1)
+    sizes.start()
+    _settle(sizes)
+    assert all(row.path in sizes.cache for row in rows), "every figure landed"
+
+    def of(name):
+        return [(how, threads, cap) for who, how, threads, cap in calls if who == name]
+
+    share = cli.GLANCE_WORKERS
+    assert [how for how, _, _ in of("small1")] == ["glance"]
+    assert [how for how, _, _ in of("mid1")] == ["glance", "glance"], "no long count"
+    assert [how for how, _, _ in of("big1")] == ["glance", "glance", "full"]
+    short, longer = of("mid1")
+    assert short[1] == longer[1] == cli.WALK_THREADS // share
+    assert longer[2] > (share - 0.5) * sizes.per_child_s, "as long as its walkers are few"
+    assert of("big1")[-1][1] == cli.WALK_THREADS, "the long count has every walker"
+
+
+def test_the_first_pass_ends_when_one_glance_at_a_time_could_have(tmp_path, monkeypatch):
+    """Two glances for every big folder must not keep a directory of big
+    folders from its long counts any longer than one glance each did."""
+    import threading
+    import time
+
+    lock = threading.Lock()
+    began = []
+    t0 = time.time()
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        if deadline - time.time() > 100:
+            with lock:
+                began.append(time.time() - t0)
+            return 1, 1, True
+        while time.time() < deadline and not stop.is_set():
+            time.sleep(0.005)
+        return 1, 1, False
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    rows = _network_rows(tmp_path, ["big%d" % i for i in range(5)])
+    sizes = cli._Sizes(rows, {}, per_child_s=0.3)
+    t0 = time.time()
+    sizes.start()
+    _settle(sizes)
+    one_at_a_time = 5 * sizes.per_child_s
+    assert len(began) == 5 and all(row.path in sizes.cache for row in rows)
+    # Unbounded, the second glances would hold them to about 2.7s.
+    assert min(began) < one_at_a_time + 0.6, "long counts begin on time"
+
+
+def test_fewer_folders_than_it_takes_are_glanced_at_one_at_a_time(tmp_path, monkeypatch):
+    """Below `GLANCE_TOGETHER` each glance is long enough for sixteen walkers
+    to finish a middling folder alone, which a quarter of them do not."""
+    import threading
+    import time
+
+    lock = threading.Lock()
+    asked, flight = [], [0, 0]
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        with lock:
+            asked.append(threads)
+            flight[0] += 1
+            flight[1] = max(flight)
+        try:
+            return 1, 1, deadline - time.time() > 100
+        finally:
+            with lock:
+                flight[0] -= 1
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    names = ["big%02d" % i for i in range(cli.GLANCE_TOGETHER - 1)]
+    sizes = cli._Sizes(_network_rows(tmp_path, names), {})
+    sizes.start()
+    _settle(sizes)
+    assert len(sizes.cache) == len(names)
+    assert set(asked) == {cli.WALK_THREADS} and flight[1] == 1, "every walker, one at a time"
+    assert len(asked) == 2 * len(names), "one glance each, then its long count"
+
+
+def test_glances_side_by_side_spend_the_visit_by_the_clock(tmp_path, monkeypatch):
+    """The visit's allowance is wall time: four glances at once for a moment
+    have spent a moment, not four."""
+    import time
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        time.sleep(0.3)
+        return 1, 1, True
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    monkeypatch.setattr(cli, "GLANCE_TOGETHER", 2)
+    sizes = cli._Sizes(_network_rows(tmp_path, ["a", "b", "c", "d"]), {})
+    sizes.start()
+    _settle(sizes)
+    assert len(sizes.cache) == 4
+    assert 0.25 < sizes._spent < 0.9

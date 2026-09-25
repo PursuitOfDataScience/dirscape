@@ -77,8 +77,9 @@ __all__ = [
 SIZES_SCHEMA = 1
 
 #: Folders kept. Opening `/project/rcc` recorded 811, its 82 folders and the
-#: folders directly inside each, so this is two dozen such trees before the
-#: oldest go.
+#: folders directly inside each, and a walk now keeps up to 50 more from below
+#: those (`cli.DEEP_KEPT`), so a tree that size is up to 5,000. `MAX_BYTES`
+#: binds first, at about 17,000, which is three such trees before the oldest go.
 MAX_RECORDS = 20000
 
 #: When the file is rewritten without its superseded lines. A record is about

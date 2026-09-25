@@ -11,7 +11,7 @@ GPFS · Lustre · CephFS · XFS · NFS · anything with a mount table
 <a href="https://pypi.org/project/dirscape/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/dirscape/badges/downloads.json" alt="PyPI downloads per month"></a>
 <img src="https://img.shields.io/badge/python-3.6%2B-blue.svg" alt="Python 3.6+">
 
-<img src="https://raw.githubusercontent.com/PursuitOfDataScience/dirscape/main/assets/demo.gif" width="900" alt="ds lists every storage root on a cluster with its usage, quota and file count, opens /software four levels deep and climbs back out, then explains one scratch directory with ds why.">
+<img src="https://raw.githubusercontent.com/PursuitOfDataScience/dirscape/main/assets/demo.gif" width="900" alt="ds shows what it is reading while it starts, lists every storage root on a cluster with its usage, quota and file count, opens /software and counts its folders as you watch, goes four levels deep and climbs back out, then explains one scratch directory with ds why.">
 
 </div>
 
@@ -60,8 +60,9 @@ baseline. Exit codes: `0` answered, `1` bad usage, `2` no place covers that path
 | :- | :- |
 | ⚡ **Quota sizes** | Sizes come from quotas, so it takes seconds. For `du`, use `rdu`. |
 | 🚀 **Big folders** | `pip install "dirscape[fast]"` adds up opened folders faster. |
-| 💾 **Opened again** | A folder shows its last sizes at once, recounted after an hour. |
+| 💾 **Opened again** | A folder shows its last sizes at once, recounted as they age. |
 | 🔎 **Search** | `/` finds any name below the folder in view as you type. |
+| 🎞️ **Motion** | Spinners turn only while a count moves; `--no-motion` stills them. |
 | ❓ **`?` is not zero** | Nothing could measure it, and `--json` gives the reason. |
 | 🆕 **First run** | Nothing is "new" until a baseline exists: run it twice. |
 | 📁 **File limits** | Small files can hit the file quota first; `ds why` shows it. |

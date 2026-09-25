@@ -21,6 +21,7 @@ Python 3.6 compatible: no `subprocess.run(capture_output=...)`, no f-strings in
 hot paths, no dataclasses.
 """
 
+import contextlib
 import os
 import subprocess
 import time
@@ -246,6 +247,9 @@ class SubprocessRunner(Runner):
         # type: (Optional[Budget]) -> None
         self.budget = budget
         self._which_cache = {}  # type: Dict[str, Optional[str]]
+        #: Told as each command starts and ends, for the startup board
+        #: (`motion.Board`), or None. It sees the command, never its output.
+        self.observer = None  # type: Optional[object]
 
     def available(self, name, extra_dirs=()):
         # type: (str, Sequence[str]) -> Optional[str]
@@ -255,6 +259,27 @@ class SubprocessRunner(Runner):
         return self._which_cache[cache_key]
 
     def run(self, argv, timeout=None, env=None):
+        # type: (Sequence[str], Optional[float], Optional[Dict[str, str]]) -> Completed
+        watch = self.observer
+        if watch is None:
+            return self._run(argv, timeout, env)
+        # The observer is told, and can never change what it is told about:
+        # anything it raises is its own problem, not the command's.
+        token = None  # type: object
+        try:
+            token = watch.started(list(argv))  # type: ignore[attr-defined]
+        except Exception:
+            watch = None
+        result = None  # type: Optional[Completed]
+        try:
+            result = self._run(argv, timeout, env)
+            return result
+        finally:
+            if watch is not None:
+                with contextlib.suppress(Exception):
+                    watch.finished(token, result)  # type: ignore[attr-defined]
+
+    def _run(self, argv, timeout=None, env=None):
         # type: (Sequence[str], Optional[float], Optional[Dict[str, str]]) -> Completed
         argv = list(argv)
         if timeout is None and self.budget is not None:

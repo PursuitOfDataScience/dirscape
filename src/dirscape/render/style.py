@@ -28,7 +28,7 @@ import os
 import shutil
 import sys
 import unicodedata
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "MIN_WIDTH",
@@ -244,6 +244,8 @@ _GLYPHS = (
     ("warn", "▲", "!"),
     ("arrow", "→", "->"),
     ("sep", "·", "-"),
+    # How many of one command a stage ran: `mmlsquota ×6` on the startup board.
+    ("times", "×", "x"),
     ("ellipsis", "…", "..."),
     ("bullet", "⏺", "*"),
     # Space the backend says is allocated but has not accounted for
@@ -261,18 +263,48 @@ _GLYPHS = (
     ("bar", "▇", "#"),
     # Where the next letter typed into a search goes.
     ("caret", "▏", "_"),
+    # The part of an opened directory's top edge that stands for the folders
+    # already counted, drawn over the light rule while the rest are counted.
+    # Heavy against light is a SHAPE, so the edge still reads as a progress
+    # bar with colour off.
+    ("heavy", "━", "="),
+)
+
+#: ``(attribute, unicode frames, ascii frames)``: the glyphs that MOVE.
+#:
+#: The rule `_GLYPHS` keeps for a still glyph holds for every frame here: an
+#: ASCII twin beside it, and every frame of an entry exactly as wide as every
+#: other, so a frame never shifts the text around it. The tests assert both.
+_FRAMES = (
+    # A spinner one column wide: the startup board, and the margin of a row
+    # that is being opened.
+    ("spin", ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"), ("|", "/", "-", "\\")),
+    # A spinner as wide as the ellipsis it stands in for: the figure being
+    # counted NOW, where the rows waiting their turn keep the still ellipsis.
+    # One column in UTF-8 and three in ASCII, whose ellipsis is `...`.
+    (
+        "dots",
+        ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"),
+        (".  ", ".. ", "...", " ..", "  ."),
+    ),
+    # A count's pace over its last seconds, slowest first.
+    ("spark", ("▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"), ("_", ".", ":", "-", "=", "+", "*", "#")),
 )
 
 
 class Glyphs(object):
     """The character set to draw with. Two complete sets, never mixed."""
 
-    __slots__ = tuple(name for name, _, _ in _GLYPHS) + ("unicode",)
+    __slots__ = (
+        tuple(name for name, _, _ in _GLYPHS) + tuple(name for name, _, _ in _FRAMES) + ("unicode",)
+    )
 
     def __init__(self, unicode_ok=True):
         # type: (bool) -> None
         for name, rich, plain in _GLYPHS:
             setattr(self, name, rich if unicode_ok else plain)
+        for name, moving, still in _FRAMES:
+            setattr(self, name, moving if unicode_ok else still)
         self.unicode = unicode_ok
 
     @classmethod
@@ -381,7 +413,7 @@ class Style(object):
     ripple outward.
     """
 
-    __slots__ = ("depth", "g", "enabled", "size", "_escapes")
+    __slots__ = ("depth", "g", "enabled", "size", "_escapes", "motion")
 
     def __init__(self, color=False, glyphs=None, size=None, depth=8):
         # type: (bool, Optional[Glyphs], Optional[int], int) -> None
@@ -390,6 +422,19 @@ class Style(object):
         self.g = glyphs if glyphs is not None else Glyphs.detect()
         self.size = size if size else term_width()
         self._escapes = {}  # type: Dict[Tuple[object, ...], str]
+        #: The `motion.Motion` a live view animates with, or None. Only the
+        #: browser's own copy carries one (see `moving`), so nothing printed,
+        #: piped or written as JSON can hold an animation marker.
+        self.motion = None  # type: object
+
+    def moving(self, motion):
+        # type: (object) -> Style
+        """This style, for a view that animates with ``motion``."""
+        other = Style.__new__(Style)
+        other.depth, other.enabled, other.g = self.depth, self.enabled, self.g
+        other.size, other._escapes = self.size, self._escapes
+        other.motion = motion
+        return other
 
     # -- primitives -------------------------------------------------------
 
@@ -812,9 +857,16 @@ def _frame_ramp(style):
     return [((0, 0, 0), 0, code) for code in _FRAME_16]
 
 
-def panel(lines, style=None, size=None, shrink=True, role=None):
-    # type: (Sequence[str], Optional[Style], Optional[int], bool, Optional[str]) -> str
+def panel(lines, style=None, size=None, shrink=True, role=None, progress=None):
+    # type: (Sequence[str], Optional[Style], Optional[int], bool, Optional[str], Optional[float]) -> str
     """A framed block, for content that should read as one unit.
+
+    ``progress``, a fraction, draws the top edge as a progress bar: the heavy
+    rule over the part done and the light one over the rest, so the box stays
+    unbroken and the bar costs no line of its own. With a live style
+    (`Style.motion`) a soft glow drifts along the heavy part now and then
+    while it grows; that is colour only, and the shapes carry the bar
+    without it.
 
     The border carries a DIAGONAL colour sweep: hue advances with ``x + y``, so
     the lightest point is the top left corner and the sweep travels round to
@@ -838,7 +890,7 @@ def panel(lines, style=None, size=None, shrink=True, role=None):
     stacked layout at exactly that point.
     """
     style = style or Style()
-    g = style.g
+    g = style.g  # type: Any
     window = size if size else style.size
     rows = list(lines)
     if shrink and rows:
@@ -865,16 +917,22 @@ def panel(lines, style=None, size=None, shrink=True, role=None):
             return style.paint(role or "dim", text)
         return prefix + text + "\033[0m"
 
-    def sweep(text, y):
-        # type: (str, int) -> str
-        """A horizontal border run, grouping equal tones into one escape."""
+    def sweep(text, y, offset=0):
+        # type: (str, int, int) -> str
+        """A horizontal border run, grouping equal tones into one escape.
+
+        ``offset`` is the column the run starts at, so a border drawn in
+        pieces carries the same sweep as one drawn whole.
+        """
+        if not text:
+            return ""
         if not ramp:
             return style.paint(role or "dim", text)
         out = []  # type: List[str]
         buffered = []  # type: List[str]
         current = None  # type: Optional[str]
         for i, ch in enumerate(text):
-            tone = tone_at(i, y)
+            tone = tone_at(offset + i, y)
             if current is not None and tone != current:
                 out.append(current + "".join(buffered) + "\033[0m")
                 buffered = []
@@ -888,7 +946,17 @@ def panel(lines, style=None, size=None, shrink=True, role=None):
     # title inlaid into the top edge cuts the border where the eye expects it
     # to continue, and a box that is a box everywhere is worth more than a
     # label saving one line.
-    out = [sweep(g.tl + g.h * (window - 2) + g.tr, 0)]
+    span = window - 2
+    if progress is None:
+        out = [sweep(g.tl + g.h * span + g.tr, 0)]
+    else:
+        done = int(round(max(0.0, min(1.0, float(progress))) * span))
+        filled = g.heavy * done
+        motion = getattr(style, "motion", None)
+        lit = sweep(filled, 0, 1)
+        if motion is not None and ramp and 0 < done < span:
+            lit = motion.shine("border", lit, loop=True, track=span)  # type: ignore[attr-defined]
+        out = [sweep(g.tl, 0) + lit + sweep(g.h * (span - done) + g.tr, 0, 1 + done)]
     for i, line in enumerate(rows):
         fitted = pad(truncate(line, inner, g.ellipsis), inner)
         out.append(cell(g.v, 0, i + 1) + " " + fitted + " " + cell(g.v, window - 1, i + 1))

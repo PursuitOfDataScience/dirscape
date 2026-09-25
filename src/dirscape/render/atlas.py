@@ -414,9 +414,13 @@ def _percent(value):
 _SHARE_PERCENT = 5
 
 
-def _share_cell(value, size, style, peak=1.0):
-    # type: (object, int, Style, float) -> str
+def _share_cell(value, size, style, peak=1.0, grow=1.0):
+    # type: (object, int, Style, float, float) -> str
     """The percent, then a bar at most ``size`` cells long.
+
+    ``grow``, from 0 to 1, is how far the bar has grown in: a live view draws
+    the bars growing for a moment once every folder is counted. The percent
+    beside it is the true share from the first frame.
 
     **The bar is drawn against the LARGEST share here, not against 100%**,
     as ncdu draws its own: the biggest folder's bar spans the room and every
@@ -437,6 +441,7 @@ def _share_cell(value, size, style, peak=1.0):
         mark = value if isinstance(value, str) and value else fields.UNKNOWN
         return pad(mark, _SHARE_PERCENT, "right")
     cells = (max(0.0, min(1.0, value / peak)) if peak > 0 else 0.0) * size
+    cells *= max(0.0, min(1.0, grow))
     # Whole cells: the partial blocks that gave a bar its last eighth are all
     # full height, and a tall tip on a short bar reads as a notch.
     text = style.g.bar * int(cells + 0.5)
@@ -663,6 +668,7 @@ def render(
     share=None,
     note=None,
     hide=(),
+    grow=1.0,
 ):
     # type: (...) -> str
     """The atlas, as one string.
@@ -675,6 +681,9 @@ def render(
     row. With it on, the gutters stay their own width and the bar takes the
     room that spreading would have handed them, which with three columns was
     fifty spaces a gap. ``note`` follows the title, saying what the whole is.
+
+    ``grow`` is how far the share bars have grown in, from 0 to 1: see
+    `_share_cell`.
 
     ``title`` replaces the header with a path, which is how the browser draws
     the directory it has opened: the SAME table, one level down, headed by
@@ -867,7 +876,7 @@ def render(
             aligns.append("left")
             peak = max([v for v in share.values() if isinstance(v, float)] or [0.0])
             for root, line in zip(roots, cells):
-                line.append(_share_cell(share.get(root.path), bar, style, peak))
+                line.append(_share_cell(share.get(root.path), bar, style, peak, grow))
     body, extra = table(
         headings,
         cells,

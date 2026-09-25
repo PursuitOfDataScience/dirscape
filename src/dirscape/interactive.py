@@ -97,6 +97,10 @@ class Key(object):
     #: Not a keypress: the view changed behind the reader (a size arrived) and
     #: wants painting again, with the cursor where it is.
     REDRAW = "redraw"
+    #: Not a keypress either: only what MOVES on screen changed (a spinner, a
+    #: fade), so the block already rendered is shown again with its motion
+    #: resolved for this moment, and nothing is rendered. See `motion`.
+    TICK = "tick"
     #: `/`: search everything under the directory in view.
     SEARCH = "search"
     #: Only a text prompt reads these: Backspace, and Ctrl-U to clear the line.
@@ -578,18 +582,44 @@ class Screen(object):
     directory of ten thousand entries is long enough to see.
     """
 
-    __slots__ = ("lines", "_write")
+    __slots__ = ("lines", "raw", "motion", "_write")
 
-    def __init__(self, write=None):
-        # type: (Optional[Callable[[str], object]]) -> None
+    def __init__(self, write=None, motion=None):
+        # type: (Optional[Callable[[str], object]], Optional[object]) -> None
+        #: What is on screen now, exactly as written.
         self.lines = []  # type: List[str]
+        #: The block as it was rendered, animation markers and all.
+        self.raw = []  # type: List[str]
+        #: The `motion.Motion` that resolves those markers, or None.
+        self.motion = motion
         self._write = write if write is not None else _emit
+
+    def _resolved(self, raw):
+        # type: (Sequence[str]) -> List[str]
+        """``raw`` as it looks at this moment, with no marker left in it."""
+        if self.motion is not None:
+            return self.motion.overlay(raw)  # type: ignore[attr-defined]
+        from .motion import MARK, strip_marks
+
+        return [strip_marks(line) if MARK in line else line for line in raw]
 
     def paint(self, lines):
         # type: (Sequence[str]) -> None
-        frame = list(lines)
+        raw = list(lines)
+        frame = self._resolved(raw)
         self._write(repaint(self.lines, frame))
         self.lines = frame
+        self.raw = raw
+
+    def tick(self):
+        # type: () -> None
+        """The block on screen again, for this moment: only lines that moved are written."""
+        if not self.raw:
+            return
+        frame = self._resolved(self.raw)
+        if frame != self.lines:
+            self._write(repaint(self.lines, frame))
+            self.lines = frame
 
     def erase(self):
         # type: () -> None
@@ -597,6 +627,7 @@ class Screen(object):
         if self.lines:
             self._write("\r\033[%dA\033[J" % (len(self.lines),))
         self.lines = []
+        self.raw = []
 
 
 def select(
@@ -739,6 +770,12 @@ def select(
             elif key == Key.SEARCH and searchable:
                 leave()
                 return Key.SEARCH
+            elif key == Key.TICK:
+                # Only what moves changed: the block already rendered, shown
+                # again for this moment. Rendering it again is exactly the
+                # cost a tick exists to avoid.
+                canvas.tick()
+                continue
             else:
                 continue
             if pending():
@@ -791,7 +828,12 @@ def highlight(lines, index, style=None, pad_to=None):
     is the signal, and this package's standing rule is that colour is never
     load bearing, so every state the row reports is still on the line in
     glyphs and words.
+
+    A spinner survives the stripping (`motion.keep_spins`): the row being
+    counted is often the one highlighted, since `m` counts the highlighted
+    row, and it is glyphs, not colour.
     """
+    from .motion import MARK, keep_spins
     from .render.style import plain
     from .render.style import width as measure
 
@@ -802,7 +844,7 @@ def highlight(lines, index, style=None, pad_to=None):
     out = []  # type: List[str]
     for position, line in enumerate(lines):
         if position == index:
-            bare = plain(line)
+            bare = keep_spins(line) if MARK in line else plain(line)
             gap = " " * max(0, room - measure(bare))
             out.append(RESET + INVERSE + bare + gap + RESET)
         else:

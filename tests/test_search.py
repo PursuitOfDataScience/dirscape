@@ -189,6 +189,35 @@ def test_a_tree_past_what_is_kept_is_still_searched_in_full_and_once(tmp_path):
     assert _found(finder, "d12")[1] == 10, "d120 to d129, and nothing twice"
 
 
+def test_a_query_changed_while_a_large_tree_is_read_still_finds_everything(tmp_path, monkeypatch):
+    """Typed while the first reading was still going, each query handed what
+    that reading had not reached to its own walk, which neither kept it nor
+    marked it past what is kept, and the next query's walk dropped it: a
+    search of 300 folders found 44 of its 300 matches on a two-core node."""
+    import time
+
+    root = _wide(tmp_path / "t")
+    real = Finder._listing
+
+    def slow(self, folder):
+        time.sleep(0.005)
+        return real(self, folder)
+
+    monkeypatch.setattr(Finder, "_listing", slow)
+    finder = Finder(str(root), threads=4, keep_folders=40)
+    finder.ask("f1")
+    finder.start()
+    for text in ("_", "_3", "f0", "_3.t", "_3.tx"):
+        time.sleep(0.04)
+        finder.ask(text)
+    reading = finder.finished_at is None
+    found, count = _found(finder, "_3.txt")
+    assert finder.capped
+    assert count == 300 and len(found) == len(set(found)) == 300
+    assert _found(finder, "d12")[1] == 10, "d120 to d129, and nothing twice"
+    assert reading, "the queries came while the tree was still being read"
+
+
 def test_readers_leave_once_the_tree_is_read(tmp_path):
     import time
 

@@ -3,7 +3,7 @@
 All notable changes to `dirscape` are recorded here, newest first, following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0] (2026-09-25)
 
 ### Added
 
@@ -19,60 +19,71 @@ All notable changes to `dirscape` are recorded here, newest first, following
   is kept, up to 4 million names, so a changed query is answered from memory:
   a median 0.041s over 60 queries on that tree. On Polaris's Lustre it reads
   33 thousand names a second.
-
-### Changed
-
-- **A folder opened before opens with its figures.** Every count the browser
-  finishes is kept, with when it finished, in the state directory beside the
-  lineage, and a folder opened again is drawn with those figures at once:
-  sorted, shared and barred from the first frame, with a line saying how old
-  they are. Figures over an hour old stay on screen while the folder is
-  counted again behind the view, after every folder with no figure at all, and
-  `m` counts the highlighted one again. `/project/rcc`, 84 folders and 37.7
-  million files, took 22.8 minutes to count the first time and 0.03s to open
-  complete after that; over 10 paired, interleaved opens of a 1.2M-file
-  folder, 45.8s became 0.023s median, the slowest pair 0.0009x. A record
-  carries its folder's inode number, so a folder made again under an old name
-  is not given the old figure, and one from a node-local filesystem is read on
-  its own node only. One file serves every cluster that shares the home it is
-  in, and a record is tied to its filesystem rather than to a cluster, so
-  `/lus/eagle` counted on Polaris opened on Sophia with those figures in 0.8s.
-  `--no-state` keeps none.
-- **A counted folder opens with its own folders counted.** The walk that
-  counts a folder also keeps the figure of each folder directly inside it, so
-  opening it next shows them at once, and a walk stopped part way still keeps
-  every folder it finished: `/project/rcc/youzhi` opens with all 97 rows.
-- **No count's work is thrown away.** A count under way now runs to its end
-  instead of being cut off by the visit's 30-minute allowance, which only
-  stops new ones from starting: cut off, a folder larger than one visit's
-  allowance, 17 million files on a cold node, could never be counted at all.
-  Opening a folder no longer stops the count in flight either: the level
-  left carries on with it behind the view while the folder opened is counted
-  with half the threads, so the two stay within rapidu's own ceiling of 24,
-  and coming back shows it landing. Coming back also goes straight to the
-  long counts, where it glanced again for 15 seconds at the folders the first
-  glance had found too big to finish.
-- **Without rapidu, a network filesystem is counted sixteen directories at a
-  time**, rapidu's own default, with exactly the serial walk's figures: a
-  173k-file folder on GPFS in 3.1s instead of 15.1s, 0.20x [95% CI 0.18, 0.23]
-  over 10 paired, interleaved walks. Local storage keeps the serial walk.
-- **Start-up asks the quota backends at the same time**, and lists allocations
-  beside them, where it asked each in turn and waited for each: on this
-  cluster six `mmlsquota` calls, the site wrapper and `accounts storage` ran
-  back to back. A run went from 2.03s to 1.36s median, 0.67x [95% CI 0.66,
-  0.67] over 40 paired, interleaved runs, the slowest pair 0.69x.
-- **The line naming the folder being counted moves.** It repainted only when a
-  figure landed, so a folder counted alone kept the figure it had at the
-  start: `counting mehta5/: 2.4k entries so far`, for 1.36 million entries. It
-  now repaints every second.
-
-### Fixed
-
-- **With rapidu installed, `files` counted every symlink twice.** rapidu's
-  `files` already holds its symlinks and special files, and adding them in
-  again had a tree of 148,402 files read 148,727.
-
-## [0.2.0] (2026-09-24)
+- **Startup says what it is waiting on.** Past half a second, the terminal
+  that used to stay blank shows a board of the sweep's phases, each ticking
+  from waiting to a spinner to a check mark with its time, and the commands
+  in flight named: `quota  mmlsquota ×6 · quota  1.0s`. Past five seconds a
+  line names the slowest thing and the allowance it is spending: `slowest:
+  lfs quota, 6.0s of the 20s allowance`. The table is drawn over the board.
+  Every other command gets the same as one line on stderr, taken away before
+  the answer is printed. In a start on this cluster it was up from 0.6s to
+  1.6s.
+- **The row being counted spins, and the rows waiting their turn do not.**
+  Every folder still coming read `…`, so the screen could not say which one
+  was being counted. The long count in flight now spins in its `used` and
+  `files` cells once it has run a second, on the highlighted row too. **The
+  spinner turns only when the count moved**, so a walk stuck on a mount that
+  does not answer stops it dead instead of spinning on a timer. The quick
+  first pass fills its rows in without one: it gives each of 121 folders a
+  quarter of a second, and a spinner shown for a frame before the glance is
+  cut is a flicker.
+- **The count's line gives its pace.** `⠼ counting agnaik/: 130k entries so
+  far · 0:09 · 13k/s ▅▅█▅▅▆▅▆`: its time, its rate, and its last eight
+  seconds as a sparkline. A count that has not moved for five seconds says
+  `waiting on the filesystem for 0:07`, which is true of a hung mount and of
+  one enormous directory alike.
+- **An opened directory's top edge is its progress bar.** The heavy rule
+  covers the share of folders counted, and heavy against light still reads
+  with colour off. Now and then, in truecolor, a soft glow drifts along it,
+  a cell a frame, and rests between passes. A figure that took a second or
+  more to count fades in from the accent colour, and when the last one
+  lands the share bars grow in and the title shines once.
+- **Kept calm on purpose.** Figures landing are drawn at most three times a
+  second, the ones between gathered into the next, since each landing
+  re-sorts the rows and a first pass lands a dozen a second. The count's
+  line changes its words four times a second and its rate and sparkline once
+  a second. Measured on `/project2/rcc`, 121 folders, in a frame-by-frame
+  replay: no row spun for less than a second and no line flickered back and
+  forth, and the top edge changed only as the glow moved, by at most 23 of
+  255 in any colour channel of a cell between frames.
+- **Enter answers at once.** A folder that takes more than 0.1s to list spins
+  in the highlighted row's margin until its view replaces the one it was
+  opened from, where the old frame used to stand still for up to 6s.
+- **The terminal says so too.** The window title reads `ds · counting 60/84 ·
+  rcc` and is put back on the way out. The share counted goes to Windows
+  Terminal, ConEmu and Ghostty as a progress bar (OSC 9;4), and a count that
+  ran over two minutes ends with a desktop notification to iTerm2 and
+  WezTerm (OSC 9), kitty (OSC 99), Ghostty and foot (OSC 777), or the bell
+  under `DIRSCAPE_BELL=1`. None of it is sent inside tmux or screen, or to a
+  terminal not known to take it: the same bytes are a progress bar to one
+  terminal and a notification to another.
+- **`--no-motion`, or `DIRSCAPE_NO_MOTION=1`, stills all of it.** Nothing
+  moves under an agent, `--json` or `--replay` either, nor from a background
+  job or ahead of a pipe, where a pager may own the terminal. Colour is
+  never the only thing a motion says: every state is still on screen in
+  glyphs and words with it off.
+- **None of it redraws a frame.** One render of an opened directory of 200
+  folders takes 41 ms on Python 3.12 and 75 ms on 3.6 (median of 60), so ten
+  renders a second would take most of a core from the walk being reported
+  on. What moves is marked when the frame is rendered and resolved against
+  the clock ten times a second, twenty while a glow moves, on the few lines
+  that carry it. Nor does it slow the count: over 40 paired, interleaved
+  counts of a warm tree of 157k entries by the threaded walk, the count took
+  0.993x as long with motion on as off on Python 3.12 [95% CI 0.980, 1.007],
+  Wilcoxon p 0.33, and 0.974x on 3.6 [0.955, 0.983], p 2e-5; the slowest
+  pairs were 1.14x and 1.05x. With motion off the view still redraws in full
+  once a second for the count's line, which is the work motion on stops
+  doing.
 
 ### Changed
 
@@ -93,13 +104,12 @@ All notable changes to `dirscape` are recorded here, newest first, following
   there are many, so small folders are exact within seconds: on
   `/project/rcc`, 58 of its 84 folders at 30s. Every folder the glance did not
   finish is then counted to the end, one at a time and never restarted, the
-  smallest first, for up to 30 minutes a visit, with a status line naming the
-  folder in progress and its entries so far; `m` counts the highlighted one
+  smallest first, with a status line naming the folder in progress and its
+  entries so far, moving every second; `m` counts the highlighted one
   next. What an unfinished count had reached is never printed as a size: an
   earlier cut of this showed the owner's own folder, over 10T in 3 million
   files, as `288G+`. Folders still being counted sort first, since the glance
-  leaves the largest unfinished. Sizes are kept for the session, walking
-  stops when the reader leaves, and a hung mount can stop a figure but never
+  leaves the largest unfinished. A hung mount can stop a figure but never
   the keys.
 - **Each child's share of what the directory holds, largest first, once the
   whole is known.** A last `share` column gives the percent beside `used` and
@@ -126,6 +136,70 @@ All notable changes to `dirscape` are recorded here, newest first, following
   0.43], slower in every pair, which a walk running behind the view never
   shows. Its figures are `du`'s, directory blocks included and hard links
   counted once.
+- **A folder opened before opens with its figures.** Every count the browser
+  finishes is kept, with when it finished, in the state directory beside the
+  lineage, and a folder opened again is drawn with those figures at once:
+  sorted, shared and barred from the first frame, with a line saying how old
+  they are. Figures past their age stay on screen while the folder is counted
+  again behind the view, after every folder with no figure at all, and `m`
+  counts the highlighted one again. The age grows with the folder: an hour
+  for every 100,000 files, at least one and at most a week, so a folder of
+  2.4 million files that took minutes to count is counted again a day later,
+  not on every visit after the first hour. `/project/rcc`, 84 folders and 37.7
+  million files, took 22.8 minutes to count the first time and 0.03s to open
+  complete after that; over 10 paired, interleaved opens of a 1.2M-file
+  folder, 45.8s became 0.023s median, the slowest pair 0.0009x. A record
+  carries its folder's inode number, so a folder made again under an old name
+  is not given the old figure, and one from a node-local filesystem is read on
+  its own node only. One file serves every cluster that shares the home it is
+  in, and a record is tied to its filesystem rather than to a cluster, so
+  `/lus/eagle` counted on Polaris opened on Sophia with those figures in 0.8s.
+  `--no-state` keeps none.
+- **A counted folder opens with its own folders counted, three levels down.**
+  The walk that counts a folder also keeps the figure of each folder directly
+  inside it and the 50 largest below those, to three levels, so opening it
+  and going on down its big branches shows figures at once, and a walk
+  stopped part way still keeps every folder it finished: `/project/rcc/youzhi`
+  opens with all 97 rows. The inode numbers come from the same directory
+  reads, so keeping them costs no `stat`. rapidu's walk still gives the first
+  level only.
+- **No count's work is thrown away.** A count under way runs to its end, and
+  the visit's 30-minute allowance only stops new ones from starting: cut off,
+  a folder larger than one visit's allowance, 17 million files on a cold
+  node, could never be counted at all. Opening a folder does not stop the
+  count in flight either: the level left carries on with it behind the view
+  while the folder opened is counted with half the threads, so the two stay
+  within rapidu's own ceiling of 24, and coming back shows it landing. Coming
+  back also goes straight to the long counts, rather than glancing again for
+  15 seconds at the folders the first glance had found too big to finish.
+- **Without rapidu, a network filesystem is counted sixteen directories at a
+  time**, rapidu's own default, with exactly the serial walk's figures: a
+  173k-file folder on GPFS in 3.1s instead of 15.1s, 0.20x [95% CI 0.18, 0.23]
+  over 10 paired, interleaved walks. Local storage keeps the serial walk.
+- **A directory of many folders on a network filesystem fills in sooner.**
+  With 32 folders or more, the first pass glances at four at once, each with a
+  quarter of the sixteen walkers one count has, and a folder that short glance
+  did not finish gets a second one four times as long before any long count
+  begins. Over the 97 folders of `/project/rcc/youzhi`, 35 rows were exact
+  after two seconds where one glance at a time had 5, 59 after four against
+  21, and the 70th landed in 0.62x the time [95% CI 0.61, 0.63], Wilcoxon p
+  2e-6, 0.67x in the slowest of 20 paired rounds. Over 32 of them, 19 rows
+  were exact at two seconds against 7, and the last landed in 0.92x the time
+  [0.88, 0.98], 1.18x in the slowest round. The long counts stay one at a
+  time, since one keeps about 14 of its 16 walkers busy, and fewer folders are
+  glanced at one at a time: there, a quarter of the walkers is too few to
+  finish a middling folder.
+- **Start-up asks the quota backends at the same time**, and lists allocations
+  beside them, where it asked each in turn and waited for each: on this
+  cluster six `mmlsquota` calls, the site wrapper and `accounts storage` ran
+  back to back. A run went from 2.03s to 1.36s median, 0.67x [95% CI 0.66,
+  0.67] over 40 paired, interleaved runs, the slowest pair 0.69x.
+
+### Fixed
+
+- **Ctrl-C while a folder was being listed printed a traceback.** Between
+  two views the terminal is not in cbreak, so the key raised where nothing
+  caught it; it now leaves the browser as `q` does.
 
 ## [0.1.1] (2026-09-24)
 

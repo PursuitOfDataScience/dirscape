@@ -668,7 +668,7 @@ def used_cell(root, style=None):
     # "How much room is left" is the `free` figure in `why` and `paths --json`,
     # which is what the grading was approximating, and this package's standing
     # rule is that colour is never load bearing.
-    return figure(text, style), "; ".join(caveats)
+    return _landing(root, style, figure(text, style)), "; ".join(caveats)
 
 
 def limit_cell(root, style=None):
@@ -743,11 +743,15 @@ def file_count_cell(root, style=None):
     row, _how, _why = pick_row(getattr(root, "inode_quota", None), root.path, "files")
     if row is None:
         return _pending_mark(root, style)
-    return figure(human_count(row.used), style)
+    return _landing(root, style, figure(human_count(row.used), style))
 
 
 #: The policy flag a directory listing sets on a child it is still adding up.
 MEASURING = "measuring"
+
+#: The policy entry a live view sets when a child's figure lands: when, on the
+#: view's own clock, so the figure fades in from the accent colour.
+LANDED = "landed"
 
 
 def _pending_mark(root, style):
@@ -756,10 +760,31 @@ def _pending_mark(root, style):
 
     Two different states, and a listing shows both at once: `?` says nothing
     could measure this, and the ellipsis says the answer is a moment away.
+
+    In a live view the ellipsis is marked to spin while THIS row is the one
+    being counted (`motion.Motion.spin`), and the rows waiting their turn keep
+    it still, which is the difference the screen could not show before. `?`
+    is never marked: nothing is happening to it.
     """
     if (getattr(root, "policy", None) or {}).get(MEASURING):
-        return style.dim(style.g.ellipsis)
+        mark = style.g.ellipsis
+        motion = getattr(style, "motion", None)
+        if motion is not None and root.path:
+            mark = motion.spin(root.path, mark)
+        return style.dim(mark)
     return UNKNOWN
+
+
+def _landing(root, style, cell):
+    # type: (Root, Style, str) -> str
+    """A figure cell, marked to fade in if its figure has only just landed."""
+    motion = getattr(style, "motion", None)
+    if motion is None:
+        return cell
+    since = (getattr(root, "policy", None) or {}).get(LANDED)
+    if since is None:
+        return cell
+    return motion.flash(root.path, since, cell)
 
 
 def inode_limit_cell(root, style=None):

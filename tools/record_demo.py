@@ -91,6 +91,7 @@ class Terminal:
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
         self.frames = []  # (rows of cells, cursor or None, milliseconds)
+        self.pending = b""
         self.fd = None
         self.pid = None
 
@@ -129,8 +130,13 @@ class Terminal:
             os.execvpe(sys.executable, [sys.executable, str(DRIVER), *argv], env)
         self.pid, self.fd = pid, fd
 
-    def pump(self, quiet=0.35, limit=40.0):
-        """Feed output until the program has said nothing for `quiet` seconds."""
+    def pump(self, quiet=0.35, limit=40.0, soft=False):
+        """Feed output until the program has said nothing for `quiet` seconds.
+
+        ``soft`` returns after ``limit`` instead of failing, for a view that is
+        animating and so never goes quiet: a spinner or a fade writes a frame
+        every tenth of a second while something is being counted.
+        """
         deadline = time.time() + limit
         last = time.time()
         while time.time() < deadline:
@@ -142,39 +148,78 @@ class Terminal:
                     return False
                 if not data:
                     return False
-                self.stream.feed(data)
+                self.feed_frames(data)
                 last = time.time()
             elif time.time() - last > quiet:
                 return True
+        if soft:
+            return True
         raise SystemExit("the program never went quiet")
 
-    def wait_for(self, text, limit=40.0):
+    def feed_frames(self, data):
+        """Feed whole synchronized frames only, as a terminal honouring DEC 2026 shows them.
+
+        pyte ignores the mode, so a frame read in two pieces would otherwise be
+        filmed half drawn.
+        """
+        self.pending += data
+        opened = self.pending.rfind(b"\033[?2026h")
+        closed = self.pending.rfind(b"\033[?2026l")
+        if opened > closed:
+            ready, self.pending = self.pending[:opened], self.pending[opened:]
+        else:
+            ready, self.pending = self.pending, b""
+        if ready:
+            self.stream.feed(ready)
+
+    def film(self, seconds, every=0.1):
+        """Record ``seconds`` of whatever moves, one frame each ``every`` seconds."""
+        end = time.time() + seconds
+        while time.time() < end:
+            if not self.pump(quiet=every, limit=every, soft=True):
+                break
+            self.shot(int(every * 1000))
+
+    def wait_for(self, text, limit=40.0, every=None):
+        """Until ``text`` is on screen, filming meanwhile if ``every`` is given."""
         deadline = time.time() + limit
         while text not in "\n".join(self.screen.display):
             if time.time() > deadline:
                 raise SystemExit("never saw %r on screen" % (text,))
-            self.pump(quiet=0.1, limit=limit)
-        self.pump()
+            self.pump(quiet=0.1, limit=every or 0.1, soft=True)
+            if every:
+                self.shot(int(every * 1000))
+        self.pump(soft=True, limit=1.0)
 
     def press(self, key, ms):
         os.write(self.fd, KEYS[key])
-        alive = self.pump()
+        alive = self.pump(soft=True, limit=1.0)
         self.shot(ms)
         return alive
 
     def finish(self):
         while self.pump(limit=40.0):
             pass
+        if self.pending:
+            self.stream.feed(self.pending)
+            self.pending = b""
         os.close(self.fd)
         os.waitpid(self.pid, 0)
 
     def selected(self):
-        """The text of the row painted in inverse video, or ''."""
+        """The text of the row painted in inverse video, or ''.
+
+        The row with the most inverse cells, not one inverse across half the
+        width: with a share column the band stops just past the percent, so
+        the bars keep their colour.
+        """
+        best, text = 8, ""
         for y in range(ROWS):
             row = [self.screen.buffer[y][x] for x in range(COLS)]
-            if sum(1 for c in row if c.reverse) > COLS // 2:
-                return "".join(c.data for c in row)
-        return ""
+            lit = sum(1 for c in row if c.reverse)
+            if lit > best:
+                best, text = lit, "".join(c.data for c in row)
+        return text
 
     def move_to(self, text, ms=170, limit=60):
         for _ in range(limit):
@@ -187,16 +232,19 @@ class Terminal:
 def storyboard(term):
     term.type("ds")
     term.spawn(["--no-state"])
-    term.wait_for("q quit")
+    term.wait_for("q quit", every=0.1)  # the startup board, then the table
     term.shot(2600)
 
     term.move_to(TABLE_ROW, ms=150)
     term.shot(500)
-    term.press("enter", 1300)  # what is inside /software
+    term.press("enter", 100)  # what is inside /software, counted while you watch
+    term.film(9.5)
+    term.shot(900)
     for depth, name in enumerate(DESCENT):  # and down, as far as the tree goes
         term.move_to(name, ms=80 if depth == 0 else 220)
         term.shot(350)
-        term.press("enter", 2000 if depth == len(DESCENT) - 1 else 700)
+        term.press("enter", 100)
+        term.film(2.4 if depth == len(DESCENT) - 1 else 1.2)
     for _ in DESCENT:  # esc climbs one level at a time
         term.press("esc", 320)
     term.press("esc", 1100)  # back at the table
@@ -222,6 +270,12 @@ _ARMS = {
 
 def box(draw, ch, left, top, cw, lh, fill):
     """Draw a box drawing character edge to edge; False if `ch` is not one."""
+    if ch == "━":
+        # The heavy rule an opened directory's top edge is filled with while
+        # its folders are counted: the light rule's line, three pixels thick.
+        cy = top + lh // 2
+        draw.line((left, cy, left + cw - 1, cy), fill=fill, width=3)
+        return True
     arms = _ARMS.get(ch)
     if arms is None:
         return False
@@ -260,6 +314,9 @@ def render(frames, path):
         raise SystemExit("DejaVu Sans Mono not found")
     plain = ImageFont.truetype(font_path, SIZE)
     heavy = ImageFont.truetype(font_path.replace(".ttf", "-Bold.ttf"), SIZE)
+    # The mono face has no braille, which is what every spinner is drawn in;
+    # the proportional face of the same family has the whole block.
+    braille = ImageFont.truetype(font_path.replace("SansMono", "Sans"), SIZE)
     # An integer cell: a fractional advance accumulates across a row, and a
     # run of box drawing picks up a one pixel gap wherever the fraction wraps.
     cw = round(plain.getlength("M"))
@@ -290,6 +347,8 @@ def render(frames, path):
                     draw.rectangle((left, top, left + cw - 1, top + lh - 1), fill=bg)
                 if cell.data.strip() and not box(draw, cell.data, left, top, cw, lh, fg):
                     font = heavy if cell.bold else plain
+                    if "\u2800" <= cell.data <= "\u28ff":
+                        font = braille
                     draw.text((left, top + 2), cell.data, font=font, fill=fg)
         if cursor is not None:
             left, top = pad + cursor[0] * cw, bar + pad + cursor[1] * lh

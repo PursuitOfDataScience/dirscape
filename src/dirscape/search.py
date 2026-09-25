@@ -411,6 +411,7 @@ class Finder(object):
                     return
                 folder, parent_kept, walk = self._todo.popleft()
                 self._active += 1
+                popped = self._walk
             try:
                 got = self._listing(folder)
             except Exception:
@@ -419,9 +420,12 @@ class Finder(object):
             generation = 0
             with self._lock:
                 self._active -= 1
-                if walk != self._walk:
-                    # Read for a query that has since changed: its walk was
-                    # replaced by one from the frontier, which reads this too.
+                # Read for a query that has since changed: a later walk from
+                # the frontier reads this too, whether it is one of an older
+                # walk's or the first reading's below what is kept. The first
+                # reading's own folders are never outdated: nothing else reads
+                # them, and they are kept, or found past it, here or not at all.
+                if (walk != self._walk) if walk else (not parent_kept and popped != self._walk):
                     self._lock.notify_all()
                     continue
                 if got is None:
@@ -459,7 +463,7 @@ class Finder(object):
                 hits = self._match(query, folder, got[0], got[1])
                 if hits:
                     with self._lock:
-                        if generation == self._generation and walk == self._walk:
+                        if generation == self._generation and walk in (0, self._walk):
                             self._take(hits)
 
     # -- asking ------------------------------------------------------------
@@ -484,12 +488,16 @@ class Finder(object):
             if self._frontier:
                 # The tree past the kept part is read again for this query,
                 # from where keeping stopped. What the first reading had not
-                # reached yet is in `_todo` and is read again from there too.
+                # reached yet stays the first reading's, kept or found past what
+                # is kept as it would have been: handed to this walk instead,
+                # none of it was either, and the next query's walk dropped it.
+                # A search of 300 folders typed into while they were read found
+                # 44 of its 300 matches on a two-core node.
                 pending = [item[0] for item in self._todo if item[1] and item[2] == 0]
                 self._walk += 1
                 self.reread = 0
                 self._todo = deque((folder, False, self._walk) for folder in self._frontier)
-                self._todo.extend((folder, True, self._walk) for folder in pending)
+                self._todo.extend((folder, True, 0) for folder in pending)
                 self._lock.notify_all()
                 rewalk = self._started and not self._stopped.is_set()
             if not query.empty:

@@ -3,15 +3,19 @@
 `record_demo.py` runs this in a pseudo-terminal. Every root, figure, user and
 directory name below is invented, so the recording shows no real site, person
 or path. The interface is the real one: `cli.main`, the renderer, the browser
-and its keys are unmodified, and only two things are served from the tables
-here instead of the machine: the sweep's result and the directory listing.
+and its keys are unmodified, and only three things are served from the tables
+here instead of the machine: the sweep's result, the directory listing, and
+each folder's count, which takes an invented while so the counting shows.
+The sweep reports invented stages and commands to the startup board.
 
     python tools/demo_cluster.py --no-state            # the table
     python tools/demo_cluster.py --no-state why /scratch/jdoe42
 """
 
+import hashlib
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
@@ -28,6 +32,7 @@ from dirscape.model import (  # noqa: E402
     refuted,
 )
 from dirscape.render.fields import RunMeta  # noqa: E402
+from dirscape.runner import Completed  # noqa: E402
 from dirscape.sitecfg import Site  # noqa: E402
 
 USER = "jdoe42"
@@ -247,24 +252,111 @@ def children(path, limit=cli.CHILD_LIMIT):
     """`cli._children`, served from `TREE`."""
     entries = TREE.get(path.rstrip("/") or "/", [])
     out = []
-    for name, items in entries[:limit]:
+    for position, (name, items) in enumerate(entries[:limit]):
         out.append(
             {
                 "name": name,
                 "path": path.rstrip("/") + "/" + name,
+                "ino": 4000 + position,
                 "items": items,
                 "readable": True,
                 "writable": not path.startswith(("/software", "/datasets")),
                 "enterable": True,
             }
         )
-    return out, max(0, len(entries) - limit)
+    return out, max(0, len(entries) - limit), True
+
+
+#: path -> (bytes, files, seconds its count takes): the folders the demo opens
+#: first, a few of them big enough for the long count and its status line.
+COUNTS = {
+    "/software/R-4.4.1": (int(1.9 * G), 21400, 0.15),
+    "/software/cuda-12.4": (int(7.8 * G), 5210, 1.9),
+    "/software/gcc-13.2.0": (int(2.2 * G), 48100, 0.25),
+    "/software/julia-1.10.4": (int(1.1 * G), 9800, 0.1),
+    "/software/matlab-2024a": (int(24.6 * G), 181000, 2.8),
+    "/software/openmpi-5.0.3": (412 * 1024**2, 3900, 0.08),
+    "/software/paraview-5.12": (int(3.4 * G), 12700, 0.2),
+    "/software/python-3.12.4": (891 * 1024**2, 35600, 0.18),
+    "/software/rstudio-2024.04": (int(1.4 * G), 6100, 0.12),
+    "/software/samtools-1.20": (38 * 1024**2, 240, 0.05),
+}
+
+
+def _invented(path):
+    """A figure and a pace for any other folder, the same every run."""
+    seed = int(hashlib.sha256(path.encode("utf-8")).hexdigest()[:8], 16)
+    files = 10 + seed % 4000
+    return files * (4096 + seed % 60000), files, 0.05 + (seed % 40) / 100.0
+
+
+def size_of(path, deadline, ceiling, stop, box=None, progress=None, parts=None, threads=1):
+    """`cli._size_of`, counting an invented folder at an invented pace.
+
+    The progress counter moves as a real walk's does, so the spinner and the
+    status line behave exactly as they would, and a count that outlasts the
+    glance is left for the long count as a real one would be.
+    """
+    used, files, seconds = COUNTS.get(path) or _invented(path)
+    started = time.time()
+    while True:
+        spent = time.time() - started
+        if progress is not None:
+            progress.inodes = int(files * min(1.0, spent / seconds))
+        if spent >= seconds:
+            return used, files, True
+        if time.time() > deadline or stop.is_set():
+            return 0, 0, False
+        time.sleep(0.02)
+
+
+def _stages(observer):
+    """An invented start, told to the board as `cli.sweep` tells it a real one."""
+
+    def done(record, pause):
+        time.sleep(pause)
+        observer.finished(record, Completed([], 0))
+
+    for label in ("config", "mounts", "plugins"):
+        observer.stage(label)
+    observer.note("mounts", "7 filesystems")
+
+    def listing():
+        observer.claim("allocations")
+        done(observer.started(["/usr/local/bin/accounts", "storage"]), 0.9)
+        observer.release("allocations")
+
+    beside = threading.Thread(target=listing)
+    beside.start()
+    quota = [
+        observer.started(["/usr/lpp/mmfs/bin/mmlsquota", "-Y", fs])
+        for fs in ("home", "project", "scratch", "datasets")
+    ]
+    wrapper = observer.started(["/usr/local/bin/quota"])
+    for record in quota:
+        done(record, 0.15)
+    done(wrapper, 0.5)
+    observer.stage("quota")
+    beside.join()
+    observer.stage("allocations")
+    observer.note("paths", "7 paths")
+    for label, pause in (("discover", 0.2), ("attribute", 0.15), ("snapshots", 0.3)):
+        time.sleep(pause)
+        observer.stage(label)
+    observer.stage("quota-attach")
 
 
 def main(argv=None):
     run = cluster()
-    cli.sweep = lambda opts, runner=None, save_state=True: run
+
+    def sweep(opts, runner=None, save_state=True, observer=None):
+        if observer is not None:
+            _stages(observer)
+        return run
+
+    cli.sweep = sweep
     cli._children = children
+    cli._size_of = size_of
     return cli.main(argv)
 
 

@@ -958,3 +958,95 @@ def test_a_character_of_several_bytes_is_one_character(monkeypatch):
         finally:
             os.close(write)
             monkeypatch.undo()
+
+
+# --------------------------------------------------------------------------
+# Motion: a tick shows the block again, and never renders it
+# --------------------------------------------------------------------------
+
+
+class _Mover(object):
+    """A stand-in `motion.Motion`: resolves each marker to the frame number."""
+
+    def __init__(self):
+        self.frame = 0
+        self.passes = 0
+
+    def overlay(self, lines):
+        from dirscape.motion import strip_marks
+
+        self.passes += 1
+        return [strip_marks(line).replace("@", str(self.frame % 10)) for line in lines]
+
+
+def test_a_tick_shows_the_block_again_without_rendering_it():
+    """Rendering an opened directory of 200 folders takes 41 ms: a frame cannot."""
+    rendered = []
+    written = []
+    mover = _Mover()
+    screen = interactive.Screen(write=written.append, motion=mover)
+
+    def render(cursor):
+        rendered.append(cursor)
+        return ["row one", "spinner @", "row three"]
+
+    def keys():
+        mover.frame += 1
+        return next(sequence)
+
+    sequence = iter([Key.TICK, Key.TICK, Key.TICK, Key.QUIT])
+    select(render, 3, keys=keys, raw=False, screen=screen, erase=False)
+    assert rendered == [0], "rendered once, for the first frame, and never for a tick"
+    assert mover.passes == 4, "the first paint, then one overlay per tick"
+    assert len(written) == 4
+
+
+def test_a_tick_writes_only_the_line_that_moved():
+    written = []
+    mover = _Mover()
+    screen = interactive.Screen(write=written.append, motion=mover)
+    screen.paint(["a steady line", "spinner @", "another steady line"])
+    mover.frame = 3
+    screen.tick()
+    assert "spinner 3" in written[-1]
+    assert "steady" not in written[-1], "unchanged lines are stepped over, not rewritten"
+    before = len(written)
+    screen.tick()
+    assert len(written) == before, "nothing moved: nothing is written"
+
+
+def test_a_screen_with_no_motion_never_writes_a_marker():
+    from dirscape import motion
+
+    written = []
+    screen = interactive.Screen(write=written.append)
+    marked = motion.Motion(object()).spin("/lab/a", "...")
+    screen.paint(["a " + marked])
+    assert motion.MARK not in "".join(written)
+    assert "a ..." in "".join(written)
+
+
+def test_erasing_forgets_the_block_so_a_tick_draws_nothing():
+    written = []
+    screen = interactive.Screen(write=written.append, motion=_Mover())
+    screen.paint(["spinner @"])
+    screen.erase()
+    before = len(written)
+    screen.tick()
+    assert len(written) == before and screen.raw == [] and screen.lines == []
+
+
+def test_a_key_already_waiting_comes_before_a_frame():
+    """`select` folds keys, and a tick is only ever asked for when none waits."""
+    written = []
+    mover = _Mover()
+    screen = interactive.Screen(write=written.append, motion=mover)
+    moves = []
+
+    def render(cursor):
+        moves.append(cursor)
+        return ["row %d" % i for i in range(3)]
+
+    sequence = iter([Key.DOWN, Key.TICK, Key.DOWN, Key.QUIT])
+    select(render, 3, keys=lambda: next(sequence), raw=False, screen=screen, erase=False)
+    assert moves == [0, 1, 2], "each key rendered, the tick did not"

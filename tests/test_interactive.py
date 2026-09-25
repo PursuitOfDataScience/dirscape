@@ -901,3 +901,60 @@ def test_a_redraw_asks_where_the_cursor_went_when_rows_can_move():
         remap=lambda cursor: 2,
     )
     assert painted == [0, 1, 2] and chosen == 2
+
+
+# --------------------------------------------------------------------------
+# The search prompt
+# --------------------------------------------------------------------------
+
+
+def test_slash_asks_for_a_search_and_a_select_that_wants_one_returns_it():
+    assert read_key(_chars("/")) == Key.SEARCH
+    lines = ["a", "b"]
+    out = []
+    got = select(
+        lambda i: lines, 2, keys=_reader([Key.SEARCH]), write=out.append, raw=False,
+        searchable=True,
+    )  # fmt: skip
+    assert got == Key.SEARCH
+    ignored = select(
+        lambda i: lines, 2, keys=_reader([Key.SEARCH, Key.ENTER]), write=out.append, raw=False
+    )
+    assert ignored == 0, "a view that cannot search ignores `/`"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("q", "q"),
+        ("j", "j"),
+        ("/", "/"),
+        ("\r", Key.ENTER),
+        ("\x7f", Key.ERASE),
+        ("\x08", Key.ERASE),
+        ("\x15", Key.CLEAR),
+        ("\x1b[A", Key.UP),
+        ("\x1b[B", Key.DOWN),
+        ("\x01", Key.OTHER),
+        ("", Key.QUIT),
+    ],
+)
+def test_at_a_prompt_letters_are_text_and_only_named_keys_are_keys(text, expected):
+    """`q` quits the table, and is a `q` in a search: nobody can look for `sq`."""
+    assert interactive.read_text(_chars(text), pending=lambda: True) == expected
+
+
+def test_a_bare_escape_at_a_prompt_goes_back():
+    assert interactive.read_text(_chars("\x1b"), pending=lambda: False) == Key.BACK
+
+
+def test_a_character_of_several_bytes_is_one_character(monkeypatch):
+    read, write = os.pipe()
+    os.write(write, "é".encode("utf-8"))
+    with os.fdopen(read, "r") as stdin:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        try:
+            assert interactive._readchar() == "é"
+        finally:
+            os.close(write)
+            monkeypatch.undo()

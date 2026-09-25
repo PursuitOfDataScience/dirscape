@@ -97,6 +97,11 @@ class Key(object):
     #: Not a keypress: the view changed behind the reader (a size arrived) and
     #: wants painting again, with the cursor where it is.
     REDRAW = "redraw"
+    #: `/`: search everything under the directory in view.
+    SEARCH = "search"
+    #: Only a text prompt reads these: Backspace, and Ctrl-U to clear the line.
+    ERASE = "erase"
+    CLEAR = "clear"
 
 
 def window_rows():
@@ -315,6 +320,8 @@ def read_key(readch=None, pending=None):
         return Key.MEASURE
     if char in ("s", "S"):
         return Key.SORT
+    if char == "/":
+        return Key.SEARCH
     if char == "\x03":  # Ctrl-C, which cbreak leaves to us on some platforms
         raise KeyboardInterrupt
     if char != "\x1b":
@@ -347,6 +354,67 @@ def read_key(readch=None, pending=None):
         "C": Key.RIGHT,
         "D": Key.LEFT,
     }.get(final, Key.OTHER)
+
+
+def _readchar():
+    # type: () -> str
+    """One CHARACTER off the file descriptor, however many bytes UTF-8 gives it.
+
+    `_readch` takes one byte, which is every key `read_key` knows; a prompt
+    takes what the reader types, and `é` is two bytes that decode to nothing
+    apart.
+    """
+    try:
+        fd = sys.stdin.fileno()
+        data = os.read(fd, 1)
+        if not data:
+            return ""
+        lead = data[0]
+        more = 3 if lead >= 0xF0 else 2 if lead >= 0xE0 else 1 if lead >= 0xC0 else 0
+        while more > 0:
+            chunk = os.read(fd, more)
+            if not chunk:
+                break
+            data += chunk
+            more -= len(chunk)
+        return data.decode("utf-8", "replace")
+    except Exception:  # pragma: no cover - closed or non-readable stdin
+        return ""
+
+
+def read_text(readch=None, pending=None):
+    # type: (Optional[Callable[[], str]], Optional[Callable[[], bool]]) -> str
+    """One keypress at a text prompt: the character typed, or a named key.
+
+    Letters are text here, never commands: `q` is a `q` in a search, and only
+    Escape, Enter, the arrows, Backspace, Ctrl-U and Ctrl-C mean anything
+    else. Escape is decoded as `read_key` decodes it, asking before reading
+    whether the rest of an arrow is already waiting.
+    """
+    if readch is None:
+        readch = _readchar
+    if pending is None:
+        pending = _pending
+    char = readch()
+    if not char:
+        return Key.QUIT
+    if char in ("\r", "\n"):
+        return Key.ENTER
+    if char in ("\x7f", "\x08"):
+        return Key.ERASE
+    if char == "\x15":
+        return Key.CLEAR
+    if char == "\x03":
+        raise KeyboardInterrupt
+    if char == "\x1b":
+        if not pending():
+            return Key.BACK
+        if readch() != "[":
+            return Key.BACK
+        return {"A": Key.UP, "B": Key.DOWN, "C": Key.RIGHT, "D": Key.LEFT}.get(readch(), Key.OTHER)
+    if char < " ":
+        return Key.OTHER
+    return char
 
 
 #: How long an arrow has to be HELD before the highlight starts covering
@@ -545,9 +613,13 @@ def select(
     clock=None,  # type: Optional[Callable[[], float]]
     screen=None,  # type: Optional[Screen]
     remap=None,  # type: Optional[Callable[[int], int]]
+    searchable=False,  # type: bool
 ):
     # type: (...) -> object
     """Move a highlight over ``count`` rows; return the index, BACK or QUIT.
+
+    ``searchable`` returns `SEARCH` for `/`, for the caller to search from the
+    view it drew; elsewhere `/` is ignored like any other key.
 
     ``remap`` is asked where the cursor goes on every `REDRAW`, for a view
     whose rows can change ORDER behind the reader: an opened directory sorted
@@ -664,6 +736,9 @@ def select(
                 # unless the rows moved, in which case it follows its row.
                 if remap is not None:
                     cursor = max(0, min(count - 1, int(remap(cursor))))
+            elif key == Key.SEARCH and searchable:
+                leave()
+                return Key.SEARCH
             else:
                 continue
             if pending():

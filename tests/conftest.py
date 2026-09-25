@@ -43,6 +43,9 @@ def _a_person_at_the_keyboard(monkeypatch):
     # sized with rapidu's walk when it is, and a test gets the table's own
     # walk unless it hands rapidu in itself.
     monkeypatch.setattr(cli, "_rapidu_walk", lambda: None)
+    # Nor on the sizes this machine's own browser has kept: a test that opened
+    # a directory would read them, and write its own into the real state dir.
+    monkeypatch.setattr(cli, "_size_index", lambda run, opts: None)
 
 
 @pytest.fixture

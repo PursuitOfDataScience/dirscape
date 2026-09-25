@@ -259,6 +259,8 @@ _GLYPHS = (
     # blocks on neighbouring rows touch and the bars read as one slab. Owner:
     # "there should be a slim between these bordering bars".
     ("bar", "▇", "#"),
+    # Where the next letter typed into a search goes.
+    ("caret", "▏", "_"),
 )
 
 

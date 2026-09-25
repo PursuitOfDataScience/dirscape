@@ -5,6 +5,73 @@ All notable changes to `dirscape` are recorded here, newest first, following
 
 ## [Unreleased]
 
+### Added
+
+- **`/` searches every name below the folder in view**, or below the
+  highlighted row of the table: files and folders at any depth, by a piece of
+  the name (`era5`) or a shell pattern for the whole of it (`*.nc`), with
+  `raw/` for folders only and `data/raw` for names in a folder whose path
+  holds `data`. Matches arrive shallowest first while the rest of the tree is
+  still read, and Enter opens the folder a match is in. It reads names only,
+  never a `stat`, so a tree is searched at the speed it can be listed: 1.36
+  million names in 11.6s where `find` took 38.8s, 0.31x [95% CI 0.25, 0.37]
+  over 10 paired, interleaved runs with every answer the same. What was read
+  is kept, up to 4 million names, so a changed query is answered from memory:
+  a median 0.041s over 60 queries on that tree. On Polaris's Lustre it reads
+  33 thousand names a second.
+
+### Changed
+
+- **A folder opened before opens with its figures.** Every count the browser
+  finishes is kept, with when it finished, in the state directory beside the
+  lineage, and a folder opened again is drawn with those figures at once:
+  sorted, shared and barred from the first frame, with a line saying how old
+  they are. Figures over an hour old stay on screen while the folder is
+  counted again behind the view, after every folder with no figure at all, and
+  `m` counts the highlighted one again. `/project/rcc`, 84 folders and 37.7
+  million files, took 22.8 minutes to count the first time and 0.03s to open
+  complete after that; over 10 paired, interleaved opens of a 1.2M-file
+  folder, 45.8s became 0.023s median, the slowest pair 0.0009x. A record
+  carries its folder's inode number, so a folder made again under an old name
+  is not given the old figure, and one from a node-local filesystem is read on
+  its own node only. One file serves every cluster that shares the home it is
+  in, and a record is tied to its filesystem rather than to a cluster, so
+  `/lus/eagle` counted on Polaris opened on Sophia with those figures in 0.8s.
+  `--no-state` keeps none.
+- **A counted folder opens with its own folders counted.** The walk that
+  counts a folder also keeps the figure of each folder directly inside it, so
+  opening it next shows them at once, and a walk stopped part way still keeps
+  every folder it finished: `/project/rcc/youzhi` opens with all 97 rows.
+- **No count's work is thrown away.** A count under way now runs to its end
+  instead of being cut off by the visit's 30-minute allowance, which only
+  stops new ones from starting: cut off, a folder larger than one visit's
+  allowance, 17 million files on a cold node, could never be counted at all.
+  Opening a folder no longer stops the count in flight either: the level
+  left carries on with it behind the view while the folder opened is counted
+  with half the threads, so the two stay within rapidu's own ceiling of 24,
+  and coming back shows it landing. Coming back also goes straight to the
+  long counts, where it glanced again for 15 seconds at the folders the first
+  glance had found too big to finish.
+- **Without rapidu, a network filesystem is counted sixteen directories at a
+  time**, rapidu's own default, with exactly the serial walk's figures: a
+  173k-file folder on GPFS in 3.1s instead of 15.1s, 0.20x [95% CI 0.18, 0.23]
+  over 10 paired, interleaved walks. Local storage keeps the serial walk.
+- **Start-up asks the quota backends at the same time**, and lists allocations
+  beside them, where it asked each in turn and waited for each: on this
+  cluster six `mmlsquota` calls, the site wrapper and `accounts storage` ran
+  back to back. A run went from 2.03s to 1.36s median, 0.67x [95% CI 0.66,
+  0.67] over 40 paired, interleaved runs, the slowest pair 0.69x.
+- **The line naming the folder being counted moves.** It repainted only when a
+  figure landed, so a folder counted alone kept the figure it had at the
+  start: `counting mehta5/: 2.4k entries so far`, for 1.36 million entries. It
+  now repaints every second.
+
+### Fixed
+
+- **With rapidu installed, `files` counted every symlink twice.** rapidu's
+  `files` already holds its symlinks and special files, and adding them in
+  again had a tree of 148,402 files read 148,727.
+
 ## [0.2.0] (2026-09-24)
 
 ### Changed

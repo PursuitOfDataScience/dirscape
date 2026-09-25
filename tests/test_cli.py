@@ -1923,6 +1923,508 @@ def test_sizes_are_not_walked_twice_in_one_session(tmp_path):
     assert cli.plain(cli.render_fields.file_count_cell(roots[0])) == "1"
 
 
+#: The real one, taken before conftest swaps it out for every test.
+_REAL_SIZE_INDEX = cli._size_index
+
+
+def _open_level(path, cache, index, **sizing):
+    """One level as `_descend` builds it: the listing's roots, inodes and sizer."""
+    kids, _held, _answered = cli._children(str(path))
+    roots = [cli._listed_root(kid, None, None, {}) for kid in kids]
+    inodes = {str(kid["path"]): kid.get("ino") for kid in kids}
+    return roots, cli._Sizes(roots, cache, index=index, inodes=inodes, **sizing)
+
+
+def _files_cell(root):
+    return cli.plain(cli.render_fields.file_count_cell(root))
+
+
+def test_a_folder_counted_on_an_earlier_run_opens_with_its_figures(tmp_path):
+    """Owner, on `/project/rcc`: "this dir is so slow". Its first count took
+    22.8 minutes, and no walker makes that fast. Every open after it shows the
+    figures from the moment it is drawn, and one counted within `FRESH_S` is
+    not walked at all."""
+    from dirscape.state.sizes import SizeIndex
+
+    (tmp_path / "lab" / "a").mkdir(parents=True)
+    (tmp_path / "lab" / "a" / "f").write_bytes(b"x" * 10)
+    where = str(tmp_path / "sizes.jsonl")
+    roots, sizes = _open_level(tmp_path / "lab", {}, SizeIndex(where, host="login1"))
+    sizes.start()
+    _settle(sizes)
+    assert _files_cell(roots[0]) == "1"
+
+    roots, sizes = _open_level(tmp_path / "lab", {}, SizeIndex.load(path=where, host="login1"))
+    assert _files_cell(roots[0]) == "1", "on screen before anything is walked"
+    assert not (sizes._todo or sizes._stale), "counted within the hour: nothing to walk"
+    age, again = sizes.stored()
+    assert age < 60 and not again
+    note = cli.plain("\n".join(cli._dir_notes(roots, _plain_style(), stored=sizes.stored())))
+    assert "sizes as counted" in note and "m counts the highlighted row again" in note
+
+
+def test_an_old_stored_figure_stays_on_screen_while_it_is_counted_again(tmp_path):
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    folder = tmp_path / "lab" / "a"
+    folder.mkdir(parents=True)
+    for n in range(3):
+        (folder / ("f%d" % n)).write_bytes(b"x")
+    index = SizeIndex(str(tmp_path / "s.jsonl"), host="h")
+    index.put(str(folder), 1, 1, time.time() - 2 * cli.FRESH_S, ino=os.lstat(str(folder)).st_ino)
+    roots, sizes = _open_level(tmp_path / "lab", {}, index)
+    assert _files_cell(roots[0]) == "1", "the old figure, at once"
+    assert not roots[0].policy.get(render_fields.MEASURING), "a figure, never an ellipsis"
+    assert sizes.stored()[1], "and it is being counted again"
+    note = cli.plain("\n".join(cli._dir_notes(roots, _plain_style(), stored=sizes.stored())))
+    assert "counting again behind the view" in note
+
+    sizes.start()
+    _settle(sizes)
+    assert _files_cell(roots[0]) == "3"
+    assert sizes.stored() is None, "the age line goes with the last stored figure"
+    assert index.get(str(folder))[1] == 3, "and the new count is the one kept"
+
+
+def test_folders_with_no_figure_are_counted_before_old_ones_are_counted_again(
+    tmp_path, monkeypatch
+):
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    for name in ("new", "old"):
+        (tmp_path / "lab" / name).mkdir(parents=True)
+    old = str(tmp_path / "lab" / "old")
+    index = SizeIndex()
+    index.put(old, 1, 1, time.time() - 2 * cli.FRESH_S)
+    order = []
+    real = cli._size_of
+
+    def spy(path, *args, **kwargs):
+        order.append(os.path.basename(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_size_of", spy)
+    _roots, sizes = _open_level(tmp_path / "lab", {}, index)
+    sizes.start()
+    _settle(sizes)
+    assert order == ["new", "old"]
+
+
+def test_a_stored_figure_for_a_folder_made_again_is_not_its_figure(tmp_path):
+    """Same name, another inode: the old folder's figure would be a confident lie."""
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    folder = tmp_path / "lab" / "a"
+    folder.mkdir(parents=True)
+    index = SizeIndex()
+    index.put(str(folder), 5, 5, time.time(), ino=os.lstat(str(folder)).st_ino + 1)
+    roots, sizes = _open_level(tmp_path / "lab", {}, index)
+    assert roots[0].policy.get(render_fields.MEASURING) and sizes.stored() is None
+
+
+def test_a_counted_folder_opens_with_its_own_folders_already_counted(tmp_path):
+    """The walk of `a` saw everything under it, so opening `a` walks nothing."""
+    inner = tmp_path / "lab" / "a"
+    for name, count in (("x", 1), ("y", 2)):
+        (inner / name).mkdir(parents=True)
+        for n in range(count):
+            (inner / name / ("f%d" % n)).write_bytes(b"x")
+    cache = {}
+    _roots, sizes = _open_level(tmp_path / "lab", cache, None)
+    sizes.start()
+    _settle(sizes)
+    roots, sizes = _open_level(inner, cache, None)
+    assert not sizes._todo, "every folder in it was counted by the walk above"
+    assert [_files_cell(root) for root in roots] == ["1", "2"]
+
+
+def test_m_counts_a_stored_figure_again_and_keeps_it_on_screen(tmp_path):
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    folder = tmp_path / "lab" / "a"
+    folder.mkdir(parents=True)
+    (folder / "f").write_bytes(b"x")
+    index = SizeIndex()
+    index.put(str(folder), 1, 9, time.time())
+    roots, sizes = _open_level(tmp_path / "lab", {}, index)
+    assert not sizes._stale, "fresh, so nothing would count it"
+    assert sizes.measure(roots[0])
+    assert not roots[0].policy.get(render_fields.MEASURING)
+    _settle(sizes)
+    assert _files_cell(roots[0]) == "1"
+
+
+def test_running_out_of_time_leaves_a_stored_figure_standing(tmp_path):
+    import time
+
+    from dirscape.state.sizes import SizeIndex
+
+    for name in ("new", "old"):
+        (tmp_path / "lab" / name).mkdir(parents=True)
+    index = SizeIndex()
+    index.put(str(tmp_path / "lab" / "old"), 7, 7, time.time() - 2 * cli.FRESH_S)
+    roots, sizes = _open_level(tmp_path / "lab", {}, index, glance_s=0.0, total_s=0.0)
+    sizes.start()
+    _settle(sizes)
+    by_name = {os.path.basename(root.path): root for root in roots}
+    assert by_name["new"].policy.get("not_added")
+    assert not by_name["old"].policy.get("not_added") and _files_cell(by_name["old"]) == "7"
+
+
+def test_the_walk_hands_over_every_subtree_it_finished(tmp_path):
+    import threading
+
+    for name, count in (("a", 1), ("b", 3)):
+        (tmp_path / name / "deep").mkdir(parents=True)
+        for n in range(count):
+            (tmp_path / name / "deep" / ("f%d" % n)).write_bytes(b"x" * 100)
+    (tmp_path / "top-file").write_bytes(b"x")
+    parts = {}
+    used, files, done = cli._walk(str(tmp_path), 1e18, 10**9, stop=threading.Event(), parts=parts)
+    assert done and files == 5
+    assert sorted(parts) == [str(tmp_path / "a"), str(tmp_path / "b")]
+    for path, figures in parts.items():
+        assert figures == cli._walk(path, 1e18, 10**9)[:2], "what walking it alone counts"
+    assert sum(f for _b, f in parts.values()) == files - 1, "the file at the top is nobody's part"
+
+
+def test_a_walk_cut_short_hands_over_only_what_it_finished(tmp_path):
+    (tmp_path / "small").mkdir()
+    (tmp_path / "small" / "f").write_bytes(b"x")
+    (tmp_path / "big").mkdir()
+    for n in range(50):
+        (tmp_path / "big" / ("d%d" % n)).mkdir()
+    parts = {}
+    _used, _files, done = cli._walk(str(tmp_path), 1e18, 20, parts=parts)
+    assert not done
+    assert str(tmp_path / "big") not in parts
+    for path, figures in parts.items():
+        assert figures == cli._walk(path, 1e18, 10**9)[:2]
+
+
+def test_rapidu_hands_over_the_folders_it_finished_directly_under_its_root():
+    entry = argparse.Namespace
+    root = "/lab/a"
+    finished = {"x"}
+    res = argparse.Namespace(
+        root=root,
+        dir_agg={
+            "/lab/a/x": entry(path="/lab/a/x", is_dir=True, size=10, files=2),
+            "/lab/a/y": entry(path="/lab/a/y", is_dir=True, size=20, files=3),
+            "/lab/a/f": entry(path="/lab/a/f", is_dir=False, size=5, files=1),
+        },
+        is_finished=lambda e: os.path.basename(e.path) in finished,
+    )
+    parts = {}
+    cli._rapidu_parts(res, parts)
+    assert parts == {"/lab/a/x": (10, 2)}, "unfinished and plain files are not parts"
+
+
+def test_the_size_index_reaches_every_level_the_reader_opens(tmp_path, monkeypatch):
+    """`_descend` named the row it opened `index`, the parameter's own name, so
+    from the second level down the sizer was handed a row number for an index."""
+    from dirscape import interactive
+    from dirscape.state.sizes import SizeIndex
+
+    for name in ("a/inner", "b/inner"):
+        (tmp_path / "lab" / name).mkdir(parents=True)
+    index = SizeIndex()
+    seen = []
+    real = cli._Sizes
+
+    class Spy(real):
+        def __init__(self, roots, cache, **kwargs):
+            seen.append(kwargs.get("index"))
+            real.__init__(self, roots, cache, **kwargs)
+
+    monkeypatch.setattr(cli, "_Sizes", Spy)
+    answers = iter([1, interactive.Key.BACK, interactive.Key.QUIT])
+
+    def select(paint, count, **kwargs):
+        paint(0)
+        return next(answers)
+
+    monkeypatch.setattr(cli.interactive, "select", select)
+    outcome = cli._descend(str(tmp_path / "lab"), _plain_style(), 100, index=index)
+    assert outcome == interactive.Key.QUIT
+    assert len(seen) == 3 and all(found is index for found in seen)
+
+
+def _tree(root, shape):
+    """Directories and files under ``root``: {"a/b": 3} is `a/b` holding three files."""
+    for where, count in shape.items():
+        (root / where).mkdir(parents=True, exist_ok=True)
+        for n in range(count):
+            (root / where / ("f%d" % n)).write_bytes(b"x" * (100 + n))
+    return root
+
+
+def test_the_threaded_walk_counts_exactly_what_the_serial_one_does(tmp_path):
+    """Without rapidu, a network filesystem is counted sixteen directories at a
+    time. It must not change one figure, parts included."""
+    root = _tree(tmp_path / "t", {"a": 3, "a/b": 2, "a/b/c": 1, "d": 0, "e/f": 5, ".": 2})
+    (root / "a" / "link").symlink_to("b")
+    serial_parts, threaded_parts = {}, {}
+    serial = cli._walk(str(root), 1e18, 10**9, parts=serial_parts)
+    tally = cli._Tally()
+    threaded = cli._walk_threads(str(root), 1e18, 10**9, parts=threaded_parts, tally=tally)
+    assert threaded == serial and serial[2]
+    assert threaded_parts == serial_parts and len(threaded_parts) == 3
+    assert tally.inodes > serial[1], "entries read, directories among them"
+
+
+def test_the_threaded_walk_stops_at_its_deadline_its_stop_and_its_ceiling(tmp_path):
+    import threading
+    import time
+
+    root = _tree(tmp_path / "t", {"a": 30, "b": 30})
+    assert not cli._walk_threads(str(root), time.time() - 1, 10**9)[2], "past the deadline"
+    stop = threading.Event()
+    stop.set()
+    assert not cli._walk_threads(str(root), 1e18, 10**9, stop=stop)[2], "stopped"
+    parts = {}
+    assert not cli._walk_threads(str(root), 1e18, 5, parts=parts)[2], "over the ceiling"
+    for path, figures in parts.items():
+        assert figures == cli._walk(path, 1e18, 10**9)[:2], "only what it finished"
+
+
+def test_without_rapidu_a_network_filesystem_is_counted_with_threads(tmp_path, monkeypatch):
+    import threading
+
+    used = []
+    monkeypatch.setattr(
+        cli, "_walk_threads", lambda *args, **kwargs: used.append(args[5]) or (1, 1, True)
+    )
+    gpfs = Root(str(tmp_path), fstype="gpfs")
+    local = Root(str(tmp_path), fstype="xfs")
+    assert (cli._threads_for(gpfs), cli._threads_for(local)) == (cli.WALK_THREADS, 1)
+    assert cli._size_of(str(tmp_path), 1e18, 10, threading.Event(), threads=16) == (1, 1, True)
+    assert used == [16]
+    cli._size_of(str(tmp_path), 1e18, 10, threading.Event(), threads=1)
+    assert used == [16], "local storage keeps the serial walk"
+
+
+def test_m_stops_dirscapes_own_walk_as_it_stops_rapidus(tmp_path, monkeypatch):
+    """Without rapidu, `m` had nothing to stop: the folder asked for waited for
+    the whole count in flight, however long that was."""
+    import time
+
+    for name in ("big", "wanted"):
+        (tmp_path / name).mkdir()
+    order = []
+
+    def count(path, deadline, ceiling, stop, parts, threads, progress):
+        order.append(os.path.basename(path))
+        while os.path.basename(path) == "big" and not stop.is_set():
+            time.sleep(0.01)
+        return (1, 1, os.path.basename(path) != "big")
+
+    monkeypatch.setattr(cli, "_count_here", count)
+    roots = [cli._listed_root(kid, None, None, {}) for kid in cli._children(str(tmp_path))[0]]
+    sizes = cli._Sizes(roots, {}, glance_s=0.0)
+    sizes.start()
+    stop = time.time() + 5
+    while sizes.counting()[0] is None and time.time() < stop:
+        time.sleep(0.01)
+    assert os.path.basename(sizes.counting()[0].path) == "big"
+    assert sizes.measure(roots[1])
+    stop = time.time() + 5
+    while "wanted" not in order and time.time() < stop:
+        time.sleep(0.01)
+    assert order[:2] == ["big", "wanted"], "the wanted folder next, not after `big`"
+    sizes.stop()
+    _settle(sizes)
+
+
+class _SlowWalk(object):
+    """rapidu's `walk`, where ``slow`` holds until released or stopped."""
+
+    def __init__(self, slow):
+        import threading
+
+        self.slow = slow
+        self.release = threading.Event()
+        self.calls = []
+
+    def __call__(self, path, **kwargs):
+        self.calls.append((os.path.basename(path), kwargs.get("threads")))
+        stop = kwargs["stop"]
+        if os.path.basename(path) == self.slow:
+            while not (self.release.is_set() or stop.is_set()):
+                stop.wait(0.01)
+        return argparse.Namespace(
+            root=path, size=10, files=1, symlinks=0, specials=0, partial=stop.is_set(), dir_agg={}
+        )
+
+
+def _gpfs_level(tmp_path, names):
+    for name in names:
+        (tmp_path / name).mkdir(exist_ok=True)
+    parent = Root(str(tmp_path), fstype="gpfs")
+    return [cli._listed_root(kid, parent, None, {}) for kid in cli._children(str(tmp_path))[0]]
+
+
+def _until(check, limit=5.0):
+    import time
+
+    stop = time.time() + limit
+    while not check() and time.time() < stop:
+        time.sleep(0.01)
+    assert check()
+
+
+def test_a_count_under_way_is_not_cut_off_by_the_visits_allowance(tmp_path, monkeypatch):
+    """Cut off at the allowance, the work was thrown away, and a folder larger
+    than one visit's allowance could never be counted at all."""
+    import threading
+
+    walk = _SlowWalk("big")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    roots = _gpfs_level(tmp_path, ["big"])
+    sizes = cli._Sizes(roots, {}, glance_s=0.0, total_s=0.05)
+    sizes.start()
+    _until(lambda: sizes.counting()[0] is not None)
+    threading.Timer(0.3, walk.release.set).start()
+    _settle(sizes)
+    assert str(tmp_path / "big") in sizes.cache, "counted to the end, past the allowance"
+
+
+def test_opening_a_folder_keeps_the_count_in_flight_going(tmp_path, monkeypatch):
+    walk = _SlowWalk("big")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    cache = {}
+    first = _gpfs_level(tmp_path, ["big", "small"])
+    level = cli._Sizes(first, cache, glance_s=0.0)
+    level.start()
+    _until(lambda: level.counting()[0] is not None)
+    big = level.counting()[0]
+    other = [root for root in first if root is not big][0]
+    assert level.set_aside(opening=other), "the reader opened another folder"
+
+    # Back up to the same directory: the row being counted waits for that count.
+    again = _gpfs_level(tmp_path, ["big", "small"])
+    back = cli._Sizes(again, cache, glance_s=0.0, aside=level)
+    waiting = [root for root in again if root.path == big.path][0]
+    assert waiting.policy.get(render_fields.MEASURING) and back.busy()
+    assert back.counting()[0].path == big.path, "the status line names it"
+    assert back.measure(waiting), "`m` on it: it is being counted already"
+    back.start()
+    _until(lambda: ("small", 8) in walk.calls)
+    walk.release.set()
+    _until(lambda: not level.busy())
+    assert back.changed()
+    _settle(back)
+    assert _files_cell(waiting) == "1", "its figure lands where the reader is"
+    assert [name for name, _ in walk.calls].count("big") == 1, "counted once, not again"
+
+
+def test_opening_the_folder_being_counted_stops_that_count(tmp_path, monkeypatch):
+    walk = _SlowWalk("big")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    level = cli._Sizes(_gpfs_level(tmp_path, ["big"]), {}, glance_s=0.0)
+    level.start()
+    _until(lambda: level.counting()[0] is not None)
+    assert not level.set_aside(opening=level.counting()[0])
+    _settle(level)
+
+
+def test_a_count_set_aside_that_ends_unanswered_is_counted_where_the_reader_is(
+    tmp_path, monkeypatch
+):
+    walk = _SlowWalk("big")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    cache = {}
+    level = cli._Sizes(_gpfs_level(tmp_path, ["big"]), cache, glance_s=0.0)
+    level.start()
+    _until(lambda: level.counting()[0] is not None)
+    assert level.set_aside()
+    again = _gpfs_level(tmp_path, ["big"])
+    back = cli._Sizes(again, cache, glance_s=0.0, aside=level)
+    level.stop()
+    _until(lambda: not level.busy())
+    walk.release.set()
+    assert back.changed()
+    back.refresh()
+    _settle(back)
+    assert _files_cell(again[0]) == "1"
+    assert [name for name, _ in walk.calls] == ["big", "big"]
+
+
+def test_the_browser_counts_on_behind_a_folder_the_reader_opened(tmp_path, monkeypatch):
+    """Owner, on `/project/rcc`: "this dir is so slow". Opening one of its
+    folders to look inside stopped the count in flight, and coming back began
+    it again from nothing: minutes of a large folder's count, every time."""
+    from dirscape import interactive
+
+    walk = _SlowWalk("big")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    for name in ("big/inner", "small/inner"):
+        (tmp_path / "lab" / name).mkdir(parents=True)
+    monkeypatch.setattr(cli, "_nearest", lambda path, known: Root(path, fstype="gpfs"))
+    made = []
+    real = cli._Sizes
+
+    class Spy(real):
+        def __init__(self, roots, cache, **kwargs):
+            real.__init__(self, roots, cache, **kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(cli, "_Sizes", Spy)
+    landed = []
+
+    def select(paint, count, **kwargs):
+        level = made[-1]
+        if len(made) == 1:
+            _until(lambda: getattr(level.counting()[0], "path", "").endswith("big"))
+            return 1  # `small`: the row being counted sorts first
+        if len(made) == 2:
+            assert made[0].busy(), "the count of `big` goes on behind the view"
+            return interactive.Key.BACK
+        walk.release.set()
+        _until(lambda: level.changed())
+        level.refresh()
+        landed.extend(r.path for r in level.roots if r.quota is not None)
+        return interactive.Key.QUIT
+
+    monkeypatch.setattr(cli.interactive, "select", select)
+    assert cli._descend(str(tmp_path / "lab"), _plain_style(), 100) == interactive.Key.QUIT
+    assert str(tmp_path / "lab" / "big") in landed
+    assert [name for name, _ in walk.calls].count("big") <= 2, "a glance, then one count"
+
+
+def test_coming_back_to_a_level_goes_straight_to_its_long_counts(tmp_path, monkeypatch):
+    """Each return to `/project/rcc` glanced again, for fifteen seconds, at the
+    very folders the first glance had found too big to finish."""
+    walk = _SlowWalk("big")
+    monkeypatch.setattr(cli, "_rapidu_walk", lambda: walk)
+    glanced = {}
+    first = cli._Sizes(_gpfs_level(tmp_path, ["big"]), {}, per_child_s=0.05, glanced=glanced)
+    first.start()
+    _until(lambda: first.counting()[0] is not None)
+    first.stop()
+    _settle(first)
+    assert str(tmp_path / "big") in glanced
+    again = cli._Sizes(_gpfs_level(tmp_path, ["big"]), {}, per_child_s=0.05, glanced=glanced)
+    assert not again._todo and [r.path for r in again._full] == [str(tmp_path / "big")]
+
+
+def test_the_size_index_is_off_under_no_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    run = cli.Run()
+    off = cli.build_parser().parse_args(["--no-state"])
+    assert _REAL_SIZE_INDEX(run, off) is None
+    on = _REAL_SIZE_INDEX(run, cli.build_parser().parse_args([]))
+    assert on is not None and on.path.startswith(str(tmp_path))
+
+
 def test_a_child_the_table_measured_is_the_tables_row(tmp_path):
     """Its figures are the quota's, not a walk's, and the same as the table shows."""
     (tmp_path / "lab").mkdir()
@@ -2045,6 +2547,9 @@ class _FakeSizes(object):
         self.measured.append(self.cursor if root is None else root)
         return True
 
+    def counting(self):
+        return None, None
+
 
 def test_a_landed_figure_repaints_and_m_measures_the_highlighted_row():
     from dirscape.interactive import Key
@@ -2055,6 +2560,35 @@ def test_a_landed_figure_repaints_and_m_measures_the_highlighted_row():
     assert keys() == Key.REDRAW, "a figure landed"
     assert keys() == Key.REDRAW and fake.measured == [7], "m on the highlighted row"
     assert keys() == Key.DOWN, "every other key passes through"
+
+
+def test_a_count_in_flight_repaints_its_status_line_every_second():
+    """Owner's `/project/rcc` read "counting mehta5/: 2.4k entries so far" for a
+    folder of 1.36 million entries: the line repainted only on a landing."""
+    from dirscape.interactive import Key
+
+    class Counting(_FakeSizes):
+        def counting(self):
+            return "mehta5", 2400
+
+    now = [0.0]
+
+    def waiting(seconds):
+        now[0] += seconds
+        return False
+
+    keys = cli._sizing_keys(
+        Counting(running=True), reader=lambda: Key.UP, waiting=waiting, clock=lambda: now[0]
+    )
+    assert keys() == Key.REDRAW and 1.0 <= now[0] < 1.3
+    assert keys() == Key.REDRAW and 2.0 <= now[0] < 2.5, "and again a second later"
+    idle = cli._sizing_keys(
+        _FakeSizes(running=True),
+        reader=lambda: Key.UP,
+        waiting=lambda t: now.__setitem__(0, now[0] + t) or now[0] > 10,
+        clock=lambda: now[0],
+    )
+    assert idle() == Key.UP, "nothing in flight: no repaint, only keys"
 
 
 def test_while_walks_run_a_key_is_read_only_once_one_is_waiting():
@@ -2309,10 +2843,12 @@ def test_rapidu_sizes_a_child_when_it_is_installed(tmp_path, monkeypatch):
     flight where `_walk` waits on one, which is what a cold tree costs."""
     import threading
 
-    fake = _FakeWalk({"size": 4096, "files": 7, "symlinks": 2, "specials": 1})
+    fake = _FakeWalk({"size": 4096, "files": 10, "symlinks": 2, "specials": 1})
     monkeypatch.setattr(cli, "_rapidu_walk", lambda: fake)
     used, files, done = cli._size_of(str(tmp_path), 1e18, 10, threading.Event())
-    assert (used, files, done) == (4096, 10, True), "every entry that is not a directory"
+    # rapidu's `files` already holds its symlinks and specials. Adding them in
+    # again had a tree of 148,402 files read 148,727.
+    assert (used, files, done) == (4096, 10, True), "every entry that is not a directory, once"
     ((path, kwargs),) = fake.calls
     assert path == str(tmp_path) and kwargs["one_file_system"] is True
     assert isinstance(kwargs["stop"], threading.Event)
@@ -3972,3 +4508,124 @@ def test_a_user_scoped_row_reaches_the_directory_that_is_yours():
     # the same mount must stay `?` rather than inherit this reader's figure.
     theirs = _root("/home/someone", fileset="", device="acorn")
     assert cli._rows_governing(snap, theirs) == []
+
+
+# --------------------------------------------------------------------------
+# Search
+# --------------------------------------------------------------------------
+
+
+def _searchable(tmp_path):
+    for path in ("data/ERA5-2020.nc", "data/raw/era5-1999.grib", "runs/era5/log.txt", "notes.txt"):
+        (tmp_path / "lab" / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "lab" / path).write_bytes(b"x" * 100)
+    return str(tmp_path / "lab")
+
+
+def _typing(monkeypatch, keys, finder):
+    """Drive `_search_view` from a script: Enter only once the search has finished."""
+    from dirscape import interactive
+
+    script = list(keys)
+
+    def read():
+        if not script:
+            return interactive.Key.BACK
+        key = script.pop(0)
+        if key == interactive.Key.ENTER and not finder.done:
+            # A key that changes nothing, so the view paints what was found
+            # before Enter is pressed on it, as a reader would see it first.
+            assert finder.wait(10)
+            script.insert(0, key)
+            return interactive.Key.OTHER
+        return key
+
+    monkeypatch.setattr(interactive, "read_text", read)
+    monkeypatch.setattr(interactive, "input_waiting", lambda timeout: True)
+    # `interactive._Nothing`, not `contextlib.nullcontext`, which is 3.7+.
+    monkeypatch.setattr(interactive, "raw_session", interactive._Nothing)
+
+
+def test_a_search_finds_names_below_every_folder_and_draws_them_as_the_view_does(tmp_path):
+    from dirscape.search import Finder
+
+    top = _searchable(tmp_path)
+    finder = Finder(top, threads=2)
+    finder.start()
+    finder.ask("era5")
+    assert finder.wait(10)
+    _query, matches, found = finder.snapshot()
+    style = _plain_style()
+    lines, _first, _room = cli._search_frame(
+        top, "era5", matches, found, 0, None, finder, style, 100, 40, {}, {}
+    )
+    text = cli.plain("\n".join(lines))
+    title = "".join(line.strip("│ ").split("  ")[0] for line in text.splitlines()[1:4])
+    assert title.startswith("search " + top) and "3 found" in text, "the title wraps at a /"
+    assert "/ era5" in text
+    rows = [line.strip("│ ").split()[0] for line in text.splitlines() if "era5" in line.lower()]
+    assert "data/ERA5-2020.nc" in rows and "runs/era5/" in rows
+    assert "data/raw/era5-1999.grib" in rows
+    assert "read 8 names in 5 folders" in text
+
+
+def test_typing_a_name_and_pressing_enter_opens_the_folder_it_is_in(tmp_path, monkeypatch):
+    from dirscape import interactive
+    from dirscape.search import Finder
+
+    top = _searchable(tmp_path)
+    finder = Finder(top, threads=2)
+    _typing(monkeypatch, list("1999") + [interactive.Key.ENTER], finder)
+    out = []
+    outcome, query = cli._search_view(
+        top, _plain_style(), 100, interactive.Screen(out.append), {}, finder
+    )
+    assert (outcome, query) == (os.path.join(top, "data", "raw"), "1999")
+
+
+def test_a_folder_match_opens_that_folder_and_escape_goes_back(tmp_path, monkeypatch):
+    from dirscape import interactive
+    from dirscape.search import Finder
+
+    top = _searchable(tmp_path)
+    finder = Finder(top, threads=2)
+    _typing(monkeypatch, list("runs/") + [interactive.Key.ENTER], finder)
+    outcome, _query = cli._search_view(
+        top, _plain_style(), 100, interactive.Screen(lambda s: None), {}, finder
+    )
+    assert outcome == os.path.join(top, "runs")
+    finder = Finder(top, threads=2)
+    _typing(monkeypatch, list("zzz") + [interactive.Key.ENTER, interactive.Key.BACK], finder)
+    outcome, query = cli._search_view(
+        top, _plain_style(), 100, interactive.Screen(lambda s: None), {}, finder
+    )
+    assert (outcome, query) == (interactive.Key.BACK, "zzz"), "enter on nothing does nothing"
+
+
+def test_slash_in_a_folder_searches_it_and_slash_again_takes_the_search_up_again(
+    tmp_path, monkeypatch
+):
+    """A million files is not something to scroll: `/` from any folder searches
+    every folder below it, and coming back to `/` finds the query as it was."""
+    from dirscape import interactive
+
+    top = _searchable(tmp_path)
+    views = []
+
+    def view(here, style, width, screen, cache, finder, query=""):
+        views.append((here, query, finder))
+        finder.start()
+        assert finder.wait(10)
+        return (os.path.join(here, "data") if len(views) == 1 else interactive.Key.BACK), "era5"
+
+    monkeypatch.setattr(cli, "_search_view", view)
+    answers = iter([interactive.Key.SEARCH, interactive.Key.BACK, interactive.Key.SEARCH])
+
+    def select(paint, count, **kwargs):
+        paint(0)
+        return next(answers, interactive.Key.QUIT)
+
+    monkeypatch.setattr(cli.interactive, "select", select)
+    assert cli._descend(top, _plain_style(), 100) == interactive.Key.QUIT
+    assert [(here, query) for here, query, _f in views] == [(top, ""), (top, "era5")]
+    assert views[0][2] is views[1][2], "the tree read once is asked again"

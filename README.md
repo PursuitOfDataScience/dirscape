@@ -30,7 +30,7 @@ No dependencies and Python 3.6+, so the system Python on a login node is enough.
 ## 🧰 Use
 
 ```bash
-ds                        # the table: arrows move, enter opens a row, esc goes back, q quits
+ds                        # the table: arrows move, enter opens, / searches, esc back, q quits
 ds why .                  # this directory: which quota it bills to, free space, file limit
 ds new                    # what changed since the last run
 ds recover results.csv    # snapshot copies of a deleted file, and how to restore one
@@ -60,6 +60,8 @@ baseline. Exit codes: `0` answered, `1` bad usage, `2` no place covers that path
 | :- | :- |
 | ⚡ **Quota sizes** | Sizes come from quotas, so it takes seconds. For `du`, use `rdu`. |
 | 🚀 **Big folders** | `pip install "dirscape[fast]"` adds up opened folders faster. |
+| 💾 **Opened again** | A folder shows its last sizes at once, recounted after an hour. |
+| 🔎 **Search** | `/` finds any name below the folder in view as you type. |
 | ❓ **`?` is not zero** | Nothing could measure it, and `--json` gives the reason. |
 | 🆕 **First run** | Nothing is "new" until a baseline exists: run it twice. |
 | 📁 **File limits** | Small files can hit the file quota first; `ds why` shows it. |

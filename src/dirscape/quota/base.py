@@ -42,6 +42,7 @@ Python 3.6 compatible: type comments, no dataclasses, no f-strings, stdlib only.
 
 import os
 import re
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -691,76 +692,151 @@ def read_all(backends, runner, mounts, budget, paths):
     node where none of the three paths exists), and it loses the selection in
     `read_best` to any live backend that maps the asked path. The discovery
     layer needs those rows, so it calls this and keeps them all.
+
+    **Asked all at once, not one after another.** Each backend is a command
+    or two against its own filesystem, and none of them needs another's
+    answer, so asking in turn was waiting in turn: on this cluster six
+    `mmlsquota` calls, 0.33s, then the site wrapper, 0.92s, back to back, the
+    largest part of a two second start. Together the wait is the slowest one.
+    The one exception is the stock `quota`, which may be the very executable
+    another backend already read (see `answered`), so it is asked after the
+    others have answered, knowing what the ones before it read. The answers
+    come back in the order of ``backends`` whichever finished first, and a
+    backend still running when the budget and `JOIN_GRACE_S` are spent is
+    reported as not answering rather than waited on.
     """
-    out = []  # type: List[QuotaSnapshot]
-    # Executables whose output some backend has already turned into rows, so
-    # the stock `quota` can stand aside for the wrapper it turns out to be.
-    # Only rows count: on a site whose `quota` IS the stock tool, the wrapper
-    # backend tries it too, reads nothing, and the stock backend is then the
-    # only one that can.
-    answered = {}  # type: Dict[str, str]
-    for backend in backends:
-        if _exhausted(budget):
-            out.append(
-                unavailable_quota(
-                    backend.name,
-                    VerdictCategory.NOT_PROBED,
-                    "the quota budget ran out before this backend was asked",
-                )
-            )
-            continue
+    backends = list(backends)
+    out = [None] * len(backends)  # type: List[Optional[QuotaSnapshot]]
+    # The executable each backend turned into rows, where it names one.
+    sources = [None] * len(backends)  # type: List[Optional[str]]
+    raised = [None] * len(backends)  # type: List[Optional[BaseException]]
+
+    def ask(position, answered):
+        # type: (int, Dict[str, str]) -> None
         try:
-            found = backend.supported(runner)
-        except Exception as exc:  # a probe must never take the tool down
-            out.append(
-                unavailable_quota(
-                    backend.name,
-                    VerdictCategory.BACKEND_FAILED,
-                    "could not probe for %s: %s" % (backend.name, exc),
-                )
+            out[position], sources[position] = _ask(
+                backends[position], runner, mounts, budget, paths, answered
             )
+        except BaseException as exc:  # handed to the caller's thread below
+            raised[position] = exc
+
+    workers = []  # type: List[Tuple[int, threading.Thread]]
+    for position, backend in enumerate(backends):
+        if backend.stock:
             continue
-        if not found:
-            out.append(
-                unavailable_quota(
-                    backend.name,
-                    VerdictCategory.NO_QUOTA_BACKEND,
-                    "%s is not installed on this node" % (backend.name,),
-                )
+        worker = threading.Thread(target=ask, args=(position, {}))
+        worker.daemon = True
+        worker.start()
+        workers.append((position, worker))
+    # A backend given up on keeps running as a daemon, and whatever it
+    # returns later is not this call's answer: its slot is this instead.
+    gave_up = {}  # type: Dict[int, QuotaSnapshot]
+    for position, worker in workers:
+        worker.join(_join_allowance(budget))
+        if worker.is_alive():
+            gave_up[position] = unavailable_quota(
+                backends[position].name,
+                VerdictCategory.PROBE_TIMEOUT,
+                "%s did not answer within the quota budget" % (backends[position].name,),
             )
+    for position, backend in enumerate(backends):
+        if not backend.stock:
             continue
-        twin = answered.get(_real_executable(found)) if backend.stock else None
-        if twin:
-            out.append(
-                unavailable_quota(
-                    backend.name,
-                    VerdictCategory.NOT_PROBED,
-                    "not asked: %s is the executable the %s already read, so a second call "
-                    "would print the same report" % (found, twin),
-                )
-            )
-            continue
-        try:
-            snap = backend.read(runner, mounts, budget, paths)
-        except (NotRecorded, EmptyReadingError):
-            # Both are bugs rather than cluster conditions, and both must stay
-            # loud. Swallowing `NotRecorded` would turn a gap in a fixture into
-            # a cluster's answer, which is nodetop's NT-1 exactly.
-            raise
-        except Exception as exc:
-            # Anything else is a backend misbehaving on unfamiliar output. The
-            # tool keeps going and says which backend and why, because a quota
-            # reading is an enrichment and losing it must not lose the atlas.
-            snap = unavailable_quota(
+        # Executables whose output some EARLIER backend turned into rows, so
+        # the stock `quota` can stand aside for the wrapper it turns out to be.
+        # Only rows count: on a site whose `quota` IS the stock tool, the
+        # wrapper backend tries it too, reads nothing, and the stock backend is
+        # then the only one that can.
+        answered = {}  # type: Dict[str, str]
+        for earlier in range(position):
+            if earlier in gave_up or raised[earlier] is not None or not sources[earlier]:
+                continue
+            answered.setdefault(_real_executable(str(sources[earlier])), backends[earlier].name)
+        ask(position, answered)
+    for position, exc in enumerate(raised):
+        if exc is not None and position not in gave_up:
+            raise exc
+    answers = [gave_up.get(position, out[position]) for position in range(len(backends))]
+    return [snap for snap in answers if snap is not None]
+
+
+#: How long past the quota budget a backend is waited for before it is
+#: reported as not answering. Every command a backend runs is already held to
+#: a slice of the budget by the runner, so this is only ever reached by one
+#: that blocks outside a command, in a filesystem call on a hung mount.
+JOIN_GRACE_S = 2.0
+
+
+def _join_allowance(budget):
+    # type: (object) -> Optional[float]
+    """How long to wait for one backend: the budget left and a grace, or for ever."""
+    remaining = getattr(budget, "remaining", None) if budget is not None else None
+    if remaining is None:
+        return None
+    return max(0.0, float(remaining)) + JOIN_GRACE_S
+
+
+def _ask(backend, runner, mounts, budget, paths, answered):
+    # type: (Backend, object, Optional[MountTable], object, Sequence[str], Dict[str, str]) -> Tuple[QuotaSnapshot, Optional[str]]
+    """One backend's checked answer, and the executable it read rows from, if any."""
+    if _exhausted(budget):
+        return (
+            unavailable_quota(
+                backend.name,
+                VerdictCategory.NOT_PROBED,
+                "the quota budget ran out before this backend was asked",
+            ),
+            None,
+        )
+    try:
+        found = backend.supported(runner)
+    except Exception as exc:  # a probe must never take the tool down
+        return (
+            unavailable_quota(
                 backend.name,
                 VerdictCategory.BACKEND_FAILED,
-                "%s raised %s: %s" % (backend.name, type(exc).__name__, exc),
-            )
-        source = getattr(backend, "read_from", None)
-        if source and snap.rows:
-            answered.setdefault(_real_executable(source), backend.name)
-        out.append(check_snapshot(snap))
-    return out
+                "could not probe for %s: %s" % (backend.name, exc),
+            ),
+            None,
+        )
+    if not found:
+        return (
+            unavailable_quota(
+                backend.name,
+                VerdictCategory.NO_QUOTA_BACKEND,
+                "%s is not installed on this node" % (backend.name,),
+            ),
+            None,
+        )
+    twin = answered.get(_real_executable(found)) if backend.stock else None
+    if twin:
+        return (
+            unavailable_quota(
+                backend.name,
+                VerdictCategory.NOT_PROBED,
+                "not asked: %s is the executable the %s already read, so a second call "
+                "would print the same report" % (found, twin),
+            ),
+            None,
+        )
+    try:
+        snap = backend.read(runner, mounts, budget, paths)
+    except (NotRecorded, EmptyReadingError):
+        # Both are bugs rather than cluster conditions, and both must stay
+        # loud. Swallowing `NotRecorded` would turn a gap in a fixture into
+        # a cluster's answer, which is nodetop's NT-1 exactly.
+        raise
+    except Exception as exc:
+        # Anything else is a backend misbehaving on unfamiliar output. The
+        # tool keeps going and says which backend and why, because a quota
+        # reading is an enrichment and losing it must not lose the atlas.
+        snap = unavailable_quota(
+            backend.name,
+            VerdictCategory.BACKEND_FAILED,
+            "%s raised %s: %s" % (backend.name, type(exc).__name__, exc),
+        )
+    source = getattr(backend, "read_from", None)
+    return check_snapshot(snap), (source if source and snap.rows else None)
 
 
 def _real_executable(path):

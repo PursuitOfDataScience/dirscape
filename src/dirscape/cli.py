@@ -39,10 +39,12 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, interactive
+from . import search as search_module
 from .discover import (
     DEFAULT_DEADLINE_S,
     RANK_PRIMARY,
     attribute_all,
+    classify_fstype,
     copies_for_path,
     discover,
     find_snapshots,
@@ -54,6 +56,7 @@ from .discover import (
     source_label,
     with_deadline,
 )
+from .discover.mounts import KIND_NETWORK, lustre_filesystem
 from .model import QuotaRow, Reach, Root, VerdictCategory, confirmed, refuted, sanitize, unknown
 from .plugins import detect_plugins
 from .quota import default_backends, filesets_seen, read_all, select_snapshot
@@ -68,11 +71,12 @@ from .render import (
     resolve_style,
 )
 from .render import style as render_style
-from .render.atlas import _MIN_BODY, _SHARE_PERCENT
+from .render.atlas import _MIN_BODY, _SHARE_PERCENT, _title_lines
 from .render.style import panel, plain
 from .runner import Budget, RecordedRunner, SubprocessRunner
 from .sitecfg import SITE_TEMPLATE, guess_cluster_name, load_site
 from .state import Lineage, Snapshot, cutoff_for, diff
+from .state.sizes import SizeIndex
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -218,7 +222,7 @@ def _add_global_args(parser, suppress=False):
         "--no-state",
         action="store_true",
         default=_absent(suppress),
-        help=h("do not read or write the snapshot lineage"),
+        help=h("do not read or write the snapshot lineage or saved folder sizes"),
     )
     parser.add_argument(
         "--timing",
@@ -1032,12 +1036,18 @@ class _WalkSource(object):
     figure_note = ""
 
 
-def _walk(top, deadline, ceiling, owner=None, stop=None):
-    # type: (str, float, int, Optional[int], Optional[Any]) -> Tuple[int, int, bool]
+def _walk(top, deadline, ceiling, owner=None, stop=None, parts=None):
+    # type: (str, float, int, Optional[int], Optional[Any], Optional[Dict[str, Tuple[int, int]]]) -> Tuple[int, int, bool]
     """Bytes charged and files counted under ``top``, or as far as time allowed.
 
     ``stop``, a `threading.Event`, abandons the walk at the next directory,
     which is how the browser drops a walk the reader has moved away from.
+
+    ``parts``, a dict, receives ``(bytes, files)`` for every directory directly
+    inside ``top`` whose whole subtree was walked, finished or not: the figures
+    the browser shows when the reader opens ``top`` next, for no second walk.
+    The walk is depth first, so one subtree is finished before the next is
+    begun, and a walk cut short still hands over every subtree it completed.
 
     Iterative rather than recursive, so a pathological depth cannot blow the
     stack, and `scandir` rather than `walk` so each entry's type comes from
@@ -1054,16 +1064,22 @@ def _walk(top, deadline, ceiling, owner=None, stop=None):
     total = 0
     files = 0
     seen = 0
-    stack = [top]
+    # Each directory to read, with the child of `top` it lies under ("" for
+    # `top` itself, and always "" when nobody asked for `parts`).
+    stack = [(top, "")]
+    # Per child of `top`: [bytes, files, its directories not read yet].
+    under_top = {}  # type: Dict[str, List[int]]
     while stack:
         if seen > ceiling or time.time() > deadline or (stop is not None and stop.is_set()):
             return total, files, False
-        current = stack.pop()
+        current, under = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
             # A directory inside a readable tree that we cannot enter is one
             # subtree missing from the sum, not a failure of the whole walk.
+            if under:
+                _walked_one(under_top, under, 0, 0, parts)
             continue
         seen += len(entries)
         if seen > ceiling:
@@ -1075,11 +1091,18 @@ def _walk(top, deadline, ceiling, owner=None, stop=None):
             # shape for a scratch or `/tmp` tree, so it was the case the bound
             # most needed to catch and the one case it missed.
             return total, files, False
+        here_bytes = 0
+        here_files = 0
         for entry in entries:
             try:
                 if entry.is_dir(follow_symlinks=False):
                     if owner is None or entry.stat(follow_symlinks=False).st_uid == owner:
-                        stack.append(entry.path)
+                        if parts is None:
+                            stack.append((entry.path, ""))
+                        else:
+                            child = under or entry.path
+                            stack.append((entry.path, child))
+                            under_top.setdefault(child, [0, 0, 0])[2] += 1
                     continue
                 stat = entry.stat(follow_symlinks=False)
             except OSError:
@@ -1104,9 +1127,160 @@ def _walk(top, deadline, ceiling, owner=None, stop=None):
             # answer. Sparse files keep their block figure, because theirs is
             # non-zero.
             blocks = int(getattr(stat, "st_blocks", 0)) * 512
-            total += blocks if blocks else int(getattr(stat, "st_size", 0))
-            files += 1
+            here_bytes += blocks if blocks else int(getattr(stat, "st_size", 0))
+            here_files += 1
+        total += here_bytes
+        files += here_files
+        if under:
+            _walked_one(under_top, under, here_bytes, here_files, parts)
     return total, files, True
+
+
+def _walked_one(under_top, under, here_bytes, here_files, parts):
+    # type: (Dict[str, List[int]], str, int, int, Optional[Dict[str, Tuple[int, int]]]) -> None
+    """One directory under ``under`` read: hand the subtree over once it is all read."""
+    tally = under_top[under]
+    tally[0] += here_bytes
+    tally[1] += here_files
+    tally[2] -= 1
+    if not tally[2] and parts is not None:
+        parts[under] = (tally[0], tally[1])
+
+
+#: Directories a threaded count reads at once on a network filesystem. rapidu's
+#: own default, which its author measured on GPFS: 16 threads walked a 1.19M
+#: inode tree in 36.6s against 46.9s at 8, and 24 bought 8% on one tree and
+#: nothing on another, while being "as much as is polite to ask of a shared
+#: node's metanode".
+WALK_THREADS = 16
+
+#: How long a stopped threaded count waits for its walkers to put down the
+#: directory in hand. One blocked in `scandir` on a hung mount never will, and
+#: is left behind as a daemon, as `with_deadline` leaves its probes.
+WALK_STOP_GRACE_S = 2.0
+
+
+class _Tally(object):
+    """A count in flight, for the status line: entries read so far.
+
+    rapidu's `Progress` has the same ``inodes``, so the line reads one way
+    whichever walk is counting.
+    """
+
+    def __init__(self):
+        # type: () -> None
+        self.inodes = 0
+
+
+def _walk_threads(top, deadline, ceiling, stop=None, parts=None, threads=WALK_THREADS, tally=None):
+    # type: (str, float, int, Optional[Any], Optional[Dict[str, Tuple[int, int]]], int, Optional[_Tally]) -> Tuple[int, int, bool]
+    """`_walk` with ``threads`` directories in hand at once, and the same figures.
+
+    **What the browser counts with when rapidu is not installed**, on a network
+    filesystem, where every `stat` is a round trip to a metadata server and
+    `_walk` waits on each in turn: its first walk of a 15,346-file folder here
+    took 10.7s. Sixteen in flight hide sixteen round trips at once. Everything
+    else is `_walk`'s, entry for entry: `st_blocks`, falling back to
+    `st_size` for a file that has none, directories entered and not charged,
+    symlinks never followed, and ``parts`` handed over for each subtree walked
+    to the end. On local storage `_walk` is used as it is, since there a
+    `stat` costs nothing to hide and threads cost more than they save.
+
+    The walk stops when ``deadline`` passes, ``stop`` is set, or it has read
+    more than ``ceiling`` entries, and a directory being read then is checked
+    every 1024 entries. ``tally`` counts entries read, for the status line.
+    """
+    lock = threading.Condition()
+    todo = [(top, "")]  # type: List[Tuple[str, str]]
+    under_top = {}  # type: Dict[str, List[int]]
+    # Everything shared, changed only under `lock`: bytes, files, entries read,
+    # walkers holding a directory, and whether the walk was cut short.
+    totals = {"bytes": 0, "files": 0, "seen": 0, "active": 0}
+    halt = [False]
+    finished = threading.Event()
+
+    def read(current, under):
+        # type: (str, str) -> Optional[Tuple[int, int, int, List[Tuple[str, str]]]]
+        """One directory: its bytes, files, entries and subdirectories, or None if cut."""
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            return 0, 0, 0, []
+        here_bytes = 0
+        here_files = 0
+        found = []  # type: List[Tuple[str, str]]
+        for position, entry in enumerate(entries):
+            if not (position & 1023) and position and halt[0]:
+                return None
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    found.append((entry.path, (under or entry.path) if parts is not None else ""))
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            # See `_walk` for why a file with no blocks is charged its length.
+            blocks = int(getattr(stat, "st_blocks", 0)) * 512
+            here_bytes += blocks if blocks else int(getattr(stat, "st_size", 0))
+            here_files += 1
+        return here_bytes, here_files, len(entries), found
+
+    def work():
+        # type: () -> None
+        while True:
+            with lock:
+                while not todo and totals["active"] and not halt[0]:
+                    lock.wait(0.25)
+                # Checked before every directory, as `_walk` checks them.
+                if time.time() > deadline or (stop is not None and stop.is_set()):
+                    halt[0] = True
+                if halt[0] or not todo:
+                    if not totals["active"]:
+                        finished.set()
+                    lock.notify_all()
+                    return
+                current, under = todo.pop()
+                totals["active"] += 1
+            try:
+                got = read(current, under)
+            except BaseException:
+                got = None
+                halt[0] = True
+            with lock:
+                totals["active"] -= 1
+                if got is not None:
+                    here_bytes, here_files, seen, found = got
+                    totals["bytes"] += here_bytes
+                    totals["files"] += here_files
+                    totals["seen"] += seen
+                    if tally is not None:
+                        tally.inodes = totals["seen"]
+                    for _path, child in found:
+                        if child:
+                            under_top.setdefault(child, [0, 0, 0])[2] += 1
+                    todo.extend(found)
+                    if under:
+                        _walked_one(under_top, under, here_bytes, here_files, parts)
+                    if totals["seen"] > ceiling:
+                        halt[0] = True
+                lock.notify_all()
+
+    pool = [threading.Thread(target=work) for _ in range(max(1, int(threads)))]
+    for walker in pool:
+        walker.daemon = True
+        walker.start()
+    while not finished.wait(max(0.0, min(0.1, deadline - time.time()))):
+        if time.time() > deadline or (stop is not None and stop.is_set()):
+            with lock:
+                halt[0] = True
+                lock.notify_all()
+            until = time.time() + WALK_STOP_GRACE_S
+            for walker in pool:
+                walker.join(max(0.0, until - time.time()))
+            break
+    with lock:
+        complete = not halt[0] and not todo and not totals["active"]
+        return totals["bytes"], totals["files"], complete
 
 
 def _rows_governing(snap, root):
@@ -1576,12 +1750,28 @@ def sweep(opts, runner=None, save_state=True):
 
     run.identity = read_identity(run.mounts, site=run.site)
 
-    for plugin in run.plugins:
-        try:
-            run.allocations.extend(plugin.allocations(runner, budget) or [])
-        except Exception as exc:
-            run.warnings.append("plugin %s could not list allocations: %s" % (plugin.name, exc))
-    mark("allocations")
+    # The allocation listing runs WHILE the quota backends are asked, since
+    # neither needs the other and both are commands that mostly wait: on this
+    # cluster `accounts storage` took 0.36s and the quota reads 1.28s, one
+    # after the other, of a 1.97s start. Its answers and warnings land in the
+    # run only after it is joined, so they come out in the same order as
+    # before.
+    listed = []  # type: List[Any]
+    listing_notes = []  # type: List[str]
+
+    def list_allocations():
+        # type: () -> None
+        for plugin in run.plugins:
+            try:
+                listed.extend(plugin.allocations(runner, budget) or [])
+            except Exception as exc:
+                listing_notes.append(
+                    "plugin %s could not list allocations: %s" % (plugin.name, exc)
+                )
+
+    listing = threading.Thread(target=list_allocations)
+    listing.daemon = True
+    listing.start()
 
     # Quota FIRST, because its fileset enumeration is a discovery source, on a
     # budget of its own so it cannot starve the probes. See `QUOTA_SHARE`.
@@ -1595,6 +1785,16 @@ def sweep(opts, runner=None, save_state=True):
         except Exception:
             continue
     mark("quota")
+
+    # Its commands are held to slices of the run's budget by the runner, so
+    # this wait is bounded by it; the grace covers a plugin that blocks
+    # outside a command.
+    listing.join(budget.remaining + 2.0)
+    if listing.is_alive():
+        listing_notes.append("the allocation listing did not finish in the time allowed")
+    run.allocations.extend(list(listed))
+    run.warnings.extend(listing_notes)
+    mark("allocations")
 
     run.roots = discover(
         runner,
@@ -3781,13 +3981,15 @@ def _children(path, limit=CHILD_LIMIT, read_s=LIST_READ_S, probes_s=LIST_PROBES_
     """
 
     def read():
-        # type: () -> List[Tuple[str, str]]
-        found = []  # type: List[Tuple[str, str]]
+        # type: () -> List[Tuple[str, str, int]]
+        found = []  # type: List[Tuple[str, str, int]]
         with os.scandir(path) as entries:
             for entry in entries:
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        found.append((entry.name, entry.path))
+                        # The inode number comes with the name, from `getdents`,
+                        # and is what a stored size is checked against.
+                        found.append((entry.name, entry.path, entry.inode()))
                 except OSError:
                     continue
         return sorted(found)
@@ -3799,11 +4001,11 @@ def _children(path, limit=CHILD_LIMIT, read_s=LIST_READ_S, probes_s=LIST_PROBES_
         if isinstance(exc, OSError):
             return [], 0, True
         raise exc
-    found = list(value) if isinstance(value, list) else []  # type: List[Tuple[str, str]]
+    found = list(value) if isinstance(value, list) else []  # type: List[Tuple[str, str, int]]
 
     out = []  # type: List[Dict[str, object]]
     stop = time.time() + probes_s
-    for name, child in found[:limit]:
+    for name, child, ino in found[:limit]:
         left = stop - time.time()
         done, facts, failed, _spent = (
             with_deadline(functools.partial(_child_facts, child), min(DEFAULT_DEADLINE_S, left))
@@ -3811,12 +4013,13 @@ def _children(path, limit=CHILD_LIMIT, read_s=LIST_READ_S, probes_s=LIST_PROBES_
             else (False, None, None, 0.0)
         )
         if done and failed is None and isinstance(facts, dict):
-            out.append(dict(facts, name=name, path=child))
+            out.append(dict(facts, name=name, path=child, ino=ino))
         else:
             out.append(
                 {
                     "name": name,
                     "path": child,
+                    "ino": ino,
                     "readable": False,
                     "writable": False,
                     "enterable": False,
@@ -3890,17 +4093,19 @@ LIST_SIZING_S = 15.0
 #: The shortest glance the first pass gives a folder when it has many to reach.
 GLANCE_MIN_S = 0.25
 
-#: And how long one visit to a directory may count in all, first pass and
-#: second. The walks run behind the view and stop when the reader leaves, so
-#: this bounds the login node's work, not anyone's wait. Half an hour, because
-#: one folder here, `/project/rcc/youzhi`, is over 10T in more than 3 million
+#: And how long one visit to a directory may go on BEGINNING counts, first
+#: pass and second; a count already under way runs to its end (see `_Sizes`).
+#: The walks run behind the view and stop when the reader leaves, so this
+#: bounds the login node's work, not anyone's wait. Half an hour, because one
+#: folder here, `/project/rcc/youzhi`, is over 10T in more than 3 million
 #: files, and rapidu had not finished it after two and a half minutes.
 VISIT_SIZING_S = 1800.0
 
-#: What `m` spends on the one directory it was pressed on: no entry ceiling,
-#: and this long. The reader asked for this one, so it is worth more than the
-#: glance every child gets.
-MEASURE_S = 30.0
+#: How old a stored size may be and still be the answer, with no count behind
+#: the view. Older ones stay on screen too, and are counted again once every
+#: folder without a figure has one. An hour, so a folder opened twice in an
+#: afternoon costs one count, and one opened the next day is counted afresh.
+FRESH_S = 3600.0
 
 
 def _listed_root(kid, parent, site, known):
@@ -3966,8 +4171,8 @@ def _rapidu_walk():
     return getattr(module, "walk", None)
 
 
-def _size_of(path, deadline, ceiling, stop, box=None, progress=None):
-    # type: (str, float, int, Any, Optional[List[Any]], Any) -> Tuple[int, int, bool]
+def _size_of(path, deadline, ceiling, stop, box=None, progress=None, parts=None, threads=1):
+    # type: (str, float, int, Any, Optional[List[Any]], Any, Optional[Dict[str, Tuple[int, int]]], int) -> Tuple[int, int, bool]
     """``(bytes, files, finished)`` for one child of an opened directory.
 
     **rapidu's threaded walk when it is installed, the table's own `_walk`
@@ -3983,18 +4188,31 @@ def _size_of(path, deadline, ceiling, stop, box=None, progress=None):
     walk runs behind the view, so the warm loss is invisible and the cold win
     is the one a reader waits for. Its figures are `du`'s, directory blocks and
     hard links counted once, and `files` counts every entry that is not a
-    directory, as `_walk` does.
+    directory, as `_walk` does. That is rapidu's own `files`: its `symlinks`
+    and `specials` are PART of it, not beside it, and adding them in as well
+    had a tree of 148,402 files read 148,727.
 
     ``deadline`` stops it through rapidu's own `stop` event, set by a timer;
     ``box`` holds that event while it runs, so leaving the view stops it too.
     ``progress`` is a rapidu `Progress`, which the status line reads live.
+    ``parts`` receives each finished subdirectory's figures, as from `_walk`.
+    Without rapidu, ``threads`` above one counts with `_walk_threads`, which
+    the caller asks for on a network filesystem; rapidu is handed a count
+    only when it is below its own default, which is the half a count set
+    aside leaves free.
     """
     walker = _rapidu_walk()
-    if walker is None:
-        return _walk(path, deadline, ceiling, stop=stop)
     halt = threading.Event()
     if box is not None:
         box[0] = halt
+    if walker is None:
+        # The same `halt` in ``box``, so `m` can stop this walk as it stops rapidu's.
+        either = _Either(stop, halt)
+        try:
+            return _count_here(path, deadline, ceiling, either, parts, threads, progress)
+        finally:
+            if box is not None:
+                box[0] = None
     if stop.is_set():
         halt.set()
     # Capped, because a timer that far out overflows the platform's `time_t`.
@@ -4005,22 +4223,79 @@ def _size_of(path, deadline, ceiling, stop, box=None, progress=None):
         options = {"depth": 1, "one_file_system": True, "stop": halt}
         if progress is not None:
             options["progress"] = progress
+        if 1 < threads < WALK_THREADS:
+            # Asked for fewer than its default, beside a count set aside.
+            options["threads"] = threads
         res = walker(path, **options)
     except TypeError:
         # A rapidu from before these arguments: the table's own walk instead.
-        return _walk(path, deadline, ceiling, stop=stop)
+        return _count_here(path, deadline, ceiling, _Either(stop, halt), parts, threads, progress)
     except Exception:
         return 0, 0, False
     finally:
         timer.cancel()
         if box is not None:
             box[0] = None
-    files = sum(int(getattr(res, name, 0) or 0) for name in ("files", "symlinks", "specials"))
+    if parts is not None:
+        _rapidu_parts(res, parts)
     # `partial` and not `complete`: rapidu's `complete` is also False when a
     # subdirectory could not be read, which `_walk` counts as a finished walk
     # of what is readable, and a `?` there would say "too big" about a folder
     # that is merely partly private.
-    return int(getattr(res, "size", 0) or 0), files, not getattr(res, "partial", True)
+    return (
+        int(getattr(res, "size", 0) or 0),
+        int(getattr(res, "files", 0) or 0),
+        not getattr(res, "partial", True),
+    )
+
+
+class _Either(object):
+    """Set when any of its events is: the reader leaving, or `m` wanting the walk."""
+
+    def __init__(self, *events):
+        # type: (*Any) -> None
+        self.events = events
+
+    def is_set(self):
+        # type: () -> bool
+        return any(event.is_set() for event in self.events)
+
+
+def _count_here(path, deadline, ceiling, stop, parts, threads, progress):
+    # type: (str, float, int, Any, Optional[Dict[str, Tuple[int, int]]], int, Any) -> Tuple[int, int, bool]
+    """dirscape's own count: threaded where asked, else `_walk` exactly."""
+    if threads > 1:
+        tally = progress if isinstance(progress, _Tally) else None
+        return _walk_threads(path, deadline, ceiling, stop, parts, threads, tally)
+    return _walk(path, deadline, ceiling, stop=stop, parts=parts)
+
+
+def _threads_for(root):
+    # type: (Root) -> int
+    """How many directories a count of ``root`` reads at once without rapidu."""
+    network = classify_fstype(getattr(root, "fstype", "") or "") == KIND_NETWORK
+    return WALK_THREADS if network else 1
+
+
+def _rapidu_parts(res, parts):
+    # type: (Any, Dict[str, Tuple[int, int]]) -> None
+    """Each directory directly under a rapidu walk's root that it walked to the end.
+
+    rapidu keeps these anyway, one `Entry` per child at `depth=1`, and each is
+    cumulative: what walking that child alone would count, apart from a hard
+    link shared with a sibling, which is charged to whichever the walk met
+    first, as `du a b` charges it. `is_finished` is what makes a walk that was
+    cut short still worth reading: every child it finished is exact.
+    """
+    root = getattr(res, "root", "")
+    finished = getattr(res, "is_finished", None)
+    for entry in list((getattr(res, "dir_agg", None) or {}).values()):
+        where = getattr(entry, "path", "")
+        if not getattr(entry, "is_dir", False) or os.path.dirname(where) != root:
+            continue
+        if finished is not None and not finished(entry):
+            continue
+        parts[where] = (int(entry.size), int(entry.files))
 
 
 class _Sizes(object):
@@ -4041,9 +4316,29 @@ class _Sizes(object):
     did not finish is then counted to the end, ONE AT A TIME and never
     restarted, the one the glance found smallest first, so the most rows turn
     exact the soonest. `m` counts the highlighted folder next, interrupting
-    the count in flight, which starts over after it. The whole visit stops
-    after `VISIT_SIZING_S`, and whatever was cut off then reads `?`, with a
-    line saying so.
+    the count in flight, which starts over after it. No count is begun once
+    the visit has spent `VISIT_SIZING_S`, and whatever was never begun then
+    reads `?`, with a line saying so. A count already under way runs to its
+    end: cut off at the allowance, the work it had done was thrown away, and a
+    folder larger than one visit's allowance, `/project/rcc/pnsinha`'s 17
+    million files on a cold node, could never be counted at all.
+
+    **Opening a folder does not throw away the count in flight.** The level
+    being left carries on with it behind the view, `aside`, while the folder
+    opened is counted with half the threads, so the two together stay within
+    rapidu's own ceiling of 24. Coming back, the row it was counting reads `…`
+    until it lands. Opening the very folder being counted stops it instead,
+    since its folders are then counted where the reader is looking.
+
+    **Nothing is counted twice.** Every walk also hands back the figures of
+    the folders directly inside the one it walked (`_walk`, `_rapidu_parts`),
+    so opening a folder that was counted shows its children at once, and
+    every finished count goes into ``index``, the `SizeIndex` kept between
+    runs. A folder opened again shows the figures it had, from the moment it
+    is drawn: `/project/rcc` took 22.8 minutes to count the first time and
+    reads in full at once after that. A stored figure older than ``fresh_s``
+    stays on screen while the folder is counted again, after every folder
+    that has no figure at all, and a note says how old the figures are.
 
     Everything here is keyed by FOLDER, never by row number, because the rows
     re-sort as the figures land (`_Order`) and a row number names a different
@@ -4055,9 +4350,11 @@ class _Sizes(object):
     renderer iterates a root's policy while it paints, and a second thread
     writing into that dict is how a repaint dies of "dictionary changed size".
 
-    ``cache`` maps a path to ``(bytes, files)`` for FINISHED counts only and
-    outlives this object, so a directory the reader comes back to is not
-    counted again.
+    ``cache`` maps a path to ``(bytes, files)`` for counts FINISHED this
+    session and outlives this object, so a directory the reader comes back to
+    is not counted again. ``inodes`` maps each row's path to the inode number
+    the listing read, which is how a stored figure is known to be this
+    folder's and not an older one's that had the same name.
     """
 
     def __init__(
@@ -4068,6 +4365,11 @@ class _Sizes(object):
         entries=WALK_ENTRIES,  # type: int
         glance_s=LIST_SIZING_S,  # type: float
         total_s=VISIT_SIZING_S,  # type: float
+        index=None,  # type: Optional[SizeIndex]
+        inodes=None,  # type: Optional[Dict[str, Optional[int]]]
+        fresh_s=FRESH_S,  # type: float
+        aside=None,  # type: Optional[_Sizes]
+        glanced=None,  # type: Optional[Dict[str, int]]
     ):
         # type: (...) -> None
         self.roots = list(roots)
@@ -4076,15 +4378,22 @@ class _Sizes(object):
         self.entries = entries
         self.glance_s = glance_s
         self.total_s = total_s
+        self.index = index
         #: The folder the view last painted highlighted, which is what `m` means.
         self.cursor = None  # type: Optional[Root]
+        self._inodes = dict(inodes or {})
         self._lock = threading.Lock()
         self._todo = []  # type: List[Root]
         self._full = []  # type: List[Root]
         self._first = []  # type: List[Root]
+        # Rows showing a stored figure old enough to be counted again, which
+        # they are once every row without a figure has one.
+        self._stale = []  # type: List[Root]
         # What the glance counted of each folder it did not finish: the order
-        # the second pass takes them in, and never a figure on screen.
-        self._glanced = {}  # type: Dict[str, int]
+        # the second pass takes them in, and never a figure on screen. Shared
+        # by every level of one tree, so a level the reader comes back to goes
+        # straight to its long counts instead of glancing at them again.
+        self._glanced = {} if glanced is None else glanced  # type: Dict[str, int]
         self._gave_up = set()  # type: set
         self._visible = set()  # type: set
         self._running = False
@@ -4099,14 +4408,49 @@ class _Sizes(object):
         self._current = None  # type: Optional[Root]
         self._progress = None  # type: Any
         self._applied = set()  # type: set
+        # Rows showing a figure from the index, not counted this session:
+        # path to when it was counted.
+        self._stored = {}  # type: Dict[str, float]
+        # The level the reader left with a count still in flight, and the rows
+        # here that count is for: they wait for it rather than count again.
+        self._aside = aside
+        self._awaiting = set()  # type: set
+        # Set when the reader leaves with a count in flight: finish that one,
+        # begin nothing new. See `set_aside`.
+        self._detached = False
+        elsewhere = aside.counting()[0] if aside is not None and aside.busy() else None
+        now = time.time()
         for root in self.roots:
             if not self._addable(root):
                 continue
             if root.path in self.cache:
-                self._apply(root)
+                self._apply(root, *self.cache[root.path])
+                self._applied.add(root.path)
+                continue
+            kept = (
+                index.get(root.path, self._inodes.get(root.path), _filesystem_of(root))
+                if index
+                else None
+            )
+            counted_elsewhere = elsewhere is not None and root.path == elsewhere.path
+            if kept is not None:
+                used, files, counted = kept
+                self._apply(root, used, files, counted)
+                self._stored[root.path] = counted
+                if counted_elsewhere:
+                    self._awaiting.add(root.path)
+                elif now - counted >= fresh_s:
+                    self._stale.append(root)
                 continue
             root.policy[render_fields.MEASURING] = True
-            self._todo.append(root)
+            if counted_elsewhere:
+                self._awaiting.add(root.path)
+            elif root.path in self._glanced:
+                self._full.append(root)
+            else:
+                self._todo.append(root)
+        # Smallest first, as the second pass takes the rows with no figure.
+        self._stale.sort(key=lambda root: self._stored_bytes(root))
         # The glance SHRINKS with the number of folders, so the first pass
         # reaches every row in about `glance_s` however many there are.
         count = len(self._todo)
@@ -4121,29 +4465,57 @@ class _Sizes(object):
         # type: (Root) -> bool
         return bool(root.path) and root.reach == Reach.LISTABLE and root.quota is None
 
-    def _apply(self, root):
-        # type: (Root) -> None
-        """A finished count onto its root. The UI thread only."""
-        used, files = self.cache[root.path]
+    @staticmethod
+    def _stored_bytes(root):
+        # type: (Root) -> int
+        row, _how, _why = render_fields.pick_row(root.quota, root.path, "blocks")
+        return int(row.used) if row is not None and row.used is not None else 0
+
+    @staticmethod
+    def _apply(root, used, files, counted=None):
+        # type: (Root, int, int, Optional[float]) -> None
+        """A finished count onto its root. The UI thread only.
+
+        ``counted`` is when a stored figure was counted, which its source
+        carries as the reading's age; a count from this session has none.
+        """
+        source = _WalkSource  # type: Any
+        if counted is not None:
+            source = _StoredSource(counted)
         root.quota = _single_row_snapshot(
-            _WalkSource, QuotaRow("", "blocks", "user", used, mount=root.path)
+            source, QuotaRow("", "blocks", "user", used, mount=root.path)
         )
         root.inode_quota = _single_row_snapshot(
-            _WalkSource, QuotaRow("", "files", "user", files, mount=root.path)
+            source, QuotaRow("", "files", "user", files, mount=root.path)
         )
         root.policy.pop(render_fields.MEASURING, None)
         root.policy.pop("not_added", None)
-        self._applied.add(root.path)
 
     def refresh(self):
         # type: () -> None
         """Everything that finished since the last paint, onto its row."""
+        requeued = False
+        if self._awaiting and not self._aside_busy():
+            # The count set aside has ended. Idle is read FIRST, since it puts
+            # its figure in the cache before it goes idle: whatever it did not
+            # answer, stopped or cut short, is counted here after all, first.
+            with self._lock:
+                for root in self.roots:
+                    if root.path in self._awaiting and root.path not in self.cache:
+                        self._first.append(root)
+                        requeued = True
+                self._awaiting = set()
         for root in self.roots:
             if root.path in self.cache and root.path not in self._applied:
-                self._apply(root)
+                self._apply(root, *self.cache[root.path])
+                self._applied.add(root.path)
+                self._stored.pop(root.path, None)
+                self._awaiting.discard(root.path)
             elif root.path in self._gave_up and root.policy.get(render_fields.MEASURING):
                 root.policy.pop(render_fields.MEASURING, None)
                 root.policy["not_added"] = True
+        if requeued:
+            self.start()
         if self._ran_out:
             with self._lock:
                 left = self._todo + self._full
@@ -4161,7 +4533,7 @@ class _Sizes(object):
     def start(self):
         # type: () -> None
         with self._lock:
-            if self._running or not (self._todo or self._full or self._first):
+            if self._running or not (self._todo or self._full or self._first or self._stale):
                 return
             self._running = True
         worker = threading.Thread(target=self._run)
@@ -4178,35 +4550,98 @@ class _Sizes(object):
 
     def busy(self):
         # type: () -> bool
-        return self._running
+        return self._running or (bool(self._awaiting) and self._aside_busy())
+
+    def _aside_busy(self):
+        # type: () -> bool
+        aside = self._aside
+        return aside is not None and aside.busy()
+
+    def set_aside(self, opening=None):
+        # type: (Optional[Root]) -> bool
+        """The reader is opening ``opening``: keep counting the folder in flight.
+
+        True when there was one and it goes on, behind the view; the caller
+        then keeps this object as the next level's ``aside``. False when there
+        was none, or it is ``opening`` itself, and everything here stops.
+        """
+        with self._lock:
+            current = self._current
+            keep = (
+                self._running
+                and current is not None
+                and (opening is None or current.path != opening.path)
+            )
+            if keep:
+                self._detached = True
+        if not keep:
+            self.stop()
+        return keep
 
     def counting(self):
         # type: () -> Tuple[Optional[Root], Optional[int]]
         """The folder being counted to the end now, and its files so far, if known."""
         progress = self._progress
+        current = self._current
+        if current is None and self._awaiting and self._aside_busy():
+            return self._aside.counting()  # type: ignore[union-attr]
         inodes = getattr(progress, "inodes", None) if progress is not None else None
-        return self._current, inodes
+        return current, inodes
+
+    def stored(self):
+        # type: () -> Optional[Tuple[float, bool]]
+        """How old the oldest stored figure on screen is, and whether it is being counted again.
+
+        None when every figure on screen was counted this session.
+        """
+        stored = dict(self._stored)
+        if not stored:
+            return None
+        with self._lock:
+            waiting = [root.path for root in self._stale + self._first]
+        current = self._current
+        if current is not None:
+            waiting.append(current.path)
+        again = any(path in stored for path in waiting)
+        return max(0.0, time.time() - min(stored.values())), again
 
     def changed(self):
         # type: () -> bool
-        """Whether a figure landed since the last time this was asked."""
+        """Whether a figure landed since the last time this was asked.
+
+        A row waiting on the count set aside has landed once its figure is in
+        the cache, or has to be counted here once that count has ended.
+        """
         if self._changed.is_set():
             self._changed.clear()
             return True
+        if self._awaiting:
+            if not self._aside_busy():
+                return True
+            return any(path in self.cache for path in list(self._awaiting))
         return False
 
     def measure(self, root=None):
         # type: (Optional[Root]) -> bool
-        """`m`: count ``root``, the highlighted folder unless told, next."""
+        """`m`: count ``root``, the highlighted folder unless told, next.
+
+        A stored figure is counted again, and stays on screen while it is;
+        one counted this session is already the answer.
+        """
         root = root if root is not None else self.cursor
-        if root is None or root.reach != Reach.LISTABLE or root.path in self.cache:
+        if root is None or root.reach != Reach.LISTABLE:
             return False
-        if root.quota is not None:
+        if root.path in self._awaiting:
+            return True  # being counted now, by the level set aside
+        stored = root.path in self._stored
+        if root.path in self.cache and not stored:
+            return False
+        if root.quota is not None and not stored:
             return False  # a root the table measured already
         if root is self._current:
             return True  # being counted now
         with self._lock:
-            for queue in (self._todo, self._full):
+            for queue in (self._todo, self._full, self._stale):
                 if root in queue:
                     queue.remove(root)
             if root not in self._first:
@@ -4217,7 +4652,8 @@ class _Sizes(object):
                 self._preempted = True
         if halt is not None:
             halt.set()
-        root.policy[render_fields.MEASURING] = True
+        if not stored:
+            root.policy[render_fields.MEASURING] = True
         root.policy.pop("not_added", None)
         self.start()
         return True
@@ -4242,6 +4678,10 @@ class _Sizes(object):
             return self._full.pop(chosen), "full"
         if self._full:
             self._ran_out = True
+            return None, ""
+        # Every row has a figure: the stored ones that are old are counted again.
+        if self._stale and self._spent < self.total_s:
+            return self._stale.pop(0), "full"
         return None, ""
 
     def _run(self):
@@ -4263,7 +4703,7 @@ class _Sizes(object):
 
     def _work(self):
         # type: () -> None
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not self._detached:
             with self._lock:
                 root, how = self._next()
             if root is None:
@@ -4272,19 +4712,29 @@ class _Sizes(object):
             if how == "glance":
                 cap, ceiling = min(self.per_child_s, self.glance_s - self._spent), self.entries
             else:
-                cap, ceiling = max(self.total_s - self._spent, 0.0), 10**15
-                if how == "first":
-                    # Asked for by name, so it is counted even past the allowance.
-                    cap = max(cap, MEASURE_S)
+                # Once begun, to the end: see the class docstring. The reader
+                # leaving, or `m`, is what stops it.
+                cap, ceiling = float(10**9), 10**15
                 progress = _progress_counter()
                 self._current, self._progress = root, progress
                 self._changed.set()
             started = time.time()
+            parts = {}  # type: Dict[str, Tuple[int, int]]
             used, files, complete = _size_of(
-                root.path, started + cap, ceiling, self._stop, self._halt, progress
+                root.path,
+                started + cap,
+                ceiling,
+                self._stop,
+                self._halt,
+                progress,
+                parts,
+                self._threads(root),
             )
             self._spent += time.time() - started
             self._current, self._progress = None, None
+            # Kept even from a walk that was stopped: each part is a subtree
+            # it finished, so it is exact whatever became of the rest.
+            self._keep(root, parts, complete and (used, files))
             with self._lock:
                 preempted, self._preempted = self._preempted, False
             if self._stop.is_set() and not complete:
@@ -4296,17 +4746,103 @@ class _Sizes(object):
                     self._glanced[root.path] = used
                     self._full.append(root)
             elif preempted:
-                # `m` stopped it for another folder: it is counted again after.
+                # `m` stopped it for another folder: it is counted again after,
+                # and a stored figure back among the stored ones, never as a
+                # folder with no figure at all.
                 with self._lock:
-                    self._full.insert(0, root)
+                    if root.path in self._stored:
+                        self._stale.insert(0, root)
+                    else:
+                        self._full.insert(0, root)
             else:
                 self._gave_up.add(root.path)
             self._changed.set()
 
+    def _threads(self, root):
+        # type: (Root) -> int
+        """`_threads_for`, halved while the count set aside is still running."""
+        threads = _threads_for(root)
+        if self._aside_busy() and threads > 1:
+            return threads // 2
+        return threads
+
+    def _keep(self, root, parts, whole):
+        # type: (Root, Dict[str, Tuple[int, int]], Any) -> None
+        """Remember a walk's figures: this session's cache, then the index.
+
+        Only the parts a listing of ``root`` would show, the first
+        `CHILD_LIMIT` by name, which also bounds what one folder of a hundred
+        thousand directories can put in either.
+        """
+        shown = sorted(parts)[:CHILD_LIMIT]
+        for path in shown:
+            self.cache.setdefault(path, parts[path])
+        index = self.index
+        if index is None or not (shown or whole):
+            return
+        now = time.time()
+        where = _filesystem_of(root)
+        if whole:
+            used, files = whole
+            ino = self._inodes.get(root.path)
+            index.put(root.path, used, files, now, ino=ino, filesystem=where)
+        for path in shown:
+            used, files = parts[path]
+            index.put(path, used, files, now, ino=_inode_of(path), filesystem=where)
+        index.flush()
+
+
+class _StoredSource(object):
+    """The `source` of a figure the index kept: a walk, counted at ``counted``.
+
+    `_WalkSource` with an age, so `why` and `--json` say how old the reading
+    is, as they do for a quota report read from a cache.
+    """
+
+    source = "walk"
+    category = VerdictCategory.OK
+    reason = "measured by walking the directory, on an earlier visit"
+    time_note = ""
+    figure_note = ""
+
+    def __init__(self, counted):
+        # type: (float) -> None
+        self.taken_at = counted
+        self.read_at = time.time()
+
+
+def _filesystem_of(root):
+    # type: (Root) -> str
+    """The filesystem ``root`` is on, named as every node that mounts it names it, or "".
+
+    What a stored size is tied to (see `SizeIndex`). A network filesystem's
+    device is the same string on each client, a Lustre one once the directory
+    it mounts is cut off (`lustre_filesystem`), and "" for anything else means
+    the figure is this node's only.
+    """
+    fstype = (getattr(root, "fstype", "") or "").lower()
+    device = getattr(root, "device", "") or ""
+    if not device or classify_fstype(fstype) != KIND_NETWORK:
+        return ""
+    if fstype == "lustre":
+        device = lustre_filesystem(device)
+    return "%s:%s" % (fstype, device)
+
+
+def _inode_of(path):
+    # type: (str) -> Optional[int]
+    """The inode number of ``path``, or None: what a stored figure is checked against."""
+    try:
+        return os.lstat(path).st_ino
+    except OSError:
+        return None
+
 
 def _progress_counter():
     # type: () -> Any
-    """A rapidu `Progress` for the status line, or None without rapidu."""
+    """A rapidu `Progress` for the status line, or dirscape's own `_Tally` without rapidu."""
+    if _rapidu_walk() is None:
+        return _Tally()
     try:
         from rapidu import walk as module  # type: ignore[import-not-found]
 
@@ -4372,8 +4908,14 @@ class _Order(object):
         return after.index(held)
 
 
-def _sizing_keys(sizes, order=None, reader=None, waiting=None, slice_s=0.2):
-    # type: (_Sizes, Optional[_Order], Optional[Callable[[], str]], Optional[Callable[[float], bool]], float) -> Callable[[], str]
+#: How often the count in flight repaints its "entries so far" line.
+LIVE_S = 1.0
+
+
+def _sizing_keys(
+    sizes, order=None, reader=None, waiting=None, slice_s=0.2, live_s=LIVE_S, clock=time.time
+):
+    # type: (_Sizes, Optional[_Order], Optional[Callable[[], str]], Optional[Callable[[float], bool]], float, float, Callable[[], float]) -> Callable[[], str]
     """Keys for an opened directory whose sizes are still arriving.
 
     A figure landing is a repaint (`REDRAW`), `m` adds up the highlighted
@@ -4381,11 +4923,25 @@ def _sizing_keys(sizes, order=None, reader=None, waiting=None, slice_s=0.2):
     awaited in short slices so a finished walk appears without a keypress;
     once they are done, this blocks exactly as the table does and costs
     nothing while the reader reads.
+
+    **A count in flight repaints every ``live_s``** as well, so its status
+    line moves. It repainted only when a figure landed, and one folder counted
+    alone lands nothing for minutes, so the line kept the figure it had when the
+    count began: the owner's `/project/rcc` read "counting mehta5/: 2.4k entries
+    so far" for a folder of 1.36 million entries, which reads as a count that
+    has hung.
     """
     read = reader or interactive.read_key
     wait = waiting or interactive.input_waiting
+    painted = [clock()]
 
     def keys():
+        # type: () -> str
+        key = next_key()
+        painted[0] = clock()
+        return key
+
+    def next_key():
         # type: () -> str
         while True:
             # Idle is read BEFORE the change flag: the worker raises the flag
@@ -4395,6 +4951,8 @@ def _sizing_keys(sizes, order=None, reader=None, waiting=None, slice_s=0.2):
             if sizes.changed():
                 return interactive.Key.REDRAW
             if running and not wait(slice_s):
+                if sizes.counting()[0] is not None and clock() - painted[0] >= live_s:
+                    return interactive.Key.REDRAW
                 continue
             key = read()
             if key == interactive.Key.MEASURE:
@@ -4425,9 +4983,15 @@ def _row_starts(lines, roots, labels=None):
     return out
 
 
-def _dir_notes(roots, style, counting=None, entries=None):
-    # type: (Sequence[Root], Any, Optional[Root], Optional[int]) -> List[str]
-    """The count in flight, then one line for each reason a figure is `?`."""
+def _dir_notes(roots, style, counting=None, entries=None, stored=None):
+    # type: (Sequence[Root], Any, Optional[Root], Optional[int], Optional[Tuple[float, bool]]) -> List[str]
+    """The count in flight, how old any stored figure is, then each reason for a `?`.
+
+    ``stored`` is `_Sizes.stored`: the age of the oldest figure on screen that
+    an earlier visit counted, and whether it is being counted again. Stored
+    figures look like any other, so this line is the only place their age is
+    said, and it goes when the last of them has been counted again.
+    """
     lines = []  # type: List[str]
     if counting is not None:
         name = os.path.basename(counting.path.rstrip("/")) + "/"
@@ -4440,6 +5004,19 @@ def _dir_notes(roots, style, counting=None, entries=None):
                     ": %s entries so far" % (render_fields.human_count(entries),)
                     if entries
                     else "",
+                )
+            )
+        )
+    if stored is not None:
+        age, again = stored
+        lines.append(
+            style.dim(
+                "   sizes as counted %s ago%s"
+                % (
+                    render_fields.human_duration(age),
+                    ", counting again behind the view"
+                    if again
+                    else ": %s counts the highlighted row again" % (style.accent("m"),),
                 )
             )
         )
@@ -4842,8 +5419,8 @@ def _table_frame(
     return panel(lines, style=style, size=window, shrink=False).splitlines()
 
 
-def _descend(start, style, width, screen=None, run=None, cache=None):
-    # type: (str, object, Optional[int], Optional[interactive.Screen], Optional[Run], Optional[Dict[str, Tuple[int, int, bool, bool]]]) -> object
+def _descend(start, style, width, screen=None, run=None, cache=None, index=None):
+    # type: (str, object, Optional[int], Optional[interactive.Screen], Optional[Run], Optional[Dict[str, Tuple[int, int]]], Optional[SizeIndex]) -> object
     """Walk down a directory tree, one listing at a time, until the reader leaves.
 
     A STACK rather than recursion, so depth costs nothing and "back" is a pop.
@@ -4854,12 +5431,26 @@ def _descend(start, style, width, screen=None, run=None, cache=None):
     sizes added up behind it (`_Sizes`). ``run`` supplies the roots the sweep
     already measured, which a level shows exactly as the table does, and
     ``cache`` the sizes added up so far this session, so a level the reader
-    comes back to is not walked again.
+    comes back to is not walked again, and ``index`` the sizes counted on
+    earlier runs, so a level opened before is drawn with its figures.
 
     Returns `QUIT` when the reader wants out of the program entirely, and
     anything else when they have merely come back up past the top of this
     tree, which returns them to the table they opened it from.
     """
+    # The count a level carries on with after the reader opened a folder in it,
+    # which stops when the reader leaves the tree altogether.
+    aside = [None]  # type: List[Optional[_Sizes]]
+    try:
+        return _levels(start, style, width, screen, run, cache, index, aside, {})
+    finally:
+        if aside[0] is not None:
+            aside[0].stop()
+
+
+def _levels(start, style, width, screen, run, cache, index, aside, glanced):
+    # type: (str, object, Optional[int], Optional[interactive.Screen], Optional[Run], Optional[Dict[str, Tuple[int, int]]], Optional[SizeIndex], List[Optional[_Sizes]], Dict[str, int]) -> object
+    """`_descend`'s levels, one listing at a time, sharing ``aside`` and ``glanced``."""
     run = run if run is not None else Run()
     cache = {} if cache is None else cache
     known = {}  # type: Dict[str, Root]
@@ -4868,6 +5459,8 @@ def _descend(start, style, width, screen=None, run=None, cache=None):
             known[found.path] = found
     stack = [start]
     cursors = {}  # type: Dict[str, str]
+    # The last search from each folder, so `/` again takes it up where it was.
+    searches = {}  # type: Dict[str, Tuple[Any, str]]
     while stack:
         here = stack[-1]
         rows = interactive.window_rows()
@@ -4892,7 +5485,14 @@ def _descend(start, style, width, screen=None, run=None, cache=None):
             stack.pop()
             continue
 
-        sizes = _Sizes(roots, cache)
+        sizes = _Sizes(
+            roots,
+            cache,
+            index=index,
+            inodes={str(kid["path"]): kid.get("ino") for kid in kids},  # type: ignore[misc]
+            aside=aside[0],
+            glanced=glanced,
+        )
         order = _Order(roots)
         paths = [root.path for root in order.rows]
         initial = paths.index(cursors[here]) if cursors.get(here) in paths else 0
@@ -4921,7 +5521,7 @@ def _descend(start, style, width, screen=None, run=None, cache=None):
                 height=height,
                 top=seen[0],
                 held=more,
-                notes=_dir_notes(arranged.rows, style, *sizing.counting()),
+                notes=_dir_notes(arranged.rows, style, *sizing.counting(), stored=sizing.stored()),
                 by_size=arranged.by_size,
             )
             seen[0] = first
@@ -4934,6 +5534,7 @@ def _descend(start, style, width, screen=None, run=None, cache=None):
             return arranged.follow(cursor)
 
         sizes.start()
+        choice = None  # type: object
         try:
             choice = interactive.select(
                 paint,
@@ -4943,18 +5544,309 @@ def _descend(start, style, width, screen=None, run=None, cache=None):
                 escapable=True,
                 screen=screen,
                 remap=remap,
+                searchable=True,
             )
         finally:
-            sizes.stop()
+            # Opening a folder, or searching from here, keeps the count in
+            # flight going behind the view if nothing else already is: see
+            # `_Sizes`. Any other way out of this level stops it.
+            opening = None  # type: Optional[Root]
+            leaving = (None, interactive.Key.QUIT, interactive.Key.BACK, interactive.Key.SEARCH)
+            if choice not in leaving:
+                opening = order.rows[int(choice)]  # type: ignore[call-overload]
+            free = aside[0] is None or not aside[0].busy()
+            keep = opening is not None or choice == interactive.Key.SEARCH
+            if keep and free and sizes.set_aside(opening):
+                aside[0] = sizes
+            else:
+                sizes.stop()
         if choice == interactive.Key.QUIT:
             return interactive.Key.QUIT
         if choice == interactive.Key.BACK:
             stack.pop()
             continue
-        index = int(choice)  # type: ignore[arg-type]
-        cursors[here] = str(order.rows[index].path)
-        stack.append(str(order.rows[index].path))
+        if choice == interactive.Key.SEARCH:
+            found = _search_from(here, parent, style, width, screen, run, cache, searches, aside[0])
+            if found == interactive.Key.QUIT:
+                return interactive.Key.QUIT
+            if isinstance(found, str):
+                stack.append(found)
+            continue
+        chosen = int(choice)  # type: ignore[arg-type]
+        cursors[here] = str(order.rows[chosen].path)
+        stack.append(str(order.rows[chosen].path))
     return interactive.Key.BACK
+
+
+class _FileSizes(object):
+    """The size of each file a search has on screen: one `lstat` each, behind the view.
+
+    Only the rows in view are ever asked for, so a search that found a
+    hundred thousand files costs forty `stat` calls, not a hundred thousand,
+    and a hung mount can hold up a figure but never the keys. A size is
+    `_walk`'s: blocks, or the length of a file that has none.
+    """
+
+    def __init__(self):
+        # type: () -> None
+        #: Path to bytes, or None when the file could not be read.
+        self.sizes = {}  # type: Dict[str, Optional[int]]
+        self._want = []  # type: List[str]
+        self._lock = threading.Condition()
+        self._stopped = False
+        worker = threading.Thread(target=self._run)
+        worker.daemon = True
+        worker.start()
+
+    def want(self, paths):
+        # type: (Sequence[str]) -> None
+        """The files on screen now; anything asked for before and gone from view is dropped."""
+        with self._lock:
+            self._want = [path for path in paths if path not in self.sizes]
+            self._lock.notify()
+
+    def busy(self):
+        # type: () -> bool
+        return bool(self._want)
+
+    def stop(self):
+        # type: () -> None
+        with self._lock:
+            self._stopped = True
+            self._lock.notify()
+
+    def _run(self):
+        # type: () -> None
+        while True:
+            with self._lock:
+                while not self._want and not self._stopped:
+                    self._lock.wait()
+                if self._stopped:
+                    return
+                path = self._want.pop(0)
+            try:
+                stat = os.lstat(path)
+                blocks = int(getattr(stat, "st_blocks", 0)) * 512
+                self.sizes[path] = blocks if blocks else int(stat.st_size)
+            except OSError:
+                self.sizes[path] = None
+
+
+def _search_frame(
+    top, query, matches, found, cursor, first_row, finder, style, width, height, sizes, cache
+):
+    # type: (str, str, Sequence[Tuple[str, bool]], int, int, Optional[int], Any, Any, Optional[int], Optional[int], Dict[str, Optional[int]], Dict[str, Tuple[int, int]]) -> Tuple[List[str], int, int]
+    """The search, drawn as the directory view is: a prompt, the matches, what was read.
+
+    Each match is its path below ``top``, a folder ending in ``/``, cut from
+    the LEFT when it is too long, since the end of a path is the name the
+    reader was looking for. A file shows its size once `_FileSizes` has it;
+    a folder shows the figure this session counted for it, if any.
+
+    Returns ``(lines, first, room)`` as `_dir_frame` does.
+    """
+    window = width or style.size
+    inner = max(_MIN_BODY, window - 4)
+    used_w = 8
+    path_w = max(10, inner - 3 - 2 - used_w)
+    head = _title_lines("search " + top, style, inner)
+    if query and not search_module.Query(query).empty:
+        head[-1] += style.dim("  %s  %s found" % (style.g.sep, render_fields.human_count(found)))
+    lines = head + ["", render_style.rule("", style, inner), ""]
+    cursor_mark = style.accent(style.g.caret)
+    if query:
+        prompt = "   / " + sanitize(query, limit=512) + cursor_mark
+    else:
+        prompt = "   / " + cursor_mark + style.dim("  a piece of a name, or a pattern like *.nc")
+    lines += [prompt, ""]
+
+    def row(path, is_dir):
+        # type: (str, bool) -> str
+        shown = path + ("/" if is_dir else "")
+        if render_style.width(shown) > path_w:
+            shown = style.g.ellipsis + shown[-(path_w - 1) :]
+        full = os.path.join(top, path)
+        if is_dir:
+            counted = cache.get(full)
+            used = render_fields.human_bytes(counted[0]) if counted else ""
+        else:
+            size = sizes.get(full, -1)
+            used = style.g.ellipsis if size == -1 else render_fields.human_bytes(size)
+        used = render_style.pad(used, used_w, "right")
+        return "   " + render_style.pad(shown, path_w) + "  " + used
+
+    status = []  # type: List[str]
+    if not finder.done:
+        status.append(
+            style.dim(
+                "   %s reading: %s names in %s folders"
+                % (
+                    style.g.ellipsis,
+                    render_fields.human_count(finder.names),
+                    render_fields.human_count(finder.folders),
+                )
+            )
+        )
+    else:
+        spent = (finder.finished_at or time.time()) - finder.began
+        read = "   read %s names in %s folders in %s" % (
+            render_fields.human_count(finder.names),
+            render_fields.human_count(finder.folders),
+            render_fields.human_duration(spent),
+        )
+        if finder.unreadable:
+            read += "; %s could not be read" % (render_fields.human_count(finder.unreadable),)
+        status.append(style.dim(read))
+    if found > len(matches):
+        status.append(
+            style.dim(
+                "   the first %s of them shown: type more to narrow it"
+                % (render_fields.human_count(len(matches)),)
+            )
+        )
+    keys = [
+        "",
+        style.dim(
+            "   %s to search   %s move   %s open   %s back"
+            % (
+                style.accent("type"),
+                style.accent("up/down"),
+                style.accent("enter"),
+                style.accent("esc"),
+            )
+        ),
+    ]
+    heading = "   " + render_style.pad("path", path_w) + "  " + "used".rjust(used_w)
+    headings = [style.dim(heading), ""]
+    chrome = len(lines) + len(headings) + len(status) + len(keys) + 1 + 4
+    # Only the rows in the window are drawn: a search can keep twenty
+    # thousand matches, and formatting all of them on every repaint is how a
+    # view falls behind its own keys.
+    count = len(matches)
+    room = max(1, int(height) - chrome) if height else max(1, count)
+    room = min(room, count) if count else 0
+    first = _window_top(cursor, count, room, first_row) if count else 0
+    block = list(lines)
+    if count:
+        block += headings + [row(path, is_dir) for path, is_dir in matches[first : first + room]]
+        if room < count:
+            block.append(
+                style.dim(
+                    "   %d of %d, %d above, %d below"
+                    % (cursor + 1, count, first, count - first - room)
+                )
+            )
+    elif query and finder.done:
+        block.append(style.dim("   nothing under here has that in its name"))
+    block += status + keys
+    if count:
+        block = interactive.highlight(block, len(lines) + len(headings) + cursor - first)
+    return panel(block, style=style, size=window, shrink=False).splitlines(), first, room
+
+
+def _search_view(top, style, width, screen, cache, finder, query=""):
+    # type: (str, Any, Optional[int], Any, Dict[str, Tuple[int, int]], Any, str) -> Tuple[object, str]
+    """Search everything under ``top`` until the reader opens a match or leaves.
+
+    Returns ``(outcome, query)``: the outcome is the folder to open (a folder
+    match, or the folder a file match is in), `BACK` or `QUIT`, and the query
+    is what the reader had typed, so the next `/` from here starts from it.
+    """
+    finder.start()
+    if query:
+        finder.ask(query)
+    sizes = _FileSizes()
+    cursor = 0
+    viewport = [None]  # type: List[Optional[int]]
+    height = interactive.window_rows()
+    canvas = screen if screen is not None else interactive.Screen()
+    try:
+        with interactive.raw_session():
+            while True:
+                _asked, matches, found = finder.snapshot()
+                cursor = max(0, min(cursor, len(matches) - 1)) if matches else 0
+                lines, first, room = _search_frame(
+                    top, query, matches, found, cursor, viewport[0], finder, style, width,
+                    height, sizes.sizes, cache,
+                )  # fmt: skip
+                viewport[0] = first
+                canvas.paint(lines)
+                shown = matches[first : first + room]
+                sizes.want([os.path.join(top, p) for p, is_dir in shown if not is_dir])
+                busy = not finder.done or sizes.busy()
+                if not interactive.input_waiting(0.12 if busy else 1.0):
+                    continue
+                key = interactive.read_text()
+                if key == interactive.Key.QUIT:
+                    return interactive.Key.QUIT, query
+                if key == interactive.Key.BACK:
+                    return interactive.Key.BACK, query
+                if key == interactive.Key.ENTER:
+                    if not matches:
+                        continue
+                    path, is_dir = matches[cursor]
+                    full = os.path.join(top, path)
+                    return (full if is_dir else os.path.dirname(full)), query
+                if key == interactive.Key.UP:
+                    cursor = max(0, cursor - 1)
+                elif key == interactive.Key.DOWN:
+                    cursor = min(max(0, len(matches) - 1), cursor + 1)
+                elif key in (interactive.Key.ERASE, interactive.Key.CLEAR):
+                    query = "" if key == interactive.Key.CLEAR else query[:-1]
+                    finder.ask(query)
+                    cursor, viewport[0] = 0, None
+                elif len(key) == 1:
+                    query += key
+                    finder.ask(query)
+                    cursor, viewport[0] = 0, None
+    except KeyboardInterrupt:
+        return interactive.Key.QUIT, query
+    finally:
+        sizes.stop()
+
+
+def _search_from(here, parent, style, width, screen, run, cache, searches, aside):
+    # type: (str, Optional[Root], Any, Optional[int], Any, Run, Dict[str, Tuple[int, int]], Dict[str, Tuple[Any, str]], Optional[_Sizes]) -> object
+    """`/` from a view of ``here``: search, then the folder to open, `BACK` or `QUIT`.
+
+    The same filesystem rule as a count: sixteen directories read at once on
+    a network filesystem, where each read waits on a server, one on a local
+    one, where threads cost more than they hide, and half of sixteen while a
+    count carries on behind the view, so the two stay within rapidu's 24.
+    Mount points below ``here`` are not entered. A search that read its
+    whole tree is kept, and `/` from here again answers from it at once.
+    """
+    kept = searches.get(here)
+    finder, query = kept if kept is not None else (None, "")
+    if finder is None:
+        threads = _threads_for(parent) if parent is not None else 1
+        if aside is not None and aside.busy() and threads > 1:
+            threads //= 2
+        below = here.rstrip("/") + "/"
+        skip = [
+            mount.mountpoint
+            for mount in (run.mounts or ())
+            if getattr(mount, "mountpoint", "").startswith(below)
+        ]
+        finder = search_module.Finder(here, threads=threads, skip=skip)
+    outcome, query = _search_view(here, style, width, screen, cache, finder, query)
+    if finder.finished_at is not None:
+        searches[here] = (finder, query)
+    else:
+        finder.stop()
+        searches.pop(here, None)
+    return outcome
+
+
+def _size_index(run, opts):
+    # type: (Run, argparse.Namespace) -> Optional[SizeIndex]
+    """The sizes kept from earlier runs on this cluster, or None under `--no-state`."""
+    if _merge_flag(opts, "no_state", False):
+        return None
+    try:
+        return SizeIndex.load()
+    except Exception:
+        return None
 
 
 def _browse(run, opts, style, width):
@@ -4974,9 +5866,12 @@ def _browse(run, opts, style, width):
     changes = list(run.changes or [])
     legend_on = bool(_merge_flag(opts, "legend", False))
     summary_on = bool(_merge_flag(opts, "summary", False))
+    # The row the table last painted highlighted, which is what `/` searches.
+    painted = [0]
 
     def frame(cursor):
         # type: (int) -> List[str]
+        painted[0] = cursor
         return _table_frame(
             roots,
             cursor,
@@ -4994,10 +5889,11 @@ def _browse(run, opts, style, width):
     footer = [
         "",
         style.dim(
-            "   %s move   %s open   %s quit"
+            "   %s move   %s open   %s search   %s quit"
             % (
                 style.accent("up/down"),
                 style.accent("enter"),
+                style.accent("/"),
                 style.accent("q"),
             )
         ),
@@ -5046,8 +5942,12 @@ def _browse(run, opts, style, width):
 
     cursor = 0
     # Sizes added up in any directory opened this session, so going back into
-    # one does not walk it a second time. See `_Sizes`.
-    sizes = {}  # type: Dict[str, Tuple[int, int, bool, bool]]
+    # one does not walk it a second time, and those kept from earlier runs,
+    # read the first time a directory is opened. See `_Sizes`.
+    sizes = {}  # type: Dict[str, Tuple[int, int]]
+    index = [None]  # type: List[Optional[SizeIndex]]
+    # The searches made from the table, kept as `_levels` keeps its own.
+    searches = {}  # type: Dict[str, Tuple[Any, str]]
     try:
         while True:
             chosen = interactive.select(
@@ -5056,11 +5956,36 @@ def _browse(run, opts, style, width):
                 initial=cursor,
                 escapable=False,
                 screen=screen,
+                searchable=True,
             )
             if chosen in (interactive.Key.QUIT, interactive.Key.BACK):
                 return leave()
-            cursor = int(chosen)  # type: ignore[arg-type]
-            opened = _descend(roots[cursor].path or "/", style, width, screen, run=run, cache=sizes)
+            if index[0] is None:
+                index[0] = _size_index(run, opts)
+            if chosen == interactive.Key.SEARCH:
+                # Everything under the highlighted row; a match opens its folder.
+                cursor = painted[0]
+                row = roots[cursor]
+                found = _search_from(
+                    row.path or "/", row, style, width, screen, run, sizes, searches, None
+                )
+                if found == interactive.Key.QUIT:
+                    return leave()
+                if not isinstance(found, str):
+                    continue
+                target = found
+            else:
+                cursor = int(chosen)  # type: ignore[arg-type]
+                target = roots[cursor].path or "/"
+            opened = _descend(
+                target,
+                style,
+                width,
+                screen,
+                run=run,
+                cache=sizes,
+                index=index[0],
+            )
             if opened == interactive.Key.QUIT:
                 return leave()
     except Exception:
